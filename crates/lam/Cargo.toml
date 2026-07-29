@@ -1,0 +1,12 @@
+[package]
+name = "lam"
+version.workspace = true
+edition.workspace = true
+description = "Public facade for the Lam actor-style coding agent runtime"
+
+[dependencies]
+lam-core = { path = "../lam-core" }
+lam-deno = { path = "../lam-deno" }
+
+[lints]
+workspace = true

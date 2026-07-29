@@ -1,0 +1,8 @@
+[package]
+name = "lam-core"
+version.workspace = true
+edition.workspace = true
+description = "Provider-independent actor, context, model, and storage core for Lam"
+
+[lints]
+workspace = true

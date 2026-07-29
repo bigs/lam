@@ -1,0 +1,19 @@
+[workspace]
+members = [
+    "crates/lam",
+    "crates/lam-core",
+    "crates/lam-deno",
+    "crates/lam-redb",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.lints.rust]
+missing_docs = "warn"
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = "warn"

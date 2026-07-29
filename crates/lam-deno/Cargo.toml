@@ -1,0 +1,11 @@
+[package]
+name = "lam-deno"
+version.workspace = true
+edition.workspace = true
+description = "Embedded Deno isolate and typed builtin bridge for Lam"
+
+[dependencies]
+lam-core = { path = "../lam-core" }
+
+[lints]
+workspace = true
