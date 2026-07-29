@@ -293,28 +293,71 @@ or continues a run.
 
 ### Message envelope
 
-**Proposed.** A durable message envelope contains at least:
+**Settled for Slice 2.** A durable message envelope contains:
 
 - `message_id`;
-- recipient actor;
-- sender identity and sender kind;
+- authenticated `MessageSource`;
 - delivery mode;
-- structured payload and its Lam codec;
-- admission sequence/time;
-- optional `in_reply_to`;
-- optional propagated telemetry context.
+- `EncodedPayload`;
+- host-observed `received_at`.
 
-`in_reply_to` is a durable semantic edge to the specific message being
-answered. It is useful for subagent replies and request/reply navigation.
-It is not a tracing span and it does not imply that every message belongs to a
-single global correlation group.
+**Settled.** `MessageSource` is a closed provenance enum:
 
-OpenTelemetry trace and span context may travel with the envelope, but is
-advisory telemetry and may be absent or sampled away.
+- `User { principal: Option<PrincipalId> }`;
+- `Host { component: ComponentId }`;
+- `Actor { actor_id: ActorId }`.
+
+`Host` includes Lam runtime messages and explicitly identified embedding
+components. Provenance does not directly determine the provider-visible message
+role. Lam assigns the source from the authenticated call path: ordinary
+`send`/`call` input is `User`, trusted host APIs name their component, and
+actor messaging records the authenticated sending actor. Model-authored code
+cannot impersonate another actor or manufacture a trusted host source.
+
+**Settled.** Recipient identity is not duplicated inside the stored envelope.
+The actor journal key supplied to admission is authoritative. Public receipts
+and exported history may pair `actor_id` with `message_id` and journal
+revision, but a persisted event cannot disagree with the stream containing it.
+
+**Settled.** The core envelope has no `in_reply_to` or `reply_to` field.
+Steering means one model step may incorporate several messages, so Lam cannot
+deterministically infer that an output answers exactly one input. The durable
+core relation is `ContextAppended.consumed_message_ids`, which records the
+entire batch actually inserted into context.
+
+Applications and actor protocols that need request/reply correlation carry an
+explicit request identifier in their structured payload. Lam may provide a
+higher-level typed request/reply helper later, but the journal does not assign
+that semantic relationship.
+
+**Settled.** `received_at` is informational observability data. Lam obtains it
+from an injectable clock before the first append attempt and preserves it
+unchanged across conditional-append retries. Journal revision remains the sole
+authority for admission order and correctness; projections never order or make
+delivery decisions by wall-clock time. Sender-declared business timestamps
+belong inside the structured payload.
+
+OpenTelemetry trace propagation may be added in the telemetry-owning slice.
+It is not part of the initial durable envelope; trace context remains advisory
+and never becomes authoritative state.
+
+### Encoded message payload
+
+**Settled for Slice 2.** `EncodedPayload` contains a namespaced `CodecId`, an
+integer codec version, and a `serde_json::Value`. `send<T: Serialize>` converts
+the input once through the default `lam/json@1` codec before admission. If
+serialization fails, no journal event is appended.
+
+The stored JSON value is authoritative. It preserves every provider-native
+field and opaque encrypted string, but not irrelevant wire formatting, object
+key order, or numeric spelling. Computed codec views interpret this single
+value; Lam does not store a second normalized copy. A raw-wire representation
+can be introduced only if an actual provider demonstrates that byte identity,
+rather than JSON-value identity, is required.
 
 ### Message kinds
 
-**Settled direction.** The mailbox can carry user, system, library/runtime, and
+**Settled direction.** The mailbox can carry user, host/runtime, and
 other-actor messages. Payloads are structured Lam values rather than strings
 prematurely flattened into prompts.
 
@@ -339,8 +382,13 @@ during the final model step. If any exist, they are added to context and the
 same run continues. This closes the race in which an actor could otherwise
 finish immediately after acknowledging a steering receipt.
 
-The precise atomic store operation used for that race is intentionally left to
-the state-store slice; the externally visible semantics are settled.
+**Settled for the state model.** A candidate terminal context append is
+conditional on the actor-journal revision from which the decision was made. If
+a message admission wins the race, it advances that revision, the completion
+append conflicts, and the actor refolds before deciding whether to continue.
+An eligible steer therefore continues the same run; a queued message may allow
+the terminal append to be retried and then begins later work. The successful
+terminal context append is the durable run-completion linearization point.
 
 ## Runs and the public Rust API
 
@@ -378,6 +426,10 @@ The builder has useful defaults, exposes ordinary immutable-style
 configuration transformations, and permits custom implementations of the
 major interfaces. Runtime capabilities are primarily runtime configuration,
 not a combinatorial set of Cargo features.
+
+The ergonomic builder method may remain named `state_store`, but it accepts an
+implementation of the lower-level `JournalStore` trait. There is no separate
+public `StateStore` trait in the initial design.
 
 ### `send`
 
@@ -418,17 +470,51 @@ settled in the public-API slice; the semantic distinction from `send` will not.
 **Settled.** Each actor has an ordered, append-only context stream. This is the
 valuable long-term conversation record and must be retained in full.
 
-A conceptual context entry contains:
+This is a logical stream projected from the actor's authoritative journal, not
+a separately mutable store. Each `ContextAppended` event contributes one entry
+in context order.
 
-- actor-local sequence;
-- optional `run_id`;
-- entry kind and authorship metadata;
-- codec identifier and codec version;
-- lossless encoded payload;
-- minimal Lam metadata needed for projection and recovery.
+**Settled for Slice 2.** Every `ContextEntry` contains:
 
-This is a conceptual contract, not a commitment to a particular Rust enum or
-serialization format.
+- `ContextKind`;
+- `RunAssociation`;
+- `EncodedPayload`;
+- host-observed `recorded_at`.
+
+`RunAssociation` is one of `None`, `Intermediate(RunId)`, or
+`Terminal(RunId)`. A terminal association is the durable run-completion
+linearization point. `recorded_at` is informational and comes from the same
+injectable clock policy as message `received_at`.
+
+`ContextAppended` wraps one entry plus the ordered
+`consumed_message_ids` atomically inserted into that entry. Actor identity is
+the journal key. Context sequence is derived from `ContextAppended` order, and
+authorship is projected from consumed messages or the payload codec.
+Provider/model identifiers remain in native payload or codec metadata; trace
+identifiers remain telemetry.
+
+### Context kinds
+
+**Settled.** `ContextKind` has four initial variants:
+
+- `Messages`;
+- `Model`;
+- `Eval`;
+- `Compaction { covers_through: ContextSequence }`.
+
+`Messages` is one mailbox-ordered batch and requires nonempty
+`consumed_message_ids`. `Model` retains untouched provider-native output,
+including reasoning and the model's eval request. `Eval` is the model-visible
+result of executing Lam's single tool. The request remains in the preceding
+model payload; its evaluated outcome is a first-class context transition.
+`Compaction` contributes a replacement view covering entries through the
+specified context sequence.
+
+Lam deliberately has no generic `Tool`, `ToolCall`, or provider-role context
+kind. Filesystem, shell, HTTP, subagent, and application functions are
+capabilities invoked from TypeScript inside the one eval tool. Provider roles,
+reasoning-item types, eval-call identifiers, and other wire details remain in
+codec-tagged payloads and computed views.
 
 ### Native and Lam codecs
 
@@ -483,6 +569,11 @@ latest compatible marker. That watermark is a rebuildable optimization. The
 append-only marker is authoritative, so a missing watermark can be recovered
 by seeking backward through the ordered context stream.
 
+Slice 2 uses the simplest correct implementation: its pure projection folds
+the available history and remembers the newest compatible marker. Store-level
+reverse seeks, watermarks, and other materializations remain deferred until
+recovery measurements justify them.
+
 Markers for other codecs remain history and are ignored when projecting a
 request for which they are not compatible.
 
@@ -520,22 +611,59 @@ to discard the user's full history.
 
 ### Critical state
 
-**Settled.** The initial durable state is deliberately small:
+**Settled.** The initial durable state is one authoritative append-only journal
+per actor. It begins with exactly two domain event kinds:
 
-1. the per-actor inbox and its delivery progress;
-2. the per-actor append-only context stream and compaction markers.
+1. `MessageAdmitted`, containing the durable message envelope;
+2. `ContextAppended`, containing one model-visible context entry and any inbox
+   message identifiers atomically consumed into that entry.
+
+The pending inbox is the pure projection of admitted messages not yet consumed
+by a context append. The append-only context stream is the projection of
+`ContextAppended` events. A terminal context entry records run completion, and
+a compaction marker is a context-entry kind rather than a separate storage
+facility.
 
 We are not starting with a generic actor event-sourcing framework, effects
-ledger, CQRS bus, or transaction DSL. Additional durable facts must earn their
-place through a recovery or product requirement.
+ledger, CQRS bus, or transaction DSL. The event vocabulary is closed and
+domain-specific. Additional durable facts must earn their place through a
+recovery or product requirement.
 
-### `StateStore`
+### `JournalStore`
 
 **Settled.** Storage is behind a public interface so embedders can provide their
-own implementation.
+own implementation. The sole initial backend SPI is named `JournalStore`.
+
+The underlying persistence primitive is an ordered read plus an atomic,
+conditional batch append at an expected actor revision. Lam owns event
+semantics, folding, and retries; a backend owns ordered storage and the
+compare-and-append guarantee.
+
+`JournalStore` has one associated event type constrained by `Clone`,
+`Serialize`, `DeserializeOwned`, `Send`, `Sync`, and `'static`. Its methods
+read and append ordinary typed values. Lam uses
+`JournalStore<Event = ActorEvent>`; a journal cannot mix unrelated event
+languages.
+
+This is deliberately not a generic `append<T: Serialize>` method. The
+associated type preserves object-erasure options and the invariant that one
+journal has one event contract. `MemStore<ActorEvent>` keeps values directly
+without a pointless serialization round trip. Durable and custom stores choose
+their physical Serde encoding internally.
+
+`ActorEvent` owns explicit schema/version compatibility, and its context
+payload wrapper preserves provider-native data without requiring the journal
+backend to understand it. Backends may serialize the event, but they do not
+interpret `MessageEnvelope`, `ContextEntry`, or individual `ActorEvent`
+variants. This prevents the backend trait from growing into a transaction DSL.
+
+Higher-level actor-state operations remain concrete domain logic over a
+`JournalStore`. We will introduce another public abstraction only if a real
+embedding use case demonstrates that it is needed.
 
 The interface must preserve:
 
+- one isolated ordered journal per actor;
 - ordered actor-local appends;
 - admission-before-receipt for messages;
 - consistent delivery progress;
@@ -543,21 +671,60 @@ The interface must preserve:
 - the steering/finalization race semantics;
 - isolation between system state and future agent-writable data.
 
-**Open for the state-store slice.** We will derive the smallest atomic API from
-these invariants and deterministic race tests. We will avoid both an
-underpowered collection of unrelated KV calls and an open-ended mutation DSL.
+The semantic surface is only ordered `read` and conditional `append`. The Rust
+mechanism used to express asynchronous, optionally erased implementations will
+be chosen during Slice 2 without expanding those semantics. We will avoid both
+an underpowered collection of unrelated KV calls and an open-ended mutation
+DSL.
+
+### Revisions and paging
+
+**Settled.** `Revision::ZERO` represents an empty or nonexistent actor
+journal. The first successful append at expected revision zero implicitly
+creates it; there is no separate journal-creation operation.
+
+`read(actor, after, limit)` treats `after` as exclusive and returns a
+`JournalPage` containing contiguous `StoredEvent` values plus the journal head
+observed in the same consistent store view. Every stored event carries its own
+revision. The caller-provided nonzero event limit lets Lam bound recovery
+memory independently of backend configuration.
+
+An atomic batch of `N` events appended at revision `R` receives consecutive
+revisions `R + 1` through `R + N`, and success returns the new head. The events
+remain immutable after commit. Reads do not hold one backend snapshot open
+across pages: a projection may observe a later head while catching up, and its
+subsequent conditional append detects any writer that intervened.
+
+### Append outcomes and errors
+
+**Settled.** A compare-and-append conflict is ordinary concurrency control, not
+a backend failure. `append` returns either `Appended { head }` or
+`Conflict { expected, actual }`. Domain logic refolds and retries after a
+conflict.
+
+An `EventBatch` contains one required first event and zero or more remaining
+events, making an empty append unrepresentable. Every `JournalStore` supplies
+an associated backend error implementing `Error + Send + Sync + 'static`;
+`MemStore` uses `Infallible`.
+
+The common journal error wrapper has only `Backend(error)` and
+`RevisionExhausted`. Invalid ordering, gaps, or inconsistent page metadata are
+store-contract violations detected by `lam-core` while folding, rather than
+variants every backend must manufacture.
 
 ### Implementations
 
 **Settled.**
 
-- `MemStore` is the default and pure-Rust reference implementation.
-- `lam-redb` is the first durable implementation.
+- `MemStore<ActorEvent>` is the default pure-Rust `JournalStore`
+  implementation and stores typed values directly.
+- `lam-redb` is the first durable `JournalStore` implementation and performs
+  Serde encoding behind the trait boundary.
 - Custom implementations are first-class and must be testable with a shared
   conformance suite.
 
-`redb`'s ordered tables and transactions are a good match for per-actor inbox
-and context keyspaces. The exact schema is part of the state-store slice.
+`redb`'s ordered tables and transactions are a good match for per-actor
+journals. Its exact schema belongs to the durable-adapter slice.
 
 SQLite is not in the initial plan. It can be added later as another adapter
 without changing actor semantics.
@@ -653,8 +820,9 @@ TypeScript library may create child spans through an explicitly registered
 capability, but tracing does not require a framework inside the isolate.
 
 Trace identifiers are never authoritative state. Durable IDs such as
-`message_id`, `in_reply_to`, `actor_id`, context sequence, and `run_id` retain
-their meaning when tracing is disabled or sampled.
+`message_id`, `actor_id`, consumed-message references, context sequence, and
+`run_id` retain their meaning when tracing is disabled or sampled. Explicit
+application protocol identifiers do as well.
 
 ## Security and capability boundaries
 
@@ -764,7 +932,7 @@ It depends inward on the minimal contracts it needs from `lam-core`.
 
 ### `lam-redb`
 
-The durable `StateStore` adapter and its conformance tests. It depends on
+The durable `JournalStore` adapter and its conformance tests. It depends on
 `lam-core`; `lam-core` does not depend on it.
 
 ### Later crates
@@ -883,17 +1051,30 @@ Explicitly out of scope:
 
 - model APIs and the tool-calling loop;
 - inboxes, steering, queueing, and `run_id`;
-- `StateStore`, `redb`, and context compaction;
+- `JournalStore`, `redb`, and context compaction;
 - filesystem, shell, HTTP, and subagents;
 - the worker-pool scheduler;
 - the final public `Lam` builder.
 
 ### Slice 2: append-only state model
 
-Define context/inbox records, `MemStore`, the minimal `StateStore` atomic
-surface, pure projections, compaction-marker lookup, and a backend conformance
-suite. Prove steering/finalization race behavior with deterministic tests
-before adding `redb`.
+Implement one authoritative journal per actor with the two initial event kinds
+`MessageAdmitted` and `ContextAppended`. Define the message envelope, context
+entry, identifiers, revisions, codec-tagged JSON payload wrapper, and the
+minimal public ordered-read/conditional-append storage contract.
+`JournalStore` carries one Serde-compatible associated event type, with Lam
+binding it to `ActorEvent`.
+
+Implement `MemStore` as the pure-Rust reference backend. Build pure projections
+for pending inbox order, full context history, run completion, and the newest
+compatible compaction marker. A context append consumes its source message
+identifiers atomically; no separate mutable delivery record exists.
+
+The shared conformance suite must prove ordered isolation between actors,
+conditional-append conflicts, admission-before-receipt, atomic message
+consumption into context, deterministic replay, and the steering/finalization
+race. `redb`, snapshots, store-specific indexes, blobs, generic event-sourcing
+machinery, and the model loop remain out of scope.
 
 ### Slice 3: actor and scripted model loop
 
@@ -959,7 +1140,7 @@ and an in-memory store. They must not depend on timing sleeps or a real API.
 
 ### Shared conformance suites
 
-Every `StateStore` implementation runs the same behavioral suite. Typed
+Every `JournalStore` implementation runs the same behavioral suite. Typed
 namespace implementations should likewise be testable without a real model.
 
 ### Failure injection
@@ -986,7 +1167,7 @@ contract tests requiring credentials or network access remain opt-in.
 These questions are intentionally unresolved and assigned to slices:
 
 - default stdlib capability profile — coding capability slice;
-- exact atomic `StateStore` surface — Slice 2;
+- `JournalStore` async and object-erasure mechanics — Slice 2;
 - context and inbox serialization format/versioning — Slice 2;
 - final `Run<T>` Rust ergonomics — Slice 3;
 - first real model provider — Slice 5;
