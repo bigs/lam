@@ -118,11 +118,16 @@ contract was established for this design.
 
 ### TypeScript execution
 
-**Settled.** `eval` accepts TypeScript, not merely JavaScript.
+**Settled and implemented.** `eval` accepts TypeScript, not merely JavaScript.
+Each cell is parsed and transpiled with `deno_ast`, then evaluated as a
+persistent REPL cell. Type-only syntax is erased, top-level `await` works, and
+the final expression is returned after awaiting it when it is a Promise.
 
-**Proposed.** The isolate layer transpiles TypeScript before execution using a
-Deno-compatible parser/transpiler. The first slice will choose the smallest
-supported language surface and define source maps and diagnostic behavior.
+The initial kernel is intentionally module-less: static imports, exports, and
+dynamic `import()` are rejected during transpilation. Cells receive a stable
+`lam://cell/<id>` source URL, but Slice 1 does not emit source maps. Module
+loading should be introduced only alongside an explicit resolution and
+capability policy.
 
 ### Persistent isolates
 
@@ -182,17 +187,26 @@ whether a module has been registered.
 memory state store is unambiguously the default; ambient filesystem or network
 authority is not.
 
-### Effect
+### Vanilla TypeScript and Promises
 
-**Proposed direction.** Lam's TypeScript API should compose naturally with the
-Effect ecosystem. Effect is attractive for typed failures, cancellation,
-resource scopes, streams, concurrency, and OpenTelemetry integration.
+**Settled and implemented.** The kernel API is vanilla TypeScript. Async Rust
+builtins return ordinary JavaScript Promises, so model-authored programs use
+`await`, `Promise.all`, `try`/`catch`, async functions, and other language
+primitives without a framework-specific runtime.
 
-This should not leak into the Rust embedding API or provider protocols.
-The first builtin slice will determine whether builtins expose Effect values
-directly, expose Promises with an Effect-native layer, or support both. The
-important constraint is that Effect remains a coherent foundation rather than
-an ornamental wrapper around unrelated async APIs.
+An object-shaped Rust domain failure rejects the Promise with its exact
+structured, JSON-serializable error value. TypeScript can catch and inspect
+that value directly. Primitive failures use a small tagged wrapper because the
+runtime needs object identity to distinguish an unhandled builtin rejection
+from an unrelated JavaScript throw. If a builtin failure remains unhandled at
+the cell boundary, Lam reports `EvalError::BuiltinFailure` rather than
+flattening it into an arbitrary JavaScript exception.
+
+Lam does not depend on Effect, npm, or a JavaScript bundler. An embedding
+application can introduce optional TypeScript libraries in a future
+module-loading layer, but no third-party async framework is part of the kernel
+ABI. Core tracing, cancellation, and lifecycle instrumentation belong on the
+Rust side of the runtime.
 
 ## Typed Rust extensions
 
@@ -214,8 +228,8 @@ constraining its authority.
 
 ### Type inference
 
-**Settled direction.** Rust function types should supply as much of the
-TypeScript contract as possible:
+**Settled and implemented for the eval kernel.** Rust function types supply the
+TypeScript contract:
 
 - one structured input value;
 - `()` when no input is required;
@@ -224,13 +238,31 @@ TypeScript contract as possible:
 - a serializable/schema-bearing builtin error contract;
 - async, thread-safe, `'static` handlers.
 
-The generated schema powers `lam.dir()`, TypeScript declarations, runtime
-validation, and model-facing documentation. We should not require authors to
+The generated schema powers `lam.dir()` now and can power generated TypeScript
+declarations and model-facing documentation later. Serde deserialization
+independently enforces the typed input boundary at runtime. Authors do not
 write a second hand-maintained schema for ordinary functions.
 
-**Proposed.** A builtin receives an operation context containing the actor
-identity, cancellation, tracing context, and explicitly granted host handles.
-The exact trait and macro ergonomics belong to the typed-builtin slice.
+Registration is manifest-driven. `Namespace::function` contributes both an
+erased Rust handler and its inferred descriptor to one immutable registry. A
+Deno extension installs that registry into isolate state before its TypeScript
+ESM entry point runs. The entry point obtains the configured namespace tree
+through `op_lam_manifest`, materializes all namespace objects and functions,
+and routes every ordinary invocation through `op_lam_call`. `lam.dir()` queries
+the same Rust manifest, so discoverability cannot drift from the callable
+surface. Adding an ordinary Rust builtin never requires a TypeScript shim.
+
+The bridge deliberately standardizes JSON input, Promise output, and structured
+failure semantics. Reusable protocols can later cover resources, streams, or
+subscriptions. An explicitly configured custom facade remains a possible
+escape hatch for unusual JavaScript semantics, but it is not the ordinary
+extension path. A procedural macro may eventually reduce Rust boilerplate
+after the builder API has proved stable.
+
+The initial `OperationContext` exposes the isolate generation. Actor identity,
+cancellation, tracing context, and explicitly granted host handles can be added
+when their owning slices establish concrete requirements; they are not
+speculative fields in Slice 1.
 
 ## Actor model
 
@@ -547,19 +579,25 @@ model; workflows needing coordination use messages and explicit protocols.
 
 ## Scheduling and concurrency
 
-### Fixed-size isolate scheduler
+### Isolate residency
 
-**Settled initial design.** Lam runs a fixed-size pool of system threads.
-Each worker owns a single-threaded async executor/event loop and hosts multiple
-actor isolates. A resident isolate is pinned to its worker because V8 and
-`deno_core` runtime state is not freely `Send`.
+**Settled current safety constraint.** A system thread may own at most one live
+Lam isolate. `rusty_v8::OwnedIsolate` remains entered for its lifetime, so
+constructing another resident isolate and interleaving the two on one thread is
+not a supported safe lifecycle. Slice 1 enforces this with a thread-local
+builder permit instead of allowing misuse to become a native crash.
 
-Actors remain logically independent even when several isolates share a worker.
-No actor relies on another actor being in the same interpreter or thread.
+An isolate is also local to its construction thread and is not `Send`. Timeout
+replacement occurs on that same thread and retains the residency permit.
 
-**Deferred.** We may later cap agents per worker, rebalance idle actors, or
-choose thread counts dynamically from observed memory and latency. None of
-those policies may weaken actor isolation.
+**Deferred to the scheduler slice.** The original fixed-size design assumed one
+single-threaded executor could host multiple resident isolates. Implementation
+invalidated that assumption. The simplest safe scheduler is a bounded set of
+threads with one resident isolate per thread. Before choosing it, we should
+evaluate its resource and actor-residency behavior and determine whether
+`deno_core` exposes a reviewed activation mechanism that safely permits
+multiple isolates per thread. Actor isolation and message passing do not depend
+on either scheduling choice.
 
 ### Actor serialization
 
@@ -610,8 +648,9 @@ TypeScript/Rust bridge rather than in a universal event-ledger abstraction.
 ### OpenTelemetry
 
 **Settled.** Runs, model calls, evals, builtins, compactions, and message
-delivery should produce OpenTelemetry spans. Effect's tracing integration may
-provide the TypeScript side of this story.
+delivery should produce OpenTelemetry spans from the Rust runtime. A future
+TypeScript library may create child spans through an explicitly registered
+capability, but tracing does not require a framework inside the isolate.
 
 Trace identifiers are never authoritative state. Durable IDs such as
 `message_id`, `in_reply_to`, `actor_id`, context sequence, and `run_id` retain
@@ -656,10 +695,9 @@ of the HTTP capability, not ambient isolate behavior.
 
 ### Monitors
 
-**Deferred.** Async generators or Effect streams can model native monitors.
-Each emitted item becomes a message to the owning actor. Backpressure,
-coalescing, cancellation, restart behavior, and durability need a focused
-design before implementation.
+**Deferred.** Async generators can model native monitors. Each emitted item
+becomes a message to the owning actor. Backpressure, coalescing, cancellation,
+restart behavior, and durability need a focused design before implementation.
 
 ### Subagents
 
@@ -783,37 +821,63 @@ Acceptance:
 
 ### Slice 1: persistent typed eval kernel
 
-**Proposed as the first implementation slice.**
+**Implemented.**
 
 This slice validates the distinctive technical primitive without involving a
 model provider, mailbox, scheduler pool, or durable database.
 
-Scope:
+The Rust surface is `Isolate::builder()`, typed `Namespace` registration,
+`eval`, and `eval_with`. The public `lam` crate re-exports that kernel while the
+full actor-level `Lam` builder remains deferred.
 
-- construct one `lam-deno` isolate from Rust;
-- evaluate TypeScript and return a structured success or diagnostic;
-- preserve isolate state across evaluations;
-- expose no ambient filesystem, network, process, or Deno namespace;
-- register one Rust namespace with at least one typed async function;
-- infer its input/output/error schemas;
-- expose the registered contract through `lam.dir()`;
-- exercise the complete Rust → TypeScript → Rust → TypeScript → Rust path;
-- define cancellation and poisoned-isolate behavior only as far as required by
-  deterministic tests.
+The eval contract is:
 
-Acceptance tests:
+- a cell is TypeScript transpiled with `deno_ast`, with imports and exports
+  rejected;
+- cells execute serially and successful cells share lexical and global state;
+- top-level `await` works, and a final Promise is awaited even when the source
+  did not spell `await`;
+- a successful result is either `EvalValue::Undefined` or JSON;
+- `console.debug`, `log`, `info`, `warn`, and `error` become structured entries
+  on `EvalOutput`;
+- non-JSON values and cycles produce `ResultNotSerializable`;
+- JavaScript exceptions retain their native CDP details;
+- typed builtin rejections are catchable as structured values in TypeScript and
+  remain `BuiltinFailure` when unhandled.
 
-1. TypeScript-only syntax is accepted and evaluated.
-2. A binding or global established by one eval is observable in a later eval.
-3. An unregistered host capability is unavailable.
-4. A serializable Rust input reaches a typed builtin and its serializable output
-   returns to TypeScript.
-5. Invalid builtin input and a typed builtin failure produce stable structured
-   diagnostics.
-6. `lam.dir()` reports the namespace, documentation, and inferred schemas.
-7. Two isolates do not share JavaScript state.
-8. Dropping an isolate releases its runtime resources without leaving work
-   running.
+Namespace functions take one typed input and return
+`Future<Output = Result<O, E>>`. Serde performs the actual boundary conversion,
+while `schemars` derives discoverable input, output, and error schemas from the
+same Rust types. The kernel's only built-in namespace function is synchronous
+`lam.dir`; embedding applications register everything else explicitly.
+
+The runtime bootstrap is kernel-owned TypeScript and is the only checked-in
+source for that layer. It is an embedded Deno extension ESM entry point,
+transpiled through `RuntimeOptions::extension_transpiler` with the already
+pinned `deno_ast` dependency. Extension state installs the Rust registry,
+console buffer, and isolate generation before the ESM runs. The bootstrap calls
+`op_lam_manifest` once to materialize every configured namespace, routes
+ordinary functions through `op_lam_call`, implements `lam.dir()` against the
+same manifest op, captures console output, and then removes the ambient `Deno`
+bootstrap object. There is no manual `execute_script` injection, extension-
+specific TypeScript shim, npm toolchain, build script, bundle, or generated
+runtime file. A bare isolate has no filesystem, network, process, URL/fetch,
+npm, or third-party framework runtime.
+
+Each eval has a host timeout bounded by the builder's maximum. When it fires,
+Lam interrupts V8, considers that isolate poisoned, drops it and pending Rust
+op futures, constructs the next generation, and only then returns `TimedOut`.
+The error explicitly reports that heap state was lost and already-completed
+external side effects may remain. If replacement fails, the actor-facing layer
+will be able to observe `RestartFailed` or `Poisoned` rather than continuing on
+the interrupted heap.
+
+Acceptance coverage proves TypeScript persistence and top-level await, absence
+of ambient authority, Promise composition, typed error catch and propagation,
+schema discovery, automatic materialization of a deeply nested application
+namespace registered only in Rust, isolation across generations, timeout
+restart, cancellation of a pending Rust builtin, namespace validation, and the
+one-live-isolate-per-thread guard.
 
 Explicitly out of scope:
 
@@ -823,14 +887,6 @@ Explicitly out of scope:
 - filesystem, shell, HTTP, and subagents;
 - the worker-pool scheduler;
 - the final public `Lam` builder.
-
-Questions to resolve before implementation:
-
-- the exact eval input/output and diagnostic structs;
-- which transpiler/module-loading subset Slice 1 supports;
-- whether the initial builtin surface is Promise-first, Effect-first, or dual;
-- the minimal schema library and handler-erasure mechanism;
-- evaluation timeout/cancellation behavior.
 
 ### Slice 2: append-only state model
 
@@ -874,9 +930,10 @@ selected adapter supports it. Verify that raw history remains queryable.
 
 ### Slice 7: scheduler and multiple actors
 
-Introduce the fixed-size worker pool, actor residency, multiple independent
-isolates per worker, cross-actor steering, and scheduler limits. Only then add
-subagent construction.
+Introduce bounded actor residency, cross-actor steering, and scheduler limits.
+The slice must first settle whether safe residency means one isolate thread per
+slot or whether an upstream-supported activation mechanism permits multiple
+independent isolates per thread. Only then add subagent construction.
 
 ### Slice 8: coding-agent capability pack
 
@@ -929,16 +986,13 @@ contract tests requiring credentials or network access remain opt-in.
 These questions are intentionally unresolved and assigned to slices:
 
 - default stdlib capability profile — coding capability slice;
-- eval result/diagnostic representation — Slice 1;
-- TypeScript transpiler and module subset — Slice 1;
-- Effect versus Promise builtin boundary — Slice 1;
-- typed handler erasure and schema crate — Slice 1;
 - exact atomic `StateStore` surface — Slice 2;
 - context and inbox serialization format/versioning — Slice 2;
 - final `Run<T>` Rust ergonomics — Slice 3;
 - first real model provider — Slice 5;
 - context thresholds and default compaction strategy — Slice 6;
-- scheduler sizing and actor residency policy — Slice 7.
+- safe isolate activation, scheduler sizing, and actor residency policy —
+  Slice 7.
 
 ## Working agreement
 
