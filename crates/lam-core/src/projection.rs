@@ -1,0 +1,487 @@
+use std::collections::BTreeSet;
+
+use crate::{
+    ACTOR_EVENT_SCHEMA_VERSION, ActorEvent, ActorEventData, ContextEntry, ContextSequence,
+    ContextTransition, DeliveryMode, JournalPage, MessageEnvelope, MessageError, MessageId,
+    Revision, RunId, RunProgress, StoredEvent,
+};
+
+/// One admitted message as viewed through the actor projection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdmittedMessage {
+    /// Journal revision which admitted the message.
+    pub revision: Revision,
+    /// Durable envelope.
+    pub envelope: MessageEnvelope,
+    /// Context position which consumed the message, when delivered.
+    pub consumed_at: Option<ContextSequence>,
+}
+
+/// One context item paired with its derived positions.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectedContextEntry {
+    /// Position in the logical context stream.
+    pub sequence: ContextSequence,
+    /// Actor-journal revision which stored the entry.
+    pub revision: Revision,
+    /// Model-visible item.
+    pub entry: ContextEntry,
+}
+
+/// Pure current-state projection of one actor journal.
+#[derive(Debug, Default, Eq, PartialEq)]
+pub struct ActorState {
+    revision: Revision,
+    messages: Vec<AdmittedMessage>,
+    context: Vec<ProjectedContextEntry>,
+    active_run: Option<RunId>,
+    completed_runs: BTreeSet<RunId>,
+}
+
+impl ActorState {
+    /// Constructs an empty actor projection.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns the folded actor-journal head.
+    #[must_use]
+    pub const fn revision(&self) -> Revision {
+        self.revision
+    }
+
+    /// Returns the latest logical context position.
+    #[must_use]
+    pub fn context_sequence(&self) -> ContextSequence {
+        self.context
+            .last()
+            .map_or(ContextSequence::ZERO, |entry| entry.sequence)
+    }
+
+    /// Returns all projected context entries in order.
+    #[must_use]
+    pub fn context(&self) -> &[ProjectedContextEntry] {
+        &self.context
+    }
+
+    /// Returns one admitted message by identity.
+    #[must_use]
+    pub fn message(&self, message_id: &MessageId) -> Option<&AdmittedMessage> {
+        self.messages
+            .iter()
+            .find(|message| message.envelope.message_id() == message_id)
+    }
+
+    /// Iterates over pending messages in admission order.
+    pub fn pending_messages(&self) -> impl Iterator<Item = &AdmittedMessage> {
+        self.messages
+            .iter()
+            .filter(|message| message.consumed_at.is_none())
+    }
+
+    /// Returns messages currently eligible to enter context.
+    pub fn eligible_messages(&self) -> impl Iterator<Item = &AdmittedMessage> {
+        let active = self.active_run.is_some();
+        self.pending_messages()
+            .filter(move |message| !active || message.envelope.delivery() == DeliveryMode::Steer)
+    }
+
+    /// Returns the active run, if an intermediate entry has not terminated it.
+    #[must_use]
+    pub const fn active_run(&self) -> Option<&RunId> {
+        self.active_run.as_ref()
+    }
+
+    /// Reports whether a terminal model entry completed `run_id`.
+    #[must_use]
+    pub fn is_run_completed(&self, run_id: &RunId) -> bool {
+        self.completed_runs.contains(run_id)
+    }
+
+    /// Finds the newest compaction marker accepted by `compatible`.
+    pub fn latest_compaction_matching(
+        &self,
+        mut compatible: impl FnMut(&ContextEntry) -> bool,
+    ) -> Option<&ProjectedContextEntry> {
+        self.context.iter().rev().find(|projected| {
+            matches!(
+                projected.entry.transition,
+                ContextTransition::Compaction { .. }
+            ) && compatible(&projected.entry)
+        })
+    }
+
+    /// Folds one bounded journal page into this projection.
+    ///
+    /// The state is consumed so a failed fold cannot expose a partially applied
+    /// projection. Callers can rebuild from the authoritative journal.
+    pub fn fold_page(mut self, page: JournalPage) -> Result<Self, StateError> {
+        if page.head < self.revision {
+            return Err(StateError::JournalContract {
+                message: format!(
+                    "journal head regressed from {} to {}",
+                    self.revision.get(),
+                    page.head.get()
+                ),
+            });
+        }
+        if page.events.is_empty() && page.head > self.revision {
+            return Err(StateError::JournalContract {
+                message: "journal returned an empty page before its observed head".to_owned(),
+            });
+        }
+
+        let mut expected = self.revision;
+        for stored in &page.events {
+            expected = expected
+                .checked_advance(1)
+                .ok_or(StateError::RevisionExhausted)?;
+            if stored.revision != expected {
+                return Err(StateError::JournalContract {
+                    message: format!(
+                        "expected revision {}, received {}",
+                        expected.get(),
+                        stored.revision.get()
+                    ),
+                });
+            }
+            if stored.revision > page.head {
+                return Err(StateError::JournalContract {
+                    message: format!(
+                        "event revision {} exceeds observed head {}",
+                        stored.revision.get(),
+                        page.head.get()
+                    ),
+                });
+            }
+        }
+
+        for stored in page.events {
+            self.apply_stored_event(stored)?;
+        }
+        Ok(self)
+    }
+
+    /// Plans idempotent message admission against the current projection.
+    pub fn plan_admission(
+        &self,
+        message: MessageEnvelope,
+    ) -> Result<AdmissionDecision, StateError> {
+        message.validate()?;
+        if let Some(existing) = self.message(message.message_id()) {
+            if message.is_idempotent_retry_of(&existing.envelope) {
+                return Ok(AdmissionDecision::Existing {
+                    revision: existing.revision,
+                });
+            }
+            return Err(StateError::MessageIdCollision {
+                message_id: message.message_id().clone(),
+            });
+        }
+        Ok(AdmissionDecision::Append(ActorEvent::message_admitted(
+            message,
+        )))
+    }
+
+    /// Validates and plans one context append at the current journal head.
+    pub fn plan_context_append(&self, entry: ContextEntry) -> Result<ActorEvent, StateError> {
+        self.revision
+            .checked_advance(1)
+            .ok_or(StateError::RevisionExhausted)?;
+        self.validate_context_entry(&entry)?;
+        Ok(ActorEvent::context_appended(entry))
+    }
+
+    fn apply_stored_event(&mut self, stored: StoredEvent) -> Result<(), StateError> {
+        if stored.event.schema_version() != ACTOR_EVENT_SCHEMA_VERSION {
+            return Err(StateError::UnsupportedEventVersion {
+                revision: stored.revision,
+                found: stored.event.schema_version(),
+                supported: ACTOR_EVENT_SCHEMA_VERSION,
+            });
+        }
+
+        match stored.event.into_data() {
+            ActorEventData::MessageAdmitted { message } => {
+                self.apply_message(stored.revision, message)?;
+            }
+            ActorEventData::ContextAppended { entry } => {
+                self.apply_context(stored.revision, entry)?;
+            }
+        }
+        self.revision = stored.revision;
+        Ok(())
+    }
+
+    fn apply_message(
+        &mut self,
+        revision: Revision,
+        message: MessageEnvelope,
+    ) -> Result<(), StateError> {
+        message.validate()?;
+        if self.message(message.message_id()).is_some() {
+            return Err(StateError::DuplicateMessage {
+                message_id: message.message_id().clone(),
+            });
+        }
+        self.messages.push(AdmittedMessage {
+            revision,
+            envelope: message,
+            consumed_at: None,
+        });
+        Ok(())
+    }
+
+    fn apply_context(&mut self, revision: Revision, entry: ContextEntry) -> Result<(), StateError> {
+        let sequence = self.validate_context_entry(&entry)?;
+
+        match &entry.transition {
+            ContextTransition::Messages { run_id, .. } => {
+                let active = self.active_run.is_some();
+                for message in &mut self.messages {
+                    if message.consumed_at.is_none()
+                        && (!active || message.envelope.delivery() == DeliveryMode::Steer)
+                    {
+                        message.consumed_at = Some(sequence);
+                    }
+                }
+                if self.active_run.is_none() {
+                    self.active_run = Some(run_id.clone());
+                }
+            }
+            ContextTransition::Model {
+                run_id,
+                progress: RunProgress::Complete,
+            } => {
+                self.active_run = None;
+                self.completed_runs.insert(run_id.clone());
+            }
+            ContextTransition::Model {
+                progress: RunProgress::Continue,
+                ..
+            }
+            | ContextTransition::Eval { .. }
+            | ContextTransition::Compaction { .. } => {}
+        }
+
+        self.context.push(ProjectedContextEntry {
+            sequence,
+            revision,
+            entry,
+        });
+        Ok(())
+    }
+
+    fn validate_context_entry(&self, entry: &ContextEntry) -> Result<ContextSequence, StateError> {
+        let sequence = self
+            .context_sequence()
+            .next()
+            .ok_or(StateError::ContextSequenceExhausted)?;
+
+        match &entry.transition {
+            ContextTransition::Messages {
+                run_id,
+                consumed_message_ids,
+            } => {
+                self.validate_message_batch(consumed_message_ids)?;
+                self.validate_continuing_run(run_id, true)?;
+            }
+            ContextTransition::Model {
+                run_id,
+                progress: RunProgress::Continue,
+            }
+            | ContextTransition::Eval { run_id } => {
+                self.validate_continuing_run(run_id, false)?;
+            }
+            ContextTransition::Model {
+                run_id,
+                progress: RunProgress::Complete,
+            } => self.validate_terminal_run(run_id)?,
+            ContextTransition::Compaction {
+                covers_through,
+                run_id,
+            } => {
+                let current = self.context_sequence();
+                if *covers_through > current {
+                    return Err(StateError::CompactionCoversFuture {
+                        covers_through: *covers_through,
+                        current,
+                    });
+                }
+                if let Some(run_id) = run_id {
+                    self.validate_continuing_run(run_id, false)?;
+                }
+            }
+        }
+        Ok(sequence)
+    }
+
+    fn validate_message_batch(&self, actual: &[MessageId]) -> Result<(), StateError> {
+        let expected = self
+            .eligible_messages()
+            .map(|message| message.envelope.message_id().clone())
+            .collect::<Vec<_>>();
+        if expected.is_empty() {
+            return Err(StateError::NoEligibleMessages);
+        }
+        if expected != actual {
+            return Err(StateError::MessageBatchMismatch {
+                expected,
+                actual: actual.to_vec(),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_continuing_run(&self, run_id: &RunId, may_start: bool) -> Result<(), StateError> {
+        if self.completed_runs.contains(run_id) {
+            return Err(StateError::RunAlreadyCompleted {
+                run_id: run_id.clone(),
+            });
+        }
+        match &self.active_run {
+            Some(active) if active != run_id => Err(StateError::RunMismatch {
+                expected: active.clone(),
+                actual: run_id.clone(),
+            }),
+            None if !may_start => Err(StateError::RunNotActive {
+                run_id: run_id.clone(),
+            }),
+            Some(_) | None => Ok(()),
+        }
+    }
+
+    fn validate_terminal_run(&self, run_id: &RunId) -> Result<(), StateError> {
+        let Some(active) = &self.active_run else {
+            return Err(StateError::TerminalWithoutActiveRun {
+                run_id: run_id.clone(),
+            });
+        };
+        if active != run_id {
+            return Err(StateError::RunMismatch {
+                expected: active.clone(),
+                actual: run_id.clone(),
+            });
+        }
+        let pending_steers = self
+            .pending_messages()
+            .filter(|message| message.envelope.delivery() == DeliveryMode::Steer)
+            .map(|message| message.envelope.message_id().clone())
+            .collect::<Vec<_>>();
+        if pending_steers.is_empty() {
+            Ok(())
+        } else {
+            Err(StateError::TerminalWithPendingSteer {
+                message_ids: pending_steers,
+            })
+        }
+    }
+}
+
+/// Pure outcome of planning message admission.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AdmissionDecision {
+    /// Append this event at the projection's current revision.
+    Append(ActorEvent),
+    /// The identical message is already durable at this revision.
+    Existing {
+        /// Original admission revision.
+        revision: Revision,
+    },
+}
+
+/// Actor events cannot be folded into a coherent state.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum StateError {
+    /// A stored event uses an unsupported domain schema.
+    #[error(
+        "actor event at revision {revision:?} has schema {found}, but this runtime supports {supported}"
+    )]
+    UnsupportedEventVersion {
+        /// Event revision.
+        revision: Revision,
+        /// Stored schema version.
+        found: u32,
+        /// Supported schema version.
+        supported: u32,
+    },
+    /// A backend violated the ordered-page contract.
+    #[error("journal contract violation: {message}")]
+    JournalContract {
+        /// Contract failure.
+        message: String,
+    },
+    /// The durable message itself violates Lam's rules.
+    #[error(transparent)]
+    InvalidMessage(#[from] MessageError),
+    /// The journal contains the same message identity twice.
+    #[error("message `{message_id}` was admitted more than once")]
+    DuplicateMessage {
+        /// Repeated identity.
+        message_id: MessageId,
+    },
+    /// A caller reused a message identity with different semantic content.
+    #[error("message id `{message_id}` was reused with different content")]
+    MessageIdCollision {
+        /// Colliding identity.
+        message_id: MessageId,
+    },
+    /// No pending messages are currently eligible for context.
+    #[error("message context requires at least one eligible message")]
+    NoEligibleMessages,
+    /// A message batch did not consume exactly the eligible mailbox messages.
+    #[error("message batch did not match eligible mailbox order")]
+    MessageBatchMismatch {
+        /// Required message order.
+        expected: Vec<MessageId>,
+        /// Supplied message order.
+        actual: Vec<MessageId>,
+    },
+    /// A compaction marker attempted to cover context which does not exist yet.
+    #[error("compaction covers future context")]
+    CompactionCoversFuture {
+        /// Requested inclusive boundary.
+        covers_through: ContextSequence,
+        /// Current context boundary.
+        current: ContextSequence,
+    },
+    /// An entry attempted to switch runs without terminating the active one.
+    #[error("active run `{expected}` does not match entry run `{actual}`")]
+    RunMismatch {
+        /// Active run.
+        expected: RunId,
+        /// Incoming run.
+        actual: RunId,
+    },
+    /// An intermediate entry attempted to resume a completed run.
+    #[error("run `{run_id}` is already complete")]
+    RunAlreadyCompleted {
+        /// Completed run.
+        run_id: RunId,
+    },
+    /// A non-message entry attempted to begin a run.
+    #[error("run `{run_id}` is not active")]
+    RunNotActive {
+        /// Incoming run.
+        run_id: RunId,
+    },
+    /// A terminal model entry did not belong to an active run.
+    #[error("run `{run_id}` cannot terminate because it is not active")]
+    TerminalWithoutActiveRun {
+        /// Incoming run.
+        run_id: RunId,
+    },
+    /// A terminal model entry raced with one or more steering messages.
+    #[error("run cannot terminate while steering messages are pending")]
+    TerminalWithPendingSteer {
+        /// Pending steering identities.
+        message_ids: Vec<MessageId>,
+    },
+    /// Actor-journal revision arithmetic overflowed.
+    #[error("actor journal revision space is exhausted")]
+    RevisionExhausted,
+    /// Logical context sequence arithmetic overflowed.
+    #[error("actor context sequence space is exhausted")]
+    ContextSequenceExhausted,
+}

@@ -12,8 +12,8 @@ implementation slices live in [docs/PLAN.md](docs/PLAN.md).
 
 ## Current kernel
 
-The first implementation slice is usable through the public `lam` crate. It
-provides:
+The first two implementation slices are usable through the public `lam` crate.
+They provide:
 
 - persistent, serial TypeScript cells with top-level `await`;
 - ordinary JavaScript `Promise` values for asynchronous Rust builtins;
@@ -22,6 +22,13 @@ provides:
 - JSON-only results and structured console capture;
 - host-bounded timeouts that discard and replace a poisoned isolate;
 - no ambient filesystem, process, network, or `Deno` authority.
+- one append-only, actor-local journal containing admitted messages and
+  model-visible context;
+- a pluggable typed `JournalStore` contract and pure-Rust `MemStore`;
+- pure projections for pending delivery, context history, run completion, and
+  compaction markers;
+- compare-and-append semantics that deterministically resolve steering against
+  run finalization.
 
 The isolate bootstrap is kernel-owned TypeScript installed through Deno's
 extension lifecycle. At startup it reads a Rust-generated builtin manifest,
@@ -50,10 +57,10 @@ residency after we establish a safe lifecycle contract with `rusty_v8`.
 
 ## Workspace
 
-- `lam`: public facade, currently re-exporting the eval-kernel builder
-- `lam-core`: actor, model, context, mailbox, and storage abstractions
+- `lam`: public facade, re-exporting the implemented kernel and state model
+- `lam-core`: actor journal, mailbox, context, and storage contracts
 - `lam-deno`: embedded Deno isolate and typed builtin bridge
-- `lam-redb`: durable `redb` state-store implementation
+- `lam-redb`: reserved for the future durable `redb` adapter
 
 The future TUI will be distributed as an executable named `lam` from a
 separately named workspace package, so it does not displace the `lam` library

@@ -1080,6 +1080,12 @@ dependencies = [
 [[package]]
 name = "lam-core"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
 
 [[package]]
 name = "lam-deno"

@@ -258,9 +258,6 @@ impl Isolate {
                     timeout_ms,
                     previous_generation,
                     new_generation,
-                    isolate_restarted: true,
-                    state_lost: true,
-                    partial_effects_possible: true,
                 })
             }
             Err(error) => Err(EvalError::RestartFailed {
@@ -268,9 +265,6 @@ impl Isolate {
                 previous_generation,
                 attempted_generation: new_generation,
                 message: error.to_string(),
-                isolate_restarted: false,
-                state_lost: true,
-                partial_effects_possible: true,
             }),
         }
     }

@@ -4,5 +4,16 @@ version.workspace = true
 edition.workspace = true
 description = "Provider-independent actor, context, model, and storage core for Lam"
 
+[features]
+test-support = []
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+
 [lints]
 workspace = true

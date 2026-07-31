@@ -364,9 +364,6 @@ async fn timeout_discards_and_replaces_the_isolate() {
             timeout_ms: 20,
             previous_generation,
             new_generation: previous_generation + 1,
-            isolate_restarted: true,
-            state_lost: true,
-            partial_effects_possible: true,
         }
     );
     assert_eq!(isolate.generation(), previous_generation + 1);

@@ -44,6 +44,9 @@ pub enum EvalError {
     },
 
     /// The host deadline interrupted the cell and replaced its isolate.
+    ///
+    /// The previous heap is lost. Host side effects completed before the
+    /// interruption are not rolled back.
     #[error("evaluation timed out after {timeout_ms} ms; isolate restarted")]
     TimedOut {
         /// Effective host-bounded timeout.
@@ -52,15 +55,12 @@ pub enum EvalError {
         previous_generation: u64,
         /// Fresh generation installed before this error was returned.
         new_generation: u64,
-        /// Always true for this variant.
-        isolate_restarted: bool,
-        /// Always true because heap state is not replayed.
-        state_lost: bool,
-        /// Host side effects which completed before interruption are not rolled back.
-        partial_effects_possible: bool,
     },
 
     /// The poisoned isolate was dropped, but its replacement could not start.
+    ///
+    /// The previous heap is lost. Host side effects completed before the
+    /// interruption are not rolled back.
     #[error("evaluation timed out and isolate restart failed: {message}")]
     RestartFailed {
         /// Effective host-bounded timeout.
@@ -71,12 +71,6 @@ pub enum EvalError {
         attempted_generation: u64,
         /// Startup failure.
         message: String,
-        /// Always false for this variant.
-        isolate_restarted: bool,
-        /// Always true because the poisoned isolate was dropped.
-        state_lost: bool,
-        /// Host side effects which completed before interruption are not rolled back.
-        partial_effects_possible: bool,
     },
 
     /// No usable isolate is currently installed.
