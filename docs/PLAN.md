@@ -804,6 +804,7 @@ debugger, or approval UI:
 
 - token/reasoning deltas suitable for display;
 - model-request lifecycle;
+- per-request token usage and optional cost metadata;
 - eval start and completion;
 - builtin start and completion;
 - messages steered or queued;
@@ -849,6 +850,13 @@ Trace identifiers are never authoritative state. Durable IDs such as
 `message_id`, `actor_id`, consumed-message references, context sequence, and
 `run_id` retain their meaning when tracing is disabled or sampled. Explicit
 application protocol identifiers do as well.
+
+Completed model calls also produce a best-effort metadata view for runtime
+events and tracing: provider-reported model identity, normalized token counts,
+the untouched native usage object, and optional cost. Usage extraction cannot
+fail or change a run. Cost is provider-reported when available or explicitly
+marked as an estimate derived from embedding-supplied rates; Lam does not bake a
+mutable provider price catalog into core state.
 
 ## Security and capability boundaries
 
@@ -944,7 +952,7 @@ context, eval, or run semantics.
 
 ## Workspace structure
 
-The initial workspace contains:
+The workspace currently contains:
 
 ```text
 .
@@ -956,6 +964,7 @@ The initial workspace contains:
     ├── lam/
     ├── lam-core/
     ├── lam-deno/
+    ├── lam-openai/
     └── lam-redb/
 ```
 
@@ -986,11 +995,19 @@ It depends inward on the minimal contracts it needs from `lam-core`.
 The durable `JournalStore` adapter and its conformance tests. It depends on
 `lam-core`; `lam-core` does not depend on it.
 
+### `lam-openai`
+
+The first real model-adapter crate. It contains distinct public builders for
+OpenAI's Responses API and the generic OpenAI-compatible Chat Completions
+protocol. They share only HTTP, SSE, and Lam-native context helpers; each keeps
+its own wire contract and replay rules. The crate depends on the public `lam`
+facade so its builders can return a ready-to-use `Model`.
+
 ### Later crates
 
-Provider adapters, standard-library capability packs, and the TUI may become
-separate crates when their boundaries are demonstrated. We will not create
-empty crates for speculative boundaries now.
+Additional provider families, standard-library capability packs, and the TUI
+may become separate crates when their boundaries are demonstrated. We will not
+create empty crates for speculative boundaries now.
 
 ### TUI package and executable naming
 
@@ -1175,7 +1192,7 @@ completed runs, compaction watermarks, and raw context survive.
 
 #### Slice 4B: actor recovery policy
 
-**Implemented; pending review.**
+**Implemented.**
 
 Actor startup builds a fresh isolate, folds the complete actor journal, and
 then admits one host-authored `lam/system-notice@1` message before returning the
@@ -1218,10 +1235,69 @@ a possible future API.
 
 ### Slice 5: real provider codec
 
-Implement one real provider end to end while retaining its native payloads.
-Add token streaming, provider tracing, schema-constrained output, and compatible
-context replay. The provider will be selected immediately before the slice so
-we can use current API behavior.
+**Implemented and live-validated for both protocols.**
+
+`lam-openai` implements both OpenAI's Responses API and the broadly supported
+OpenAI-compatible Chat Completions protocol. They are separate public builders
+rather than one mode flag, but share a small `reqwest`/SSE transport. Both
+builders support an embedding-provided HTTP client, configurable base URL,
+bearer authentication, and an extra JSON request object for provider-specific
+settings. Lam overwrites the fields required for its control-flow invariants.
+
+The Responses adapter is deliberately stateless:
+
+- every request sets `store: false` and manually replays the in-scope context;
+- `reasoning.encrypted_content` is always requested and every native response
+  `output` item is replayed unchanged;
+- the completed provider response object is retained untouched inside a small
+  Lam envelope carrying only requested model and output-kind metadata;
+- `parallel_tool_calls` is false and the only declared function is `eval`;
+- structured outputs use the Responses `text.format` JSON Schema contract.
+
+The Chat Completions adapter targets compatible providers such as Fireworks:
+
+- its base URL is configurable; Fireworks uses
+  `https://api.fireworks.ai/inference/v1`;
+- provider extensions such as `reasoning_effort` and `reasoning_history` pass
+  through `extra_body`;
+- every native SSE JSON chunk is the authoritative stored response because a
+  streaming Chat Completions call has no separate completed response object;
+- the assistant-message replay is a computed view over those chunks and keeps
+  `reasoning_content`, encrypted/signature fields, indexed reasoning details,
+  tool calls, and unknown extension fields rather than decoding through a
+  closed common message type;
+- non-streaming JSON returned by a nominally compatible endpoint is also
+  accepted and preserved losslessly;
+- structured outputs use the compatible `response_format.json_schema`
+  contract.
+
+Both protocols project visible text/reasoning deltas into ephemeral
+`ModelDelta` events, preserve only completed native payloads durably, and emit
+Rust `tracing` spans with HTTP status and provider request ID when available.
+Their codecs compute a non-authoritative `ModelResponseMetadata` view from each
+completed native response. `RunEvent::ModelCompleted` and a Rust tracing event
+expose model identity, input/cached-input/output/reasoning/total token counts,
+the untouched native usage object, and optional USD cost. Cost estimates require
+embedding-supplied per-model prices and are labeled `estimated`, avoiding a
+stale built-in price catalog. Chat Completions asks for streaming usage by
+default through `stream_options.include_usage`, with an explicit compatibility
+opt-out; Fireworks also includes usage in its final streaming chunk.
+A resumed run with a pending eval call projects the durable
+`runtimeResumed`/unknown-outcome notice into the required provider tool-result
+slot and also presents the distinct, delimited system notice to the model.
+
+Offline tests cover exact request bodies, encrypted and plaintext reasoning
+replay, unknown Chat Completions extension fields, schema-constrained output,
+SSE framing, usage/cost projection, downstream model-completion events, and
+complete two-request Lam actor/eval loops for both protocols.
+Explicitly ignored live tests validate a plain completion plus a real
+Rust-backed directory-list/count eval loop. On 2026-08-01 they passed against
+OpenAI Responses with `gpt-5-mini` (resolved to
+`gpt-5-mini-2025-08-07`) and Fireworks Chat Completions with
+`accounts/fireworks/models/deepseek-v4-flash-0731`. Both returned native usage,
+including cached-input detail where applicable, and the configured price view
+produced bounded USD estimates. These tests validate current provider behavior;
+secrets and network-dependent tests remain outside the default suite.
 
 ### Slice 6: compaction strategies
 

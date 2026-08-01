@@ -219,7 +219,10 @@ where
         let join = std::thread::Builder::new()
             .name(format!("lam-{actor_name}"))
             .spawn(move || {
-                let runtime = match tokio::runtime::Builder::new_current_thread().build() {
+                let runtime = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
                     Ok(runtime) => runtime,
                     Err(error) => {
                         let _ = initialized.send(Err(error.to_string()));

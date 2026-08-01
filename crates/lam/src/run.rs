@@ -6,7 +6,9 @@ use std::sync::atomic::AtomicBool;
 use std::task::{Context, Poll};
 
 use futures_core::Stream;
-use lam_core::{MessageEnvelope, MessageId, ModelDelta, OutputContract, RunId};
+use lam_core::{
+    MessageEnvelope, MessageId, ModelDelta, ModelResponseMetadata, OutputContract, RunId,
+};
 use schemars::{JsonSchema, schema_for};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -49,6 +51,8 @@ pub enum RunEvent {
     ModelCompleted {
         /// Activation which produced the response.
         run_id: RunId,
+        /// Best-effort usage and cost view for downstream observability.
+        metadata: ModelResponseMetadata,
     },
     /// Lam began executing the model's TypeScript program.
     EvalStarted {

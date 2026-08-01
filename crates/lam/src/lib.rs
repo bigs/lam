@@ -34,9 +34,10 @@ pub use lam_core::{
     AdmittedMessage, AppendOutcome, CodecId, CodecRef, ComponentId, ContextEntry, ContextSequence,
     ContextTransition, DeliveryMode, EncodedPayload, EvalRequest, EventBatch, InvalidIdentifier,
     JournalError, JournalPage, JournalStore, MemStore, MessageEnvelope, MessageError, MessageId,
-    MessageSource, ModelCodec, ModelDelta, ModelDirective, ModelEventSink, ModelProvider,
-    OutputContract, PrincipalId, ProjectedContextEntry, Revision, RunId, RunProgress, StateError,
-    StoredEvent, Timestamp,
+    MessageSource, ModelCodec, ModelCost, ModelCostSource, ModelDelta, ModelDirective,
+    ModelEventSink, ModelProvider, ModelResponseMetadata, OutputContract, PrincipalId,
+    ProjectedContextEntry, Revision, RunId, RunProgress, StateError, StoredEvent, Timestamp,
+    TokenUsage,
 };
 pub use lam_deno::{
     ConsoleEntry, ConsoleLevel, EvalError, EvalOptions, EvalOutput, EvalValue, Isolate,

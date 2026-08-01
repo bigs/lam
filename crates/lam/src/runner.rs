@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use lam_core::{
     ActorId, ActorState, CodecId, CodecRef, ContextEntry, ContextTransition, EncodedPayload,
     JournalStore, MessageId, MessageSource, ModelCodec, ModelDirective, ModelEventSink,
-    ModelProvider, OutputContract, RunId, RunProgress, Timestamp,
+    ModelProvider, ModelResponseMetadata, OutputContract, RunId, RunProgress, Timestamp,
 };
 use lam_deno::{EvalOptions, Isolate};
 use serde::Serialize;
@@ -184,10 +184,13 @@ where
                     }
                 })?,
             };
+            let metadata = self.codec.response_metadata(&response);
+            trace_model_completed(&self.actor_id, &run_id, &metadata);
             emit(
                 events,
                 RunEvent::ModelCompleted {
                     run_id: run_id.clone(),
+                    metadata,
                 },
             );
             let directive =
@@ -343,6 +346,25 @@ where
             }
         }
     }
+}
+
+fn trace_model_completed(actor_id: &ActorId, run_id: &RunId, metadata: &ModelResponseMetadata) {
+    let usage = metadata.usage.as_ref();
+    let cost = metadata.cost.as_ref();
+    tracing::info!(
+        target: "lam::model",
+        actor_id = %actor_id,
+        run_id = %run_id,
+        model = metadata.model.as_deref().unwrap_or("unknown"),
+        input_tokens = ?usage.map(|usage| usage.input_tokens),
+        cached_input_tokens = ?usage.and_then(|usage| usage.cached_input_tokens),
+        output_tokens = ?usage.map(|usage| usage.output_tokens),
+        reasoning_tokens = ?usage.and_then(|usage| usage.reasoning_tokens),
+        total_tokens = ?usage.map(|usage| usage.total_tokens),
+        cost_usd = ?cost.map(|cost| cost.amount_usd),
+        cost_source = ?cost.map(|cost| cost.source),
+        "model request completed"
+    );
 }
 
 async fn wait_for_abort(abort: &mut watch::Receiver<bool>) {
