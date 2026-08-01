@@ -4,11 +4,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use lam_core::{MessageEnvelope, OutputContract};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::CompactionReceipt;
 use crate::{ActorError, RunEvent};
 
 pub(crate) enum RunnerCommand {
     Wake,
     Call(Box<CallRequest>),
+    Compact(oneshot::Sender<Result<Option<CompactionReceipt>, ActorError>>),
     Shutdown,
 }
 

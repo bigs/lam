@@ -7,19 +7,40 @@ use std::task::Poll;
 use std::time::Duration;
 
 use lam::{
-    Actor, ActorError, ContextTransition, DeliveryMode, Lam, MemStore, Model, ModelDelta,
-    Namespace, Never, Run, RunEvent, RunProgress,
+    Actor, ActorError, CompactionArtifact, CompactionConfig, CompactionPlan, CompactionReason,
+    CompactionRecord, CompactionRequest, Compactor, ContextAmount, ContextSequence,
+    ContextTransition, DeliveryMode, Lam, MemStore, Model, ModelDelta, ModelResponseMetadata,
+    Namespace, Never, Run, RunEvent, RunProgress, RuntimeEvent,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use support::{ScriptedCodec, ScriptedProvider, ScriptedStep, eval, output};
+use support::{
+    RejectingCompactionCodec, ScriptedCodec, ScriptedProvider, ScriptedStep, eval, output,
+    output_with_usage, overflow,
+};
 
 fn gated_output(value: Value, gate: Arc<Barrier>) -> ScriptedStep {
     let mut step = output(value);
     step.gate = Some(gate);
     step
+}
+
+struct InvalidCutCompactor;
+
+impl Compactor for InvalidCutCompactor {
+    fn compact<'a>(&'a self, _request: &'a CompactionRequest) -> lam::CompactionFuture<'a> {
+        Box::pin(async {
+            Ok(CompactionPlan {
+                strategy: "invalid-cut".to_owned(),
+                covers_through: ContextSequence::new(2),
+                artifact: CompactionArtifact::summary("invalid"),
+                source: None,
+                metadata: ModelResponseMetadata::default(),
+            })
+        })
+    }
 }
 
 async fn build_actor(
@@ -118,6 +139,429 @@ async fn model_eval_builtin_result_and_terminal_output_form_one_run() {
             ..
         }
     ));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn manual_compaction_materializes_one_durable_replay_record() {
+    let provider = ScriptedProvider::new([
+        output("first answer"),
+        output("compact state"),
+        output("second answer"),
+    ]);
+    let mut actor = Lam::builder(Model::new(provider.clone(), ScriptedCodec))
+        .compaction_config(CompactionConfig::default().retain(ContextAmount::Tokens(0)))
+        .build()
+        .actor("main")
+        .build()
+        .await
+        .expect("fixture actor should build");
+    let actor_ref = actor.actor_ref();
+    let mut runtime_events = actor
+        .take_runtime_events()
+        .expect("event stream is available");
+
+    assert_eq!(actor.call("first task").await.unwrap(), "first answer");
+    let receipt = actor
+        .compact()
+        .await
+        .expect("manual compaction succeeds")
+        .expect("old context is compactable");
+    assert_eq!(receipt.reason, CompactionReason::Manual);
+    assert_eq!(receipt.covers_through.get(), 2);
+
+    assert!(matches!(
+        runtime_events.next().await,
+        Some(RuntimeEvent::CompactionStarted {
+            run_id: None,
+            reason: CompactionReason::Manual,
+        })
+    ));
+    assert!(matches!(
+        runtime_events.next().await,
+        Some(RuntimeEvent::CompactionCompleted {
+            run_id: None,
+            reason: CompactionReason::Manual,
+            covers_through,
+            ..
+        }) if covers_through.get() == 2
+    ));
+
+    let state = actor_ref.state().await.expect("state should project");
+    assert_eq!(state.context().len(), 3);
+    let marker = state.context().last().unwrap();
+    let record = CompactionRecord::decode(&marker.entry.payload)
+        .unwrap()
+        .expect("durable compaction record");
+    assert_eq!(record.artifact.summary, "compact state");
+    assert_eq!(record.reason, CompactionReason::Manual);
+    assert!(record.source.is_some(), "raw summary response is retained");
+    assert_eq!(
+        record.replacement.codec.id.as_str(),
+        "test/scripted-compaction"
+    );
+
+    assert_eq!(actor.call("second task").await.unwrap(), "second answer");
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[1].value["enableEval"], false);
+    assert_eq!(requests[1].value["maxOutputTokens"], 8_192);
+    let replay = &requests[2].value["context"];
+    assert_eq!(replay.as_array().unwrap().len(), 2);
+    assert_eq!(replay[0]["transition"]["kind"], "compaction");
+    assert!(
+        replay[0]["payload"]["value"].get("source").is_none(),
+        "ephemeral replay must not clone the raw summary response"
+    );
+    assert_eq!(replay[1]["transition"]["kind"], "messages");
+
+    let state = actor_ref.state().await.expect("state should project");
+    assert_eq!(
+        state.context().len(),
+        5,
+        "raw pre-compaction entries remain"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn post_compaction_estimate_ignores_usage_from_before_the_marker() {
+    let provider = ScriptedProvider::new([
+        output_with_usage("first", 1_000),
+        output("summary"),
+        output("done"),
+    ]);
+    let config = CompactionConfig::default()
+        .context_window_tokens(1_000)
+        .trigger_at(ContextAmount::Tokens(500))
+        .retain(ContextAmount::Tokens(70))
+        .summary_reserve_tokens(100);
+    let mut actor = Lam::builder(Model::new(provider.clone(), ScriptedCodec))
+        .compaction_config(config)
+        .build()
+        .actor("main")
+        .build()
+        .await
+        .unwrap();
+
+    assert_eq!(actor.call("one").await.unwrap(), "first");
+    assert_eq!(actor.call("two").await.unwrap(), "done");
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[1].value["enableEval"], false);
+    assert_eq!(
+        requests[2].value["context"][0]["transition"]["kind"],
+        "compaction"
+    );
+    assert!(
+        requests[2].value["context"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["payload"]["value"]["usageTotal"] == 1_000),
+        "the pre-marker model response should remain in the exact tail"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn rejected_materialized_replacement_is_never_persisted() {
+    let provider = ScriptedProvider::new([output("first"), output("summary")]);
+    let mut actor = Lam::builder(Model::new(provider, RejectingCompactionCodec))
+        .compaction_config(CompactionConfig::default().retain(ContextAmount::Tokens(0)))
+        .build()
+        .actor("main")
+        .build()
+        .await
+        .unwrap();
+    let actor_ref = actor.actor_ref();
+
+    assert_eq!(actor.call("one").await.unwrap(), "first");
+    let error = actor.compact().await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("rejected its materialized replacement")
+    );
+    assert!(
+        actor_ref
+            .state()
+            .await
+            .unwrap()
+            .context()
+            .iter()
+            .all(|entry| !matches!(entry.entry.transition, ContextTransition::Compaction { .. }))
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn repeated_compaction_updates_the_summary_and_selects_the_newest_marker() {
+    let provider = ScriptedProvider::new([
+        output("first"),
+        output("summary one"),
+        output("second"),
+        output("summary two"),
+        output("third"),
+    ]);
+    let mut actor = Lam::builder(Model::new(provider.clone(), ScriptedCodec))
+        .compaction_config(CompactionConfig::default().retain(ContextAmount::Tokens(0)))
+        .build()
+        .actor("main")
+        .build()
+        .await
+        .unwrap();
+    let actor_ref = actor.actor_ref();
+
+    assert_eq!(actor.call("one").await.unwrap(), "first");
+    actor.compact().await.unwrap().unwrap();
+    assert_eq!(actor.call("two").await.unwrap(), "second");
+    actor.compact().await.unwrap().unwrap();
+    assert_eq!(actor.call("three").await.unwrap(), "third");
+
+    let state = actor_ref.state().await.unwrap();
+    let markers = state
+        .context()
+        .iter()
+        .filter(|entry| matches!(entry.entry.transition, ContextTransition::Compaction { .. }))
+        .collect::<Vec<_>>();
+    assert_eq!(markers.len(), 2);
+    let newest = CompactionRecord::decode(&markers[1].entry.payload)
+        .unwrap()
+        .unwrap();
+    assert_eq!(newest.artifact.summary, "summary two");
+    assert_eq!(
+        state.context().len(),
+        8,
+        "both covered prefixes remain durable"
+    );
+
+    let requests = provider.requests();
+    assert_eq!(
+        requests[3].value["context"][0]["transition"]["kind"],
+        "compaction"
+    );
+    assert!(
+        requests[3].value["context"][0]
+            .to_string()
+            .contains("summary one"),
+        "iterative summarization receives the prior artifact"
+    );
+    assert_eq!(requests[4].value["context"].as_array().unwrap().len(), 2);
+    assert!(
+        requests[4].value["context"][0]
+            .to_string()
+            .contains("summary two"),
+        "normal inference replays only the newest compatible marker"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn threshold_compaction_is_transparent_and_emits_run_events() {
+    let provider = ScriptedProvider::new([output("short state"), output("done")]);
+    let config = CompactionConfig::default()
+        .context_window_tokens(400)
+        .trigger_at(ContextAmount::Tokens(100))
+        .retain(ContextAmount::Tokens(0))
+        .summary_reserve_tokens(50);
+    let mut actor = Lam::builder(Model::new(provider.clone(), ScriptedCodec))
+        .compaction_config(config)
+        .build()
+        .actor("main")
+        .build()
+        .await
+        .expect("fixture actor should build");
+    let actor_ref = actor.actor_ref();
+
+    let mut run = actor.call("x".repeat(600));
+    let mut events = Vec::new();
+    while let Some(event) = run.next().await {
+        events.push(event);
+    }
+    assert_eq!(run.await.unwrap(), "done");
+    assert!(events.iter().any(|event| matches!(
+        event,
+        RunEvent::CompactionStarted {
+            reason: CompactionReason::Threshold,
+            ..
+        }
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        RunEvent::CompactionCompleted {
+            reason: CompactionReason::Threshold,
+            covers_through,
+            ..
+        } if covers_through.get() == 1
+    )));
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].value["enableEval"], false);
+    assert_eq!(requests[1].value["enableEval"], true);
+    let state = actor_ref.state().await.unwrap();
+    assert_eq!(state.context().len(), 3);
+    assert!(matches!(
+        state.context()[1].entry.transition,
+        ContextTransition::Compaction { .. }
+    ));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn steering_during_compaction_is_delivered_before_agent_inference() {
+    let gate = Arc::new(Barrier::new(2));
+    let provider = ScriptedProvider::new([
+        gated_output(json!("state"), Arc::clone(&gate)),
+        output("done"),
+    ]);
+    let config = CompactionConfig::default()
+        .context_window_tokens(400)
+        .trigger_at(ContextAmount::Tokens(100))
+        .retain(ContextAmount::Tokens(0))
+        .summary_reserve_tokens(50);
+    let mut actor = Lam::builder(Model::new(provider.clone(), ScriptedCodec))
+        .compaction_config(config)
+        .build()
+        .actor("main")
+        .build()
+        .await
+        .unwrap();
+    let actor_ref = actor.actor_ref();
+
+    let mut run = actor.call("x".repeat(600));
+    loop {
+        if matches!(run.next().await, Some(RunEvent::CompactionStarted { .. })) {
+            break;
+        }
+    }
+    actor_ref
+        .send("steered while summarizing", DeliveryMode::Steer)
+        .await
+        .unwrap();
+    gate.wait();
+    assert_eq!(run.await.unwrap(), "done");
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests[1].value["context"]
+            .to_string()
+            .contains("steered while summarizing"),
+        "steering admitted during summary inference must reach the next agent request"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn provider_overflow_compacts_once_then_retries_inference() {
+    let provider = ScriptedProvider::new([overflow(), output("overflow state"), output("done")]);
+    let mut actor = Lam::builder(Model::new(provider.clone(), ScriptedCodec))
+        .compaction_config(
+            CompactionConfig::default()
+                .retain(ContextAmount::Tokens(0))
+                .summary_reserve_tokens(50),
+        )
+        .build()
+        .actor("main")
+        .build()
+        .await
+        .unwrap();
+
+    let mut run = actor.call("large task");
+    let mut events = Vec::new();
+    while let Some(event) = run.next().await {
+        events.push(event);
+    }
+    assert_eq!(run.await.unwrap(), "done");
+    assert!(events.iter().any(|event| matches!(
+        event,
+        RunEvent::CompactionCompleted {
+            reason: CompactionReason::Overflow,
+            ..
+        }
+    )));
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0].value["enableEval"], true);
+    assert_eq!(requests[1].value["enableEval"], false);
+    assert_eq!(requests[2].value["enableEval"], true);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn disabled_compaction_returns_context_overflow_without_hidden_fallback() {
+    let provider = ScriptedProvider::new([overflow()]);
+    let mut actor = Lam::builder(Model::new(provider, ScriptedCodec))
+        .disable_compaction()
+        .build()
+        .actor("main")
+        .build()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        actor.call("large task").await,
+        Err(ActorError::ContextOverflow)
+    );
+    assert_eq!(actor.compact().await, Err(ActorError::CompactionDisabled));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn invalid_atomic_cut_emits_failure_without_appending_a_marker() {
+    let provider = ScriptedProvider::new([eval("1 + 1"), output("done")]);
+    let mut actor = Lam::builder(Model::new(provider, ScriptedCodec))
+        .compaction_config(CompactionConfig::default().retain(ContextAmount::Tokens(0)))
+        .compactor(InvalidCutCompactor)
+        .build()
+        .actor("main")
+        .build()
+        .await
+        .unwrap();
+    let actor_ref = actor.actor_ref();
+    let mut runtime_events = actor.take_runtime_events().unwrap();
+    assert_eq!(actor.call("compute").await.unwrap(), "done");
+
+    let error = actor.compact().await.unwrap_err();
+    assert!(matches!(error, ActorError::Compaction { .. }));
+    assert!(matches!(
+        runtime_events.next().await,
+        Some(RuntimeEvent::CompactionStarted { .. })
+    ));
+    assert!(matches!(
+        runtime_events.next().await,
+        Some(RuntimeEvent::CompactionFailed { ref message, .. })
+            if message.contains("atomic context boundary")
+    ));
+    let state = actor_ref.state().await.unwrap();
+    assert_eq!(state.context().len(), 4);
+    assert!(
+        !state
+            .context()
+            .iter()
+            .any(|entry| matches!(entry.entry.transition, ContextTransition::Compaction { .. }))
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn failed_summary_inference_leaves_raw_context_unchanged() {
+    let provider = ScriptedProvider::new([output("done"), overflow()]);
+    let mut actor = Lam::builder(Model::new(provider, ScriptedCodec))
+        .compaction_config(CompactionConfig::default().retain(ContextAmount::Tokens(0)))
+        .build()
+        .actor("main")
+        .build()
+        .await
+        .unwrap();
+    let actor_ref = actor.actor_ref();
+    assert_eq!(actor.call("task").await.unwrap(), "done");
+
+    assert!(matches!(
+        actor.compact().await,
+        Err(ActorError::Compaction { .. })
+    ));
+    let state = actor_ref.state().await.unwrap();
+    assert_eq!(state.context().len(), 2);
+    assert!(
+        !state
+            .context()
+            .iter()
+            .any(|entry| matches!(entry.entry.transition, ContextTransition::Compaction { .. }))
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]

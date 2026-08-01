@@ -4,6 +4,9 @@ pub enum ActorBuildError {
     /// The actor identifier was empty.
     #[error(transparent)]
     InvalidActorId(#[from] lam_core::InvalidIdentifier),
+    /// Compaction thresholds or budgets are internally inconsistent.
+    #[error("invalid compaction configuration: {0}")]
+    InvalidCompactionConfig(#[source] lam_core::CompactionConfigError),
     /// The dedicated runner thread could not be created.
     #[error("failed to start actor thread: {0}")]
     ThreadSpawn(#[source] std::io::Error),
@@ -48,6 +51,18 @@ pub enum ActorError {
         /// Codec diagnostic.
         message: String,
     },
+    /// The configured compactor could not produce or install a checkpoint.
+    #[error("context compaction failed: {message}")]
+    Compaction {
+        /// Strategy, validation, or materialization diagnostic.
+        message: String,
+    },
+    /// The provider still rejected the model context as oversized.
+    #[error("model context exceeds the provider limit")]
+    ContextOverflow,
+    /// An embedding explicitly requested compaction while it was disabled.
+    #[error("context compaction is disabled")]
+    CompactionDisabled,
     /// The actor runner rejected a second overlapping call.
     #[error("the actor already has an active call")]
     Busy,

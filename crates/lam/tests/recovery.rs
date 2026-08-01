@@ -452,7 +452,10 @@ fn assert_runtime_event(
         isolate_state,
         resumed_run_id: actual_run_id,
         interrupted_eval_outcome: actual_outcome,
-    } = event;
+    } = event
+    else {
+        panic!("expected runtime resumption event")
+    };
     assert_eq!(&actual_message_id, message_id);
     assert!(revision > lam::Revision::ZERO);
     assert_eq!(isolate_state, IsolateState::Reset);

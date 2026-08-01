@@ -35,10 +35,15 @@ adapter crates. They provide:
 - provider-neutral model and codec contracts that preserve native response
   payloads in context before acting on them;
 - a dedicated single-actor runner with durable `send`, linear `call`, steering,
-  and queueing semantics; and
+  and queueing semantics;
 - detachable run-event streams plus text and JSON Schema-derived structured
   outputs;
 - restart recovery with a durable, model-visible isolate-reset notice;
+- configurable 90%-by-default context compaction with a model-generated
+  summary plus exact tail, deterministic truncation, manual triggering, and a
+  public `Compactor` extension point;
+- append-only compaction records containing the raw source response, neutral
+  artifact, exact materialized replay item, and usage/cost metadata;
 - a pure-Rust `redb` journal backend; and
 - lossless OpenAI Responses and OpenAI-compatible Chat Completions adapters
   with token/reasoning streaming, native usage preservation, normalized usage
@@ -80,13 +85,13 @@ items:
 
 ```rust,ignore
 use lam::Lam;
-use lam_openai::{ModelPricing, responses::Responses};
+use lam_openai::responses::Responses;
 
-let model = Responses::builder("gpt-5-mini")
+let model = Responses::builder("gpt-5.6-luna")
     .api_key(std::env::var("OPENAI_API_KEY")?)
-    .pricing(ModelPricing::new(0.25, 2.0).cached_input(0.025))
     .build()?;
 let mut actor = Lam::builder(model)
+    .context_window_tokens(128_000)
     .annotate_system_prompt("Work only inside the configured project root.")
     .build()
     .actor("main")

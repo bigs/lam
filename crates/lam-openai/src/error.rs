@@ -83,6 +83,59 @@ pub enum ProviderError {
     },
 }
 
+impl ProviderError {
+    pub(crate) fn is_context_overflow(&self) -> bool {
+        let text = match self {
+            Self::HttpStatus {
+                status: 400 | 413 | 422,
+                body,
+            } => body,
+            Self::Api { message } => message,
+            _ => return false,
+        }
+        .to_ascii_lowercase();
+        [
+            "context_length_exceeded",
+            "context length",
+            "context window",
+            "maximum context",
+            "too many tokens",
+            "prompt is too long",
+        ]
+        .iter()
+        .any(|needle| text.contains(needle))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ProviderError;
+
+    #[test]
+    fn classifies_only_recognized_context_errors() {
+        assert!(
+            ProviderError::HttpStatus {
+                status: 400,
+                body: r#"{"code":"context_length_exceeded"}"#.to_owned(),
+            }
+            .is_context_overflow()
+        );
+        assert!(
+            ProviderError::Api {
+                message: "maximum context length was exceeded".to_owned(),
+            }
+            .is_context_overflow()
+        );
+        assert!(
+            !ProviderError::HttpStatus {
+                status: 401,
+                body: "context length".to_owned(),
+            }
+            .is_context_overflow()
+        );
+    }
+}
+
 /// A native payload could not be encoded into or interpreted from context.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum CodecError {

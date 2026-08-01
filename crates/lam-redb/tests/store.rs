@@ -3,9 +3,10 @@
 use std::num::NonZeroUsize;
 
 use lam_core::{
-    ActorEvent, ActorId, ActorState, AppendOutcome, CodecId, CodecRef, ContextEntry,
-    ContextSequence, ContextTransition, DeliveryMode, EncodedPayload, EventBatch, JournalStore,
-    MessageEnvelope, MessageId, MessageSource, Revision, RunId, RunProgress, Timestamp,
+    ActorEvent, ActorId, ActorState, AppendOutcome, CodecId, CodecRef, CompactionArtifact,
+    CompactionReason, CompactionRecord, ContextEntry, ContextSequence, ContextTransition,
+    DeliveryMode, EncodedPayload, EventBatch, JournalStore, MessageEnvelope, MessageId,
+    MessageSource, ModelResponseMetadata, Revision, RunId, RunProgress, Timestamp,
 };
 use lam_redb::RedbStore;
 use serde_json::json;
@@ -61,7 +62,24 @@ async fn actor_projection_survives_database_reopen() {
                         covers_through: ContextSequence::new(2),
                         run_id: None,
                     },
-                    EncodedPayload::new(codec.clone(), json!({ "summary": "complete" })),
+                    CompactionRecord {
+                        strategy: "summary-tail".to_owned(),
+                        reason: CompactionReason::Manual,
+                        source: Some(
+                            EncodedPayload::lam_json(json!({
+                                "raw": "provider response"
+                            }))
+                            .expect("fixture JSON is valid"),
+                        ),
+                        artifact: CompactionArtifact::summary("complete"),
+                        replacement: EncodedPayload::new(
+                            codec.clone(),
+                            json!({ "role": "user", "text": "complete" }),
+                        ),
+                        metadata: ModelResponseMetadata::default(),
+                    }
+                    .encode()
+                    .expect("compaction record should encode"),
                     5,
                 )),
             ],
@@ -90,12 +108,19 @@ async fn actor_projection_survives_database_reopen() {
         vec![&queued_id]
     );
     let compaction = state
-        .latest_compaction_matching(|entry| entry.payload.codec == codec)
+        .latest_compaction_matching(|entry| {
+            CompactionRecord::decode(&entry.payload)
+                .ok()
+                .flatten()
+                .is_some_and(|record| record.replacement.codec == codec)
+        })
         .expect("compaction marker should survive reopen");
-    assert_eq!(
-        compaction.entry.payload.value,
-        json!({ "summary": "complete" })
-    );
+    let record = CompactionRecord::decode(&compaction.entry.payload)
+        .expect("record should decode")
+        .expect("payload is a compaction record");
+    assert_eq!(record.artifact.summary, "complete");
+    assert_eq!(record.source.unwrap().value["raw"], "provider response");
+    assert_eq!(record.replacement.value["text"], "complete");
     assert_eq!(state.context().len(), 3, "raw context remains available");
 }
 

@@ -1,8 +1,9 @@
 //! Generic OpenAI-compatible Chat Completions adapter.
 
 use lam::{
-    ContextTransition, EncodedPayload, Model, ModelCodec, ModelDelta, ModelDirective,
-    ModelEventSink, ModelProvider, ModelResponseMetadata, OutputContract, ProjectedContextEntry,
+    CodecId, CodecRef, CompactionArtifact, ContextTransition, EncodedPayload, Model, ModelCodec,
+    ModelDelta, ModelDirective, ModelEventSink, ModelProvider, ModelRequestConfig,
+    ModelResponseMetadata, OutputContract, ProjectedContextEntry,
 };
 use serde_json::{Map, Value, json};
 
@@ -12,14 +13,15 @@ use crate::common::{
     parse_eval_arguments, parse_request, parse_response, request_payload, response_payload,
 };
 use crate::context::{
-    LAM_CODEC_VERSION, LAM_EVAL_CODEC_ID, LAM_MESSAGES_CODEC_ID, NativeRole, eval_output, is_codec,
-    messages, unsupported,
+    LAM_CODEC_VERSION, LAM_EVAL_CODEC_ID, LAM_MESSAGES_CODEC_ID, NativeRole, compaction_record,
+    compaction_text, eval_output, is_codec, messages, unsupported,
 };
 use crate::error::{BuildError, CodecError, ProviderError};
 use crate::metadata::{ModelPricing, UsageDialect, response_metadata as metadata_view};
 use crate::transport::StreamBody;
 
 const CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
+const COMPACTION_REPLACEMENT_CODEC_ID: &str = "openai/chat-compaction";
 
 /// Codec identifier for encoded Chat Completions request bodies.
 pub const REQUEST_CODEC_ID: &str = CHAT_REQUEST_CODEC_ID;
@@ -231,6 +233,10 @@ impl ModelProvider for ChatCompletionsProvider {
             }
         }
     }
+
+    fn is_context_overflow(&self, error: &Self::Error) -> bool {
+        error.is_context_overflow()
+    }
 }
 
 fn emit_chunk_deltas(events: &ModelEventSink, chunk: &Value) {
@@ -275,8 +281,7 @@ impl ModelCodec for ChatCompletionsCodec {
     fn encode_request(
         &self,
         context: &[ProjectedContextEntry],
-        output: &OutputContract,
-        system_prompt: &str,
+        config: &ModelRequestConfig<'_>,
     ) -> Result<EncodedPayload, Self::Error> {
         let mut messages = encode_context(context)?;
         let mut body = self.extra_body.clone();
@@ -296,14 +301,25 @@ impl ModelCodec for ChatCompletionsCodec {
             body.insert("stream_options".to_owned(), Value::Object(stream_options));
         }
         body.insert("n".to_owned(), Value::Number(1.into()));
-        body.insert("parallel_tool_calls".to_owned(), Value::Bool(false));
-        body.insert("tools".to_owned(), Value::Array(vec![eval_tool()]));
-        body.insert("tool_choice".to_owned(), Value::String("auto".to_owned()));
-        let mut system_sections = Vec::new();
-        if !system_prompt.is_empty() {
-            system_sections.push(system_prompt.to_owned());
+        body.remove("tools");
+        body.remove("tool_choice");
+        body.remove("parallel_tool_calls");
+        if config.enable_eval {
+            body.insert("parallel_tool_calls".to_owned(), Value::Bool(false));
+            body.insert("tools".to_owned(), Value::Array(vec![eval_tool()]));
+            body.insert("tool_choice".to_owned(), Value::String("auto".to_owned()));
         }
-        if let OutputContract::Structured { schema } = output {
+        if let Some(max_output_tokens) = config.max_output_tokens {
+            body.insert(
+                "max_tokens".to_owned(),
+                Value::Number(max_output_tokens.into()),
+            );
+        }
+        let mut system_sections = Vec::new();
+        if !config.system_prompt.is_empty() {
+            system_sections.push(config.system_prompt.to_owned());
+        }
+        if let OutputContract::Structured { schema } = config.output {
             system_sections.push(format!(
                 "Return only JSON matching this schema: <lam_output_schema>{schema}</lam_output_schema>"
             ));
@@ -331,7 +347,7 @@ impl ModelCodec for ChatCompletionsCodec {
         body.insert("messages".to_owned(), Value::Array(messages));
         Ok(request_payload(
             CHAT_REQUEST_CODEC_ID,
-            OutputKind::from_contract(output),
+            OutputKind::from_contract(config.output),
             Value::Object(body),
         ))
     }
@@ -385,6 +401,23 @@ impl ModelCodec for ChatCompletionsCodec {
             };
         metadata_view(model, usage, UsageDialect::ChatCompletions, self.pricing)
     }
+
+    fn materialize_compaction(
+        &self,
+        artifact: &CompactionArtifact,
+    ) -> Result<Option<EncodedPayload>, Self::Error> {
+        Ok(Some(EncodedPayload::new(
+            compaction_replacement_codec(),
+            json!([{
+                "role": "user",
+                "content": compaction_text(artifact),
+            }]),
+        )))
+    }
+
+    fn accepts_compaction_replacement(&self, replacement: &EncodedPayload) -> bool {
+        replacement.codec == compaction_replacement_codec()
+    }
 }
 
 fn encode_context(context: &[ProjectedContextEntry]) -> Result<Vec<Value>, CodecError> {
@@ -392,7 +425,31 @@ fn encode_context(context: &[ProjectedContextEntry]) -> Result<Vec<Value>, Codec
     let mut pending_eval = None;
     for projected in context {
         let payload = &projected.entry.payload;
-        if is_codec(payload, LAM_MESSAGES_CODEC_ID, LAM_CODEC_VERSION) {
+        if matches!(
+            projected.entry.transition,
+            ContextTransition::Compaction { .. }
+        ) {
+            if pending_eval.is_some() {
+                return Err(CodecError::InvalidPayload {
+                    message: "compaction replacement cannot split an eval call and result"
+                        .to_owned(),
+                });
+            }
+            let record = compaction_record(payload)?;
+            if record.replacement.codec != compaction_replacement_codec() {
+                return Err(unsupported(&record.replacement));
+            }
+            let replacement =
+                record
+                    .replacement
+                    .value
+                    .as_array()
+                    .ok_or_else(|| CodecError::InvalidPayload {
+                        message: "Chat Completions compaction replacement is not a message array"
+                            .to_owned(),
+                    })?;
+            native.extend(replacement.iter().cloned());
+        } else if is_codec(payload, LAM_MESSAGES_CODEC_ID, LAM_CODEC_VERSION) {
             for message in messages(&payload.value)? {
                 if message.closes_interrupted_eval
                     && let Some(tool_call_id) = pending_eval.take()
@@ -427,15 +484,6 @@ fn encode_context(context: &[ProjectedContextEntry]) -> Result<Vec<Value>, Codec
         } else {
             return Err(unsupported(payload));
         }
-
-        if matches!(
-            projected.entry.transition,
-            ContextTransition::Compaction { .. }
-        ) {
-            return Err(CodecError::InvalidPayload {
-                message: "Chat Completions compaction replay belongs to Slice 6".to_owned(),
-            });
-        }
     }
     if pending_eval.is_some() {
         return Err(CodecError::InvalidPayload {
@@ -444,6 +492,14 @@ fn encode_context(context: &[ProjectedContextEntry]) -> Result<Vec<Value>, Codec
         });
     }
     Ok(native)
+}
+
+fn compaction_replacement_codec() -> CodecRef {
+    CodecRef::new(
+        CodecId::new(COMPACTION_REPLACEMENT_CODEC_ID)
+            .expect("the Chat Completions compaction codec id is valid"),
+        CODEC_VERSION,
+    )
 }
 
 fn eval_tool() -> Value {

@@ -4,19 +4,23 @@ use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use lam_core::{
-    ActorId, ActorState, DeliveryMode, EncodedPayload, JournalStore, MemStore, MessageEnvelope,
-    MessageId, MessageSource, ModelCodec, ModelProvider, Revision, RunId, Timestamp,
+    ActorId, ActorState, CompactionConfig, Compactor, DeliveryMode, EncodedPayload, JournalStore,
+    MemStore, MessageEnvelope, MessageId, MessageSource, ModelCodec, ModelProvider, Revision,
+    RunId, Timestamp,
 };
 use lam_deno::{Isolate, IsolateInterrupt, Namespace};
 use serde::Serialize;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::command::RunnerCommand;
+use crate::compaction::{CompactionReceipt, SummaryTailCompactor};
 use crate::prompt::SystemPrompt;
 use crate::recovery::recover_actor;
 use crate::runner::ActorRunner;
 use crate::runtime_journal::{admit_message, load_state};
 use crate::{ActorBuildError, ActorError, Model, Run, RuntimeEvents};
+
+const RUNTIME_EVENT_BUFFER: usize = 256;
 
 /// Supplies informational host timestamps for durable actor entries.
 pub trait Clock: Send + Sync + 'static {
@@ -85,6 +89,8 @@ impl Lam {
             capture_console: true,
             clock: Arc::new(SystemClock),
             system_prompt: SystemPrompt::default(),
+            compaction_config: CompactionConfig::default(),
+            compactor: ConfiguredCompactor::SummaryTail,
         }
     }
 }
@@ -99,6 +105,14 @@ pub struct LamBuilder<P, C, S> {
     capture_console: bool,
     clock: Arc<dyn Clock>,
     system_prompt: SystemPrompt,
+    compaction_config: CompactionConfig,
+    compactor: ConfiguredCompactor,
+}
+
+enum ConfiguredCompactor {
+    SummaryTail,
+    Custom(Arc<dyn Compactor>),
+    Disabled,
 }
 
 impl<P, C, S> LamBuilder<P, C, S> {
@@ -114,6 +128,8 @@ impl<P, C, S> LamBuilder<P, C, S> {
             capture_console: self.capture_console,
             clock: self.clock,
             system_prompt: self.system_prompt,
+            compaction_config: self.compaction_config,
+            compactor: self.compactor,
         }
     }
 
@@ -138,6 +154,34 @@ impl<P, C, S> LamBuilder<P, C, S> {
     #[must_use]
     pub fn annotate_system_prompt(mut self, instructions: impl Into<String>) -> Self {
         self.system_prompt.annotate(instructions);
+        self
+    }
+
+    /// Replaces automatic compaction thresholds and budgets.
+    #[must_use]
+    pub fn compaction_config(mut self, config: CompactionConfig) -> Self {
+        self.compaction_config = config;
+        self
+    }
+
+    /// Declares the selected model's context window for automatic compaction.
+    #[must_use]
+    pub fn context_window_tokens(mut self, tokens: u64) -> Self {
+        self.compaction_config = self.compaction_config.context_window_tokens(tokens);
+        self
+    }
+
+    /// Replaces the default summary-tail strategy with one compactor.
+    #[must_use]
+    pub fn compactor(mut self, compactor: impl Compactor) -> Self {
+        self.compactor = ConfiguredCompactor::Custom(Arc::new(compactor));
+        self
+    }
+
+    /// Disables manual, threshold, and overflow compaction.
+    #[must_use]
+    pub fn disable_compaction(mut self) -> Self {
+        self.compactor = ConfiguredCompactor::Disabled;
         self
     }
 
@@ -184,6 +228,8 @@ impl<P, C, S> LamBuilder<P, C, S> {
             capture_console: self.capture_console,
             clock: self.clock,
             system_prompt: self.system_prompt,
+            compaction_config: self.compaction_config,
+            compactor: self.compactor,
         }
     }
 }
@@ -198,6 +244,8 @@ pub struct LamRuntime<P, C, S> {
     capture_console: bool,
     clock: Arc<dyn Clock>,
     system_prompt: SystemPrompt,
+    compaction_config: CompactionConfig,
+    compactor: ConfiguredCompactor,
 }
 
 impl<P, C, S> LamRuntime<P, C, S> {
@@ -214,6 +262,8 @@ impl<P, C, S> LamRuntime<P, C, S> {
             capture_console: self.capture_console,
             clock: self.clock,
             system_prompt: self.system_prompt,
+            compaction_config: self.compaction_config,
+            compactor: self.compactor,
         }
     }
 }
@@ -229,6 +279,8 @@ pub struct ActorBuilder<P, C, S> {
     capture_console: bool,
     clock: Arc<dyn Clock>,
     system_prompt: SystemPrompt,
+    compaction_config: CompactionConfig,
+    compactor: ConfiguredCompactor,
 }
 
 impl<P, C, S> ActorBuilder<P, C, S>
@@ -240,13 +292,16 @@ where
     /// Builds the persistent isolate on its dedicated actor thread.
     pub async fn build(self) -> Result<Actor<S>, ActorBuildError> {
         let actor_id = self.actor_id?;
+        self.compaction_config
+            .validate()
+            .map_err(ActorBuildError::InvalidCompactionConfig)?;
         let actor_name = actor_id.to_string();
         let store = Arc::new(self.store);
         let ids = Arc::new(RuntimeIds::new());
         let call_active = Arc::new(AtomicBool::new(false));
         let shutdown = Arc::new(AtomicBool::new(false));
         let (commands, receiver) = mpsc::unbounded_channel();
-        let (runtime_event_sender, runtime_event_receiver) = mpsc::unbounded_channel();
+        let (runtime_event_sender, runtime_event_receiver) = mpsc::channel(RUNTIME_EVENT_BUFFER);
         let (abort, abort_receiver) = watch::channel(false);
         let (initialized, initialization) = oneshot::channel();
         let (stopped_sender, stopped) = oneshot::channel();
@@ -258,6 +313,14 @@ where
         let runner_shutdown = Arc::clone(&shutdown);
         let provider = self.model.provider;
         let codec = self.model.codec;
+        let compactor: Option<Arc<dyn Compactor>> = match self.compactor {
+            ConfiguredCompactor::SummaryTail => Some(Arc::new(SummaryTailCompactor::from_parts(
+                Arc::clone(&provider),
+                Arc::clone(&codec),
+            ))),
+            ConfiguredCompactor::Custom(compactor) => Some(compactor),
+            ConfiguredCompactor::Disabled => None,
+        };
         let join = std::thread::Builder::new()
             .name(format!("lam-{actor_name}"))
             .spawn(move || {
@@ -309,7 +372,7 @@ where
                         }
                     };
                     if let Some(event) = recovery.event {
-                        let _ = runtime_event_sender.send(event);
+                        let _ = runtime_event_sender.try_send(event);
                     }
                     let runner = ActorRunner {
                         actor_id: runner_actor_id,
@@ -320,9 +383,12 @@ where
                         ids: runner_ids,
                         isolate,
                         system_prompt,
+                        compaction_config: self.compaction_config,
+                        compactor,
                         commands: receiver,
                         abort: abort_receiver,
                         shutdown: runner_shutdown,
+                        runtime_events: runtime_event_sender,
                     };
                     let _ = initialized.send(Ok(interrupt));
                     runner.run(recovery.wake).await;
@@ -416,6 +482,22 @@ where
         T: Serialize,
     {
         self.actor_ref.send(input, delivery).await
+    }
+
+    /// Explicitly compacts the current context with the configured strategy.
+    ///
+    /// `None` means the context does not yet contain a prefix outside the
+    /// retained-tail target.
+    pub async fn compact(&mut self) -> Result<Option<CompactionReceipt>, ActorError> {
+        if self.call_active.load(Ordering::Acquire) {
+            return Err(ActorError::Busy);
+        }
+        let (completion, result) = oneshot::channel();
+        self.actor_ref
+            .commands
+            .send(RunnerCommand::Compact(completion))
+            .map_err(|_| ActorError::Unavailable)?;
+        result.await.map_err(|_| ActorError::Unavailable)?
     }
 
     /// Starts a linear text call when the returned run is first polled.

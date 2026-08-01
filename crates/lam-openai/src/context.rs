@@ -1,6 +1,6 @@
 use lam::{
-    EncodedPayload, MessageSource, SYSTEM_NOTICE_CODEC_ID, SYSTEM_NOTICE_CODEC_VERSION,
-    SystemNotice,
+    CompactionArtifact, CompactionRecord, EncodedPayload, MessageSource, SYSTEM_NOTICE_CODEC_ID,
+    SYSTEM_NOTICE_CODEC_VERSION, SystemNotice,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -52,6 +52,31 @@ pub(crate) fn unsupported(payload: &EncodedPayload) -> CodecError {
     CodecError::UnsupportedContext {
         codec: format!("{}@{}", payload.codec.id, payload.codec.version),
     }
+}
+
+pub(crate) fn compaction_record(payload: &EncodedPayload) -> Result<CompactionRecord, CodecError> {
+    CompactionRecord::decode(payload)
+        .map_err(|error| CodecError::InvalidPayload {
+            message: format!("lam/compaction payload is invalid: {error}"),
+        })?
+        .ok_or_else(|| unsupported(payload))
+}
+
+pub(crate) fn compaction_text(artifact: &CompactionArtifact) -> String {
+    let mut text = format!(
+        "Earlier context was compacted. Continue the pending task from this state without asking for it to be repeated.\n<lam_compaction_summary>\n{}\n</lam_compaction_summary>",
+        artifact.summary
+    );
+    if !artifact.excerpts.is_empty() {
+        text.push_str("\n<lam_compaction_excerpts>");
+        for excerpt in &artifact.excerpts {
+            text.push_str("\n<excerpt>");
+            text.push_str(excerpt);
+            text.push_str("</excerpt>");
+        }
+        text.push_str("\n</lam_compaction_excerpts>");
+    }
+    text
 }
 
 fn render_message(message: DeliveredMessage) -> Result<NativeMessage, CodecError> {

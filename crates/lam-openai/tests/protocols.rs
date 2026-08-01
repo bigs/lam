@@ -7,8 +7,9 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use lam::{
-    CodecId, CodecRef, ContextEntry, ContextSequence, ContextTransition, EncodedPayload,
-    ModelCodec, ModelCostSource, ModelDelta, ModelDirective, ModelEventSink, ModelProvider,
+    CodecId, CodecRef, CompactionArtifact, CompactionReason, CompactionRecord, ContextEntry,
+    ContextSequence, ContextTransition, EncodedPayload, ModelCodec, ModelCostSource, ModelDelta,
+    ModelDirective, ModelEventSink, ModelProvider, ModelRequestConfig, ModelResponseMetadata,
     OutputContract, ProjectedContextEntry, Revision, RunEvent, RunId, RunProgress, Timestamp,
 };
 use lam_openai::chat_completions::{
@@ -79,7 +80,10 @@ fn responses_request_is_stateless_and_replays_encrypted_reasoning_unchanged() {
         ),
     ];
     let request = codec
-        .encode_request(&context, &OutputContract::Text, "runtime instructions")
+        .encode_request(
+            &context,
+            &ModelRequestConfig::agent(&OutputContract::Text, "runtime instructions"),
+        )
         .expect("context can be replayed");
     assert_eq!(request.codec.id.as_str(), RESPONSES_REQUEST_CODEC_ID);
     let body = &request.value["body"];
@@ -115,10 +119,12 @@ fn responses_structured_output_uses_json_schema_and_decodes_json() {
     let request = codec
         .encode_request(
             &[user_message("question")],
-            &OutputContract::Structured {
-                schema: schema.clone(),
-            },
-            "runtime instructions",
+            &ModelRequestConfig::agent(
+                &OutputContract::Structured {
+                    schema: schema.clone(),
+                },
+                "runtime instructions",
+            ),
         )
         .expect("valid request");
     assert_eq!(request.value["body"]["text"]["format"]["schema"], schema);
@@ -139,6 +145,71 @@ fn responses_structured_output_uses_json_schema_and_decodes_json() {
         codec.interpret_response(&response).expect("valid output"),
         ModelDirective::Output(json!({ "answer": 42 }))
     );
+}
+
+#[test]
+fn responses_compaction_replays_only_the_durable_materialized_view() {
+    let (_, codec) = Responses::builder("gpt-test")
+        .api_key("test-key")
+        .build_parts()
+        .expect("valid adapter");
+    let artifact = CompactionArtifact::summary("Current goal and state.");
+    let replacement = codec
+        .materialize_compaction(&artifact)
+        .unwrap()
+        .expect("Responses supports neutral compaction");
+    let source = response_payload(
+        RESPONSES_RESPONSE_CODEC_ID,
+        "text",
+        "response",
+        json!({
+            "output": [{
+                "type": "reasoning",
+                "encrypted_content": "raw-compaction-secret"
+            }]
+        }),
+    );
+    let record = CompactionRecord {
+        strategy: "summary-tail".to_owned(),
+        reason: CompactionReason::Threshold,
+        source: Some(source),
+        artifact,
+        replacement,
+        metadata: ModelResponseMetadata::default(),
+    };
+    let context = vec![
+        projected(
+            10,
+            ContextTransition::Compaction {
+                covers_through: ContextSequence::new(8),
+                run_id: None,
+            },
+            record.encode().unwrap(),
+        ),
+        user_message("exact tail"),
+    ];
+    let request = codec
+        .encode_request(
+            &context,
+            &ModelRequestConfig::agent(&OutputContract::Text, "runtime"),
+        )
+        .unwrap();
+    let input = request.value["body"]["input"].as_array().unwrap();
+    assert_eq!(input.len(), 2);
+    assert_eq!(input[0]["role"], "user");
+    assert!(input[0].to_string().contains("Continue the pending task"));
+    assert!(input[0].to_string().contains("Current goal and state."));
+    assert_eq!(input[1]["content"][0]["text"], "exact tail");
+    assert!(!request.value.to_string().contains("raw-compaction-secret"));
+
+    let summary_request = codec
+        .encode_request(
+            &[user_message("history")],
+            &ModelRequestConfig::compaction("summarize", 512),
+        )
+        .unwrap();
+    assert!(summary_request.value["body"].get("tools").is_none());
+    assert_eq!(summary_request.value["body"]["max_output_tokens"], 512);
 }
 
 #[test]
@@ -217,8 +288,7 @@ fn chat_replays_reasoning_extensions_and_tool_calls_from_native_chunks() {
                     payload("lam/eval", json!({ "status": "success", "output": 4 })),
                 ),
             ],
-            &OutputContract::Text,
-            "",
+            &ModelRequestConfig::agent(&OutputContract::Text, ""),
         )
         .expect("context can be replayed");
     assert_eq!(request.codec.id.as_str(), CHAT_REQUEST_CODEC_ID);
@@ -250,10 +320,12 @@ fn chat_structured_output_uses_json_schema_and_decodes_json() {
     let request = codec
         .encode_request(
             &[user_message("numbers")],
-            &OutputContract::Structured {
-                schema: schema.clone(),
-            },
-            "runtime instructions",
+            &ModelRequestConfig::agent(
+                &OutputContract::Structured {
+                    schema: schema.clone(),
+                },
+                "runtime instructions",
+            ),
         )
         .expect("valid request");
     assert_eq!(
@@ -290,6 +362,74 @@ fn chat_structured_output_uses_json_schema_and_decodes_json() {
         codec.interpret_response(&response).expect("valid output"),
         ModelDirective::Output(json!([1, 2, 3]))
     );
+}
+
+#[test]
+fn chat_compaction_replays_only_the_durable_materialized_view() {
+    let (_, codec) = ChatCompletions::builder("test-model")
+        .build_parts()
+        .expect("valid adapter");
+    let artifact = CompactionArtifact::summary("Current goal and state.");
+    let replacement = codec
+        .materialize_compaction(&artifact)
+        .unwrap()
+        .expect("Chat supports neutral compaction");
+    let record = CompactionRecord {
+        strategy: "summary-tail".to_owned(),
+        reason: CompactionReason::Manual,
+        source: Some(response_payload(
+            CHAT_RESPONSE_CODEC_ID,
+            "text",
+            "response",
+            json!({ "private_reasoning": "raw-compaction-secret" }),
+        )),
+        artifact,
+        replacement,
+        metadata: ModelResponseMetadata::default(),
+    };
+    let context = vec![
+        projected(
+            10,
+            ContextTransition::Compaction {
+                covers_through: ContextSequence::new(8),
+                run_id: None,
+            },
+            record.encode().unwrap(),
+        ),
+        user_message("exact tail"),
+    ];
+    let request = codec
+        .encode_request(
+            &context,
+            &ModelRequestConfig::agent(&OutputContract::Text, "runtime"),
+        )
+        .unwrap();
+    let messages = request.value["body"]["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 3, "system, checkpoint, and exact tail");
+    assert_eq!(messages[1]["role"], "user");
+    assert!(
+        messages[1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Continue the pending task")
+    );
+    assert!(
+        messages[1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Current goal and state.")
+    );
+    assert_eq!(messages[2]["content"], "exact tail");
+    assert!(!request.value.to_string().contains("raw-compaction-secret"));
+
+    let summary_request = codec
+        .encode_request(
+            &[user_message("history")],
+            &ModelRequestConfig::compaction("summarize", 512),
+        )
+        .unwrap();
+    assert!(summary_request.value["body"].get("tools").is_none());
+    assert_eq!(summary_request.value["body"]["max_tokens"], 512);
 }
 
 #[test]
@@ -330,8 +470,7 @@ fn resumption_notice_closes_pending_eval_in_both_native_protocols() {
                 projected(1, model_transition(), responses_call),
                 projected(2, recovery_transition(), notice.clone()),
             ],
-            &OutputContract::Text,
-            "",
+            &ModelRequestConfig::agent(&OutputContract::Text, ""),
         )
         .expect("notice closes Responses call");
     assert_eq!(
@@ -378,8 +517,7 @@ fn resumption_notice_closes_pending_eval_in_both_native_protocols() {
                 projected(1, model_transition(), chat_call),
                 projected(2, recovery_transition(), notice),
             ],
-            &OutputContract::Text,
-            "",
+            &ModelRequestConfig::agent(&OutputContract::Text, ""),
         )
         .expect("notice closes Chat call");
     assert_eq!(request.value["body"]["messages"][1]["role"], "tool");
@@ -431,8 +569,7 @@ async fn responses_provider_sends_store_false_and_returns_completed_native_respo
     let request = codec
         .encode_request(
             &[user_message("hello")],
-            &OutputContract::Text,
-            "runtime instructions",
+            &ModelRequestConfig::agent(&OutputContract::Text, "runtime instructions"),
         )
         .expect("valid request");
     let deltas = Arc::new(Mutex::new(Vec::new()));
@@ -503,8 +640,7 @@ async fn chat_provider_preserves_every_chunk_and_streams_reasoning() {
     let request = codec
         .encode_request(
             &[user_message("hello")],
-            &OutputContract::Text,
-            "runtime instructions",
+            &ModelRequestConfig::agent(&OutputContract::Text, "runtime instructions"),
         )
         .expect("valid request");
     let deltas = Arc::new(Mutex::new(Vec::new()));

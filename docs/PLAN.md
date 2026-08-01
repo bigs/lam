@@ -551,14 +551,16 @@ codec-tagged payloads and computed views.
   Lam-native codec.
 - Provider-generated messages and reasoning items are stored in that provider's
   native format without normalizing away fields.
-- Compaction results are stored in the codec that produced them.
+- Compaction records durably retain their untouched source response, portable
+  artifact, and exact codec-specific replacement view.
 
 Provider reasoning models may return encrypted or otherwise opaque reasoning
 traces that must be replayed exactly. Lam must not deserialize such a payload
 into a smaller common enum and then synthesize a supposedly equivalent native
 message.
 
-**Proposed.** A `ModelCodec` supplies computed, read-only views:
+**Settled for Slice 6A.** A `ModelCodec` supplies computed views and can
+materialize a neutral compaction artifact into an exact native replacement:
 
 - encode Lam-native messages for a provider request;
 - expose useful neutral metadata for UIs and diagnostics;
@@ -566,9 +568,12 @@ message.
 - translate or compact incompatible history when switching providers.
 
 Views cut both ways: Lam-native input must be encoded for providers, while
-provider-native output can be inspected through a general view. There remains
-one authoritative payload, not a native copy plus a neutral copy that can
-diverge.
+provider-native output can be inspected through a general view. Ordinary
+context entries retain one authoritative payload. Compaction is a deliberate
+exception because auditability requires both provenance and the exact item
+which was sent back to the model. The replacement is materialized once before
+the marker append and is replayed directly; a later codec release does not
+silently reinterpret an old marker.
 
 ## Context compaction
 
@@ -581,10 +586,11 @@ A compaction marker is itself an append-only context entry. Conceptually it
 records:
 
 - the context sequence it `covers_through`;
-- its output codec/version;
-- provider/model compatibility;
-- the compacted native or Lam payload;
-- strategy metadata useful for inspection.
+- the trigger and stable strategy name;
+- the untouched summary-provider response, when one exists;
+- a neutral summary plus optional exact excerpts;
+- the exact codec-tagged replacement inserted into future requests;
+- normalized usage and cost metadata.
 
 To construct a request, Lam selects the newest marker compatible with the
 target model/codec and appends the eligible tail after `covers_through`. If no
@@ -596,39 +602,94 @@ latest compatible marker. That watermark is a rebuildable optimization. The
 append-only marker is authoritative, so a missing watermark can be recovered
 by seeking backward through the ordered context stream.
 
-Slice 2 uses the simplest correct implementation: its pure projection folds
-the available history and remembers the newest compatible marker. Store-level
-reverse seeks, watermarks, and other materializations remain deferred until
-recovery measurements justify them.
+The pure projection folds the available history and finds the newest compatible
+marker. The request view places that materialized replacement first, followed
+by every non-marker raw entry after `covers_through`. Store-level reverse seeks,
+watermarks, and other indexing remain deferred until measurements justify them.
+The untouched summary response remains in the durable marker but is omitted
+from this ephemeral replay projection.
 
 Markers for other codecs remain history and are ignored when projecting a
 request for which they are not compatible.
 
 ### When compaction occurs
 
-**Settled direction.** Compaction is enabled by default and is transparent to
+**Settled for Slice 6A.** Compaction is enabled by default and is transparent to
 `call`: the actor continues until completion rather than returning a
 "compaction required" condition to the embedding application.
 
-Compaction may be triggered by:
+The public `CompactionConfig` separates three budgets:
 
-- approaching a model context limit;
-- switching to an incompatible provider or model;
-- an explicit caller request;
-- later, a background materialization policy.
+- `trigger_at: ContextAmount`, either a token count or context-window ratio;
+- `retain: ContextAmount`, the target exact recent tail;
+- `summary_reserve_tokens`, a hard output-capacity bound for summary inference.
 
-### Strategy chain
+The default trigger is 90% of a declared context window. Automatic preflight is
+inactive until the embedding declares that window; provider-reported overflow
+can still trigger one recovery compaction and retry. The effective trigger is
+never later than `context_window - summary_reserve_tokens`.
+Configuration is rejected at build time when the resolved retained tail is not
+smaller than that effective trigger.
 
-**Proposed default order:**
+Compaction reasons are:
 
-1. a provider-native compaction facility when one exists;
-2. a Lam-managed summary with a verbatim/recent tail;
-3. deterministic emergency truncation as a last resort.
+- `Threshold`, evaluated immediately before model-request encoding;
+- `Overflow`, after a provider classifies one request as context overflow;
+- `Manual`, exposed through `Actor::compact`.
 
-Strategies are configurable and replaceable. Provider-native compaction
-results remain provider-native context payloads. We will verify actual OpenAI,
-Anthropic, and other provider capabilities when their adapters are built rather
-than encoding assumptions now.
+`disable_compaction` disables all three. In particular, overflow returns a
+typed error instead of silently activating an emergency strategy.
+
+### Compactor contract and built-ins
+
+**Settled for Slice 6A.** One public `Compactor` is active. Its immutable request
+contains only the reason, ordered atomic units, previous neutral artifact,
+retained-tail target, and summary-output cap. It proposes a cutoff and artifact;
+the actor engine remains authoritative for validation, native materialization,
+and compare-and-append installation.
+
+Atomic units prevent a continuing model response from being separated from its
+eval outcome or recovery/steering closure. A proposed cutoff must be the end of
+one such unit. An oversized unit is summarized whole rather than string-sliced.
+
+The public library includes:
+
+- `SummaryTailCompactor`, the default, which uses the actor model unless an
+  embedding supplies another model;
+- `TruncateOldestCompactor`, a deterministic no-inference implementation which
+  inserts an explicit truncation notice;
+- `FallbackCompactor`, an explicit composition helper rather than an implicit
+  engine strategy chain.
+
+The default summary prompt is intentionally minimal. Repeated compaction passes
+the previous neutral artifact into the next summary and retains the newly
+selected tail verbatim. A failed or empty summary appends nothing.
+
+More experimental strategies may later live in a separate extension crate.
+The core trait is already externally implementable, so Slice 6A does not create
+an empty package for them.
+
+### Recovery and observability
+
+Compaction inference has no tools and is repeatable. `CompactionStarted` and
+`CompactionFailed` are ephemeral streaming events. One successful
+`ContextAppended` marker is the `CompactionCompleted` durability point and also
+carries usage/cost metadata for logs and consumers. A crash before that append
+may repeat summary inference; a crash after it replays the installed marker.
+Actor-wide lifecycle events use a bounded, best-effort stream; the journal
+marker, not event buffering, remains authoritative.
+
+Steering admitted while a summary request is outstanding is delivered after
+the marker append and before the next agent inference. Marker installation does
+not make mailbox delivery wait for another model boundary.
+
+### Slice 6B boundary
+
+Model switching and provider-native compaction remain Slice 6B. A native
+compactor will store the complete endpoint response and materialize its opaque
+or encrypted replacement without translating it into a smaller common type.
+Incompatible markers remain durable history but are ignored by request
+projection.
 
 Physical database compaction, archival, and content-addressed offloading are
 separate storage concerns. Logical context compaction never grants permission
@@ -1317,6 +1378,12 @@ including cached-input detail where applicable, and the configured price view
 produced bounded USD estimates. These tests validate current provider behavior;
 secrets and network-dependent tests remain outside the default suite.
 
+The Slice 6A compaction smokes additionally passed on 2026-08-01 against
+Responses with `gpt-5.6-luna` and Chat Completions with the same DeepSeek
+model. They forced one threshold compaction, resumed the original instruction,
+verified the durable marker alongside complete raw history, and emitted usage
+and configured cost estimates for both summary and continuation requests.
+
 ### Slice 5B: model instructions and manifest synopsis
 
 **Implemented.**
@@ -1377,11 +1444,23 @@ the familiar JavaScript `console` global remains callable and its entries are
 discarded. The eval tool description briefly identifies `lam.result`; the
 manifest remains the authoritative documentation surface.
 
-### Slice 6: compaction strategies
+### Slice 6A: provider-neutral compaction
 
-Implement transparent threshold/model-switch compaction, a Lam summary plus
-verbatim tail, emergency truncation, and provider-native compaction where the
-selected adapter supports it. Verify that raw history remains queryable.
+**Implemented and live-validated.**
+
+The generic compactor contract, ratio/token thresholds, automatic and manual
+triggering, summary plus exact tail, deterministic truncation, atomic cut
+validation, durable materialized replacements, and lossless replay through
+Responses and Chat Completions are complete. Coverage includes multiple
+markers, overflow recovery, disabled semantics, steering races, failed
+summaries, redb reopen, and complete raw-history retention.
+
+### Slice 6B: model switching and provider-native compaction
+
+Define model-switch behavior over compatible and incompatible markers. Add
+provider-native compaction where the selected adapter supports it, beginning
+with the OpenAI Responses compaction endpoint, while preserving opaque outputs
+exactly.
 
 ### Slice 7: scheduler and multiple actors
 
@@ -1447,7 +1526,7 @@ These questions are intentionally unresolved and assigned to slices:
 - `JournalStore` async and object-erasure mechanics — Slice 2;
 - context and inbox serialization format/versioning — Slice 2;
 - first real model provider — Slice 5;
-- context thresholds and default compaction strategy — Slice 6;
+- model-switch and provider-native compaction semantics — Slice 6B;
 - safe isolate activation, scheduler sizing, and actor residency policy —
   Slice 7.
 

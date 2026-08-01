@@ -1,8 +1,9 @@
 //! OpenAI Responses API adapter.
 
 use lam::{
-    ContextTransition, EncodedPayload, Model, ModelCodec, ModelDelta, ModelDirective,
-    ModelEventSink, ModelProvider, ModelResponseMetadata, OutputContract, ProjectedContextEntry,
+    CodecId, CodecRef, CompactionArtifact, ContextTransition, EncodedPayload, Model, ModelCodec,
+    ModelDelta, ModelDirective, ModelEventSink, ModelProvider, ModelRequestConfig,
+    ModelResponseMetadata, OutputContract, ProjectedContextEntry,
 };
 use serde_json::{Map, Value, json};
 
@@ -12,14 +13,15 @@ use crate::common::{
     parse_eval_arguments, parse_request, parse_response, request_payload, response_payload,
 };
 use crate::context::{
-    LAM_CODEC_VERSION, LAM_EVAL_CODEC_ID, LAM_MESSAGES_CODEC_ID, NativeRole, eval_output, is_codec,
-    messages, unsupported,
+    LAM_CODEC_VERSION, LAM_EVAL_CODEC_ID, LAM_MESSAGES_CODEC_ID, NativeRole, compaction_record,
+    compaction_text, eval_output, is_codec, messages, unsupported,
 };
 use crate::error::{BuildError, CodecError, ProviderError};
 use crate::metadata::{ModelPricing, UsageDialect, response_metadata};
 use crate::transport::StreamBody;
 
 const RESPONSES_PATH: &str = "/responses";
+const COMPACTION_REPLACEMENT_CODEC_ID: &str = "openai/responses-compaction";
 
 /// Codec identifier for encoded Responses request bodies.
 pub const REQUEST_CODEC_ID: &str = RESPONSES_REQUEST_CODEC_ID;
@@ -197,6 +199,10 @@ impl ModelProvider for ResponsesProvider {
             ))
         }
     }
+
+    fn is_context_overflow(&self, error: &Self::Error) -> bool {
+        error.is_context_overflow()
+    }
 }
 
 fn emit_delta(events: &ModelEventSink, value: &Value, reasoning: bool) {
@@ -232,8 +238,7 @@ impl ModelCodec for ResponsesCodec {
     fn encode_request(
         &self,
         context: &[ProjectedContextEntry],
-        output: &OutputContract,
-        system_prompt: &str,
+        config: &ModelRequestConfig<'_>,
     ) -> Result<EncodedPayload, Self::Error> {
         let input = encode_context(context)?;
         let mut body = self.extra_body.clone();
@@ -241,19 +246,30 @@ impl ModelCodec for ResponsesCodec {
         body.insert("model".to_owned(), Value::String(self.model.clone()));
         body.insert("input".to_owned(), Value::Array(input));
         body.remove("instructions");
-        if !system_prompt.is_empty() {
+        if !config.system_prompt.is_empty() {
             body.insert(
                 "instructions".to_owned(),
-                Value::String(system_prompt.to_owned()),
+                Value::String(config.system_prompt.to_owned()),
             );
         }
         body.insert("store".to_owned(), Value::Bool(false));
         body.insert("stream".to_owned(), Value::Bool(true));
-        body.insert("parallel_tool_calls".to_owned(), Value::Bool(false));
         body.insert("include".to_owned(), Value::Array(include));
-        body.insert("tools".to_owned(), Value::Array(vec![eval_tool()]));
-        body.insert("tool_choice".to_owned(), Value::String("auto".to_owned()));
-        if let OutputContract::Structured { schema } = output {
+        body.remove("tools");
+        body.remove("tool_choice");
+        body.remove("parallel_tool_calls");
+        if config.enable_eval {
+            body.insert("parallel_tool_calls".to_owned(), Value::Bool(false));
+            body.insert("tools".to_owned(), Value::Array(vec![eval_tool()]));
+            body.insert("tool_choice".to_owned(), Value::String("auto".to_owned()));
+        }
+        if let Some(max_output_tokens) = config.max_output_tokens {
+            body.insert(
+                "max_output_tokens".to_owned(),
+                Value::Number(max_output_tokens.into()),
+            );
+        }
+        if let OutputContract::Structured { schema } = config.output {
             let mut text = body
                 .remove("text")
                 .and_then(|value| value.as_object().cloned())
@@ -271,7 +287,7 @@ impl ModelCodec for ResponsesCodec {
         }
         Ok(request_payload(
             RESPONSES_REQUEST_CODEC_ID,
-            OutputKind::from_contract(output),
+            OutputKind::from_contract(config.output),
             Value::Object(body),
         ))
     }
@@ -317,6 +333,26 @@ impl ModelCodec for ResponsesCodec {
             self.pricing,
         )
     }
+
+    fn materialize_compaction(
+        &self,
+        artifact: &CompactionArtifact,
+    ) -> Result<Option<EncodedPayload>, Self::Error> {
+        Ok(Some(EncodedPayload::new(
+            compaction_replacement_codec(),
+            json!([{
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": compaction_text(artifact),
+                }]
+            }]),
+        )))
+    }
+
+    fn accepts_compaction_replacement(&self, replacement: &EncodedPayload) -> bool {
+        replacement.codec == compaction_replacement_codec()
+    }
 }
 
 fn encode_context(context: &[ProjectedContextEntry]) -> Result<Vec<Value>, CodecError> {
@@ -324,7 +360,30 @@ fn encode_context(context: &[ProjectedContextEntry]) -> Result<Vec<Value>, Codec
     let mut pending_eval = None;
     for projected in context {
         let payload = &projected.entry.payload;
-        if is_codec(payload, LAM_MESSAGES_CODEC_ID, LAM_CODEC_VERSION) {
+        if matches!(
+            projected.entry.transition,
+            ContextTransition::Compaction { .. }
+        ) {
+            if pending_eval.is_some() {
+                return Err(CodecError::InvalidPayload {
+                    message: "compaction replacement cannot split an eval call and result"
+                        .to_owned(),
+                });
+            }
+            let record = compaction_record(payload)?;
+            if record.replacement.codec != compaction_replacement_codec() {
+                return Err(unsupported(&record.replacement));
+            }
+            let replacement =
+                record
+                    .replacement
+                    .value
+                    .as_array()
+                    .ok_or_else(|| CodecError::InvalidPayload {
+                        message: "Responses compaction replacement is not an item array".to_owned(),
+                    })?;
+            input.extend(replacement.iter().cloned());
+        } else if is_codec(payload, LAM_MESSAGES_CODEC_ID, LAM_CODEC_VERSION) {
             for message in messages(&payload.value)? {
                 if message.closes_interrupted_eval
                     && let Some(call_id) = pending_eval.take()
@@ -369,15 +428,6 @@ fn encode_context(context: &[ProjectedContextEntry]) -> Result<Vec<Value>, Codec
         } else {
             return Err(unsupported(payload));
         }
-
-        if matches!(
-            projected.entry.transition,
-            ContextTransition::Compaction { .. }
-        ) {
-            return Err(CodecError::InvalidPayload {
-                message: "Responses compaction replay belongs to Slice 6".to_owned(),
-            });
-        }
     }
     if pending_eval.is_some() {
         return Err(CodecError::InvalidPayload {
@@ -385,6 +435,14 @@ fn encode_context(context: &[ProjectedContextEntry]) -> Result<Vec<Value>, Codec
         });
     }
     Ok(input)
+}
+
+fn compaction_replacement_codec() -> CodecRef {
+    CodecRef::new(
+        CodecId::new(COMPACTION_REPLACEMENT_CODEC_ID)
+            .expect("the Responses compaction codec id is valid"),
+        CODEC_VERSION,
+    )
 }
 
 fn include_encrypted_reasoning(existing: Option<Value>) -> Result<Vec<Value>, CodecError> {

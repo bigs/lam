@@ -3,8 +3,9 @@ use std::sync::{Arc, Barrier, Mutex};
 use std::time::Duration;
 
 use lam::{
-    EncodedPayload, EvalRequest, ModelCodec, ModelDelta, ModelDirective, ModelEventSink,
-    ModelProvider, OutputContract,
+    CompactionArtifact, EncodedPayload, EvalRequest, ModelCodec, ModelDelta, ModelDirective,
+    ModelEventSink, ModelProvider, ModelRequestConfig, ModelResponseMetadata, OutputContract,
+    TokenUsage,
 };
 use serde_json::{Value, json};
 
@@ -19,7 +20,7 @@ struct ScriptedState {
 }
 
 pub(crate) struct ScriptedStep {
-    response: EncodedPayload,
+    response: Result<EncodedPayload, ScriptError>,
     pub(crate) deltas: Vec<ModelDelta>,
     pub(crate) gate: Option<Arc<Barrier>>,
 }
@@ -70,8 +71,12 @@ impl ModelProvider for ScriptedProvider {
             if let Some(gate) = step.gate {
                 gate.wait();
             }
-            Ok(step.response)
+            step.response
         }
+    }
+
+    fn is_context_overflow(&self, error: &Self::Error) -> bool {
+        error.0 == "context overflow"
     }
 }
 
@@ -84,8 +89,7 @@ impl ModelCodec for ScriptedCodec {
     fn encode_request(
         &self,
         context: &[lam::ProjectedContextEntry],
-        output: &OutputContract,
-        system_prompt: &str,
+        config: &ModelRequestConfig<'_>,
     ) -> Result<EncodedPayload, Self::Error> {
         let context = context
             .iter()
@@ -96,7 +100,7 @@ impl ModelCodec for ScriptedCodec {
                 })
             })
             .collect::<Vec<_>>();
-        let output = match output {
+        let output = match config.output {
             OutputContract::Text => json!({ "kind": "text" }),
             OutputContract::Structured { schema } => {
                 json!({ "kind": "structured", "schema": schema })
@@ -105,7 +109,9 @@ impl ModelCodec for ScriptedCodec {
         Ok(native(json!({
             "context": context,
             "output": output,
-            "systemPrompt": system_prompt,
+            "systemPrompt": config.system_prompt,
+            "enableEval": config.enable_eval,
+            "maxOutputTokens": config.max_output_tokens,
         })))
     }
 
@@ -141,6 +147,73 @@ impl ModelCodec for ScriptedCodec {
             None => Err(ScriptError("response has no directive".to_owned())),
         }
     }
+
+    fn response_metadata(&self, response: &EncodedPayload) -> ModelResponseMetadata {
+        let Some(total_tokens) = response.value.get("usageTotal").and_then(Value::as_u64) else {
+            return ModelResponseMetadata::default();
+        };
+        ModelResponseMetadata {
+            model: Some("scripted".to_owned()),
+            usage: Some(TokenUsage {
+                input_tokens: total_tokens,
+                cached_input_tokens: None,
+                output_tokens: 0,
+                reasoning_tokens: None,
+                total_tokens,
+                native: json!({ "totalTokens": total_tokens }),
+            }),
+            cost: None,
+        }
+    }
+
+    fn materialize_compaction(
+        &self,
+        artifact: &CompactionArtifact,
+    ) -> Result<Option<EncodedPayload>, Self::Error> {
+        Ok(Some(EncodedPayload::new(
+            scripted_compaction_codec(),
+            json!({ "summary": artifact.summary, "excerpts": artifact.excerpts }),
+        )))
+    }
+
+    fn accepts_compaction_replacement(&self, replacement: &EncodedPayload) -> bool {
+        replacement.codec == scripted_compaction_codec()
+    }
+}
+
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+pub(crate) struct RejectingCompactionCodec;
+
+impl ModelCodec for RejectingCompactionCodec {
+    type Error = ScriptError;
+
+    fn encode_request(
+        &self,
+        context: &[lam::ProjectedContextEntry],
+        config: &ModelRequestConfig<'_>,
+    ) -> Result<EncodedPayload, Self::Error> {
+        ScriptedCodec.encode_request(context, config)
+    }
+
+    fn interpret_response(&self, response: &EncodedPayload) -> Result<ModelDirective, Self::Error> {
+        ScriptedCodec.interpret_response(response)
+    }
+
+    fn response_metadata(&self, response: &EncodedPayload) -> ModelResponseMetadata {
+        ScriptedCodec.response_metadata(response)
+    }
+
+    fn materialize_compaction(
+        &self,
+        artifact: &CompactionArtifact,
+    ) -> Result<Option<EncodedPayload>, Self::Error> {
+        ScriptedCodec.materialize_compaction(artifact)
+    }
+
+    fn accepts_compaction_replacement(&self, _replacement: &EncodedPayload) -> bool {
+        false
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -149,7 +222,7 @@ pub(crate) struct ScriptError(String);
 
 pub(crate) fn eval(source: &str) -> ScriptedStep {
     ScriptedStep {
-        response: native(json!({ "kind": "eval", "source": source })),
+        response: Ok(native(json!({ "kind": "eval", "source": source }))),
         deltas: Vec::new(),
         gate: None,
     }
@@ -157,7 +230,29 @@ pub(crate) fn eval(source: &str) -> ScriptedStep {
 
 pub(crate) fn output(value: impl Into<Value>) -> ScriptedStep {
     ScriptedStep {
-        response: native(json!({ "kind": "output", "value": value.into() })),
+        response: Ok(native(json!({ "kind": "output", "value": value.into() }))),
+        deltas: Vec::new(),
+        gate: None,
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn output_with_usage(value: impl Into<Value>, total_tokens: u64) -> ScriptedStep {
+    ScriptedStep {
+        response: Ok(native(json!({
+            "kind": "output",
+            "value": value.into(),
+            "usageTotal": total_tokens,
+        }))),
+        deltas: Vec::new(),
+        gate: None,
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn overflow() -> ScriptedStep {
+    ScriptedStep {
+        response: Err(ScriptError("context overflow".to_owned())),
         deltas: Vec::new(),
         gate: None,
     }
@@ -166,6 +261,13 @@ pub(crate) fn output(value: impl Into<Value>) -> ScriptedStep {
 fn scripted_codec() -> lam::CodecRef {
     lam::CodecRef::new(
         lam::CodecId::new("test/scripted").expect("fixture codec is valid"),
+        1,
+    )
+}
+
+fn scripted_compaction_codec() -> lam::CodecRef {
+    lam::CodecRef::new(
+        lam::CodecId::new("test/scripted-compaction").expect("fixture codec is valid"),
         1,
     )
 }

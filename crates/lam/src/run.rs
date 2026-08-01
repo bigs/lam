@@ -7,7 +7,8 @@ use std::task::{Context, Poll};
 
 use futures_core::Stream;
 use lam_core::{
-    MessageEnvelope, MessageId, ModelDelta, ModelResponseMetadata, OutputContract, RunId,
+    CompactionReason, ContextSequence, MessageEnvelope, MessageId, ModelDelta,
+    ModelResponseMetadata, OutputContract, RunId,
 };
 use schemars::{JsonSchema, schema_for};
 use serde::Serialize;
@@ -53,6 +54,33 @@ pub enum RunEvent {
         run_id: RunId,
         /// Best-effort usage and cost view for downstream observability.
         metadata: ModelResponseMetadata,
+    },
+    /// Lam began creating a replacement view over old context.
+    CompactionStarted {
+        /// Activation being compacted.
+        run_id: RunId,
+        /// Trigger requesting compaction.
+        reason: CompactionReason,
+    },
+    /// A compaction marker became durable.
+    CompactionCompleted {
+        /// Activation being compacted.
+        run_id: RunId,
+        /// Trigger requesting compaction.
+        reason: CompactionReason,
+        /// Inclusive raw-context boundary replaced by the marker.
+        covers_through: ContextSequence,
+        /// Summary-inference usage and cost.
+        metadata: ModelResponseMetadata,
+    },
+    /// A compactor failed without installing a marker.
+    CompactionFailed {
+        /// Activation being compacted.
+        run_id: RunId,
+        /// Trigger requesting compaction.
+        reason: CompactionReason,
+        /// Human-readable failure.
+        message: String,
     },
     /// Lam began executing the model's TypeScript program.
     EvalStarted {

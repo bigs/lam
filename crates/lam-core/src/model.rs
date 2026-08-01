@@ -6,7 +6,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{EncodedPayload, ProjectedContextEntry};
+use crate::{CompactionArtifact, EncodedPayload, ProjectedContextEntry};
 
 /// Requested shape of a terminal model output.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -18,6 +18,43 @@ pub enum OutputContract {
         /// JSON Schema supplied to the provider codec.
         schema: Value,
     },
+}
+
+/// Per-request behavior selected by Lam's agent or compaction loop.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModelRequestConfig<'a> {
+    /// Requested terminal output shape.
+    pub output: &'a OutputContract,
+    /// Ephemeral system instructions for this request.
+    pub system_prompt: &'a str,
+    /// Whether Lam's single eval tool is available.
+    pub enable_eval: bool,
+    /// Optional provider output-token cap.
+    pub max_output_tokens: Option<u64>,
+}
+
+impl<'a> ModelRequestConfig<'a> {
+    /// Constructs an ordinary agent-loop request.
+    #[must_use]
+    pub const fn agent(output: &'a OutputContract, system_prompt: &'a str) -> Self {
+        Self {
+            output,
+            system_prompt,
+            enable_eval: true,
+            max_output_tokens: None,
+        }
+    }
+
+    /// Constructs a tool-free text request used by a model-backed compactor.
+    #[must_use]
+    pub const fn compaction(system_prompt: &'a str, max_output_tokens: u64) -> Self {
+        Self {
+            output: &OutputContract::Text,
+            system_prompt,
+            enable_eval: false,
+            max_output_tokens: Some(max_output_tokens),
+        }
+    }
 }
 
 /// One eval request computed from a provider-native response.
@@ -51,7 +88,8 @@ pub enum ModelDelta {
 /// Best-effort metadata computed from one completed provider response.
 ///
 /// Provider-native response payloads remain authoritative. This view exists
-/// for downstream observability and never participates in actor state.
+/// for downstream observability; a compaction record may retain a copy beside
+/// its untouched source response so replay costs remain inspectable.
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelResponseMetadata {
@@ -137,6 +175,11 @@ pub trait ModelProvider: Send + Sync + 'static {
         request: EncodedPayload,
         events: ModelEventSink,
     ) -> impl Future<Output = Result<EncodedPayload, Self::Error>> + Send;
+
+    /// Classifies a provider failure caused by an oversized model context.
+    fn is_context_overflow(&self, _error: &Self::Error) -> bool {
+        false
+    }
 }
 
 /// Pure translation between Lam context and one provider-native protocol.
@@ -149,8 +192,7 @@ pub trait ModelCodec: Send + Sync + 'static {
     fn encode_request(
         &self,
         context: &[ProjectedContextEntry],
-        output: &OutputContract,
-        system_prompt: &str,
+        config: &ModelRequestConfig<'_>,
     ) -> Result<EncodedPayload, Self::Error>;
 
     /// Interprets one untouched completed provider response.
@@ -162,5 +204,20 @@ pub trait ModelCodec: Send + Sync + 'static {
     /// fields return an empty view rather than failing an otherwise valid run.
     fn response_metadata(&self, _response: &EncodedPayload) -> ModelResponseMetadata {
         ModelResponseMetadata::default()
+    }
+
+    /// Materializes one portable artifact as an exact native context item.
+    ///
+    /// Returning `None` means this codec has not implemented compaction replay.
+    fn materialize_compaction(
+        &self,
+        _artifact: &CompactionArtifact,
+    ) -> Result<Option<EncodedPayload>, Self::Error> {
+        Ok(None)
+    }
+
+    /// Reports whether an exact materialized replacement can be replayed.
+    fn accepts_compaction_replacement(&self, _replacement: &EncodedPayload) -> bool {
+        false
     }
 }

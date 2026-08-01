@@ -2,14 +2,16 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use futures_core::Stream;
-use lam_core::{MessageId, Revision, RunId};
+use lam_core::{
+    CompactionReason, ContextSequence, MessageId, ModelResponseMetadata, Revision, RunId,
+};
 use serde::Serialize;
 use tokio::sync::mpsc;
 
 use crate::{InterruptedEvalOutcome, IsolateState};
 
 /// Actor-wide lifecycle information suitable for an embedding UI.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(
     tag = "type",
     rename_all = "camelCase",
@@ -31,15 +33,49 @@ pub enum RuntimeEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         interrupted_eval_outcome: Option<InterruptedEvalOutcome>,
     },
+    /// Lam began creating a replacement view over old context.
+    CompactionStarted {
+        /// Active run associated with the operation, if any.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        run_id: Option<RunId>,
+        /// Trigger requesting compaction.
+        reason: CompactionReason,
+    },
+    /// A compaction marker became durable.
+    CompactionCompleted {
+        /// Active run associated with the operation, if any.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        run_id: Option<RunId>,
+        /// Trigger requesting compaction.
+        reason: CompactionReason,
+        /// Inclusive raw-context boundary replaced by the marker.
+        covers_through: ContextSequence,
+        /// Journal revision containing the marker.
+        revision: Revision,
+        /// Stable name of the selected strategy.
+        strategy: String,
+        /// Summary-inference usage and cost.
+        metadata: ModelResponseMetadata,
+    },
+    /// A compactor failed without installing a marker.
+    CompactionFailed {
+        /// Active run associated with the operation, if any.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        run_id: Option<RunId>,
+        /// Trigger requesting compaction.
+        reason: CompactionReason,
+        /// Human-readable failure.
+        message: String,
+    },
 }
 
 /// Single-consumer stream of actor-wide runtime events.
 pub struct RuntimeEvents {
-    receiver: mpsc::UnboundedReceiver<RuntimeEvent>,
+    receiver: mpsc::Receiver<RuntimeEvent>,
 }
 
 impl RuntimeEvents {
-    pub(crate) const fn new(receiver: mpsc::UnboundedReceiver<RuntimeEvent>) -> Self {
+    pub(crate) const fn new(receiver: mpsc::Receiver<RuntimeEvent>) -> Self {
         Self { receiver }
     }
 

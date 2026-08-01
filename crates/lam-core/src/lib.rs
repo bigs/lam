@@ -3,6 +3,7 @@
 //! This crate owns the append-only actor state model and deliberately does not
 //! depend on V8 or `deno_core`.
 
+mod compaction;
 mod context;
 mod event;
 mod journal;
@@ -15,6 +16,12 @@ mod types;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
+pub use compaction::{
+    COMPACTION_RECORD_CODEC_ID, COMPACTION_RECORD_CODEC_VERSION, CompactionArtifact,
+    CompactionConfig, CompactionConfigError, CompactionError, CompactionFuture, CompactionPlan,
+    CompactionReason, CompactionRecord, CompactionRequest, CompactionUnit, Compactor,
+    ContextAmount, atomic_compaction_units, compaction_prefix_len, estimate_entry_tokens,
+};
 pub use context::{ContextEntry, ContextTransition, RunProgress};
 pub use event::{ACTOR_EVENT_SCHEMA_VERSION, ActorEvent, ActorEventData};
 pub use journal::{
@@ -24,7 +31,8 @@ pub use mem_store::MemStore;
 pub use message::{DeliveryMode, MessageEnvelope, MessageError, MessageSource};
 pub use model::{
     EvalRequest, ModelCodec, ModelCost, ModelCostSource, ModelDelta, ModelDirective,
-    ModelEventSink, ModelProvider, ModelResponseMetadata, OutputContract, TokenUsage,
+    ModelEventSink, ModelProvider, ModelRequestConfig, ModelResponseMetadata, OutputContract,
+    TokenUsage,
 };
 pub use projection::{
     ActorState, AdmissionDecision, AdmittedMessage, ProjectedContextEntry, StateError,

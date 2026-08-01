@@ -5,6 +5,8 @@
 
 mod actor;
 mod command;
+mod compaction;
+mod compaction_engine;
 mod error;
 mod eval;
 mod model;
@@ -20,6 +22,9 @@ pub use actor::{
     AbortHandle, Actor, ActorBuilder, ActorRef, Clock, Lam, LamBuilder, LamRuntime, MessageReceipt,
     SystemClock,
 };
+pub use compaction::{
+    CompactionReceipt, FallbackCompactor, SummaryTailCompactor, TruncateOldestCompactor,
+};
 pub use error::{ActorBuildError, ActorError};
 pub use eval::EvalOutcome;
 pub use model::Model;
@@ -32,13 +37,16 @@ pub use runtime_event::{RuntimeEvent, RuntimeEvents};
 
 pub use lam_core::{
     ACTOR_EVENT_SCHEMA_VERSION, ActorEvent, ActorEventData, ActorId, ActorState, AdmissionDecision,
-    AdmittedMessage, AppendOutcome, CodecId, CodecRef, ComponentId, ContextEntry, ContextSequence,
-    ContextTransition, DeliveryMode, EncodedPayload, EvalRequest, EventBatch, InvalidIdentifier,
-    JournalError, JournalPage, JournalStore, MemStore, MessageEnvelope, MessageError, MessageId,
-    MessageSource, ModelCodec, ModelCost, ModelCostSource, ModelDelta, ModelDirective,
-    ModelEventSink, ModelProvider, ModelResponseMetadata, OutputContract, PrincipalId,
-    ProjectedContextEntry, Revision, RunId, RunProgress, StateError, StoredEvent, Timestamp,
-    TokenUsage,
+    AdmittedMessage, AppendOutcome, COMPACTION_RECORD_CODEC_ID, COMPACTION_RECORD_CODEC_VERSION,
+    CodecId, CodecRef, CompactionArtifact, CompactionConfig, CompactionConfigError,
+    CompactionError, CompactionFuture, CompactionPlan, CompactionReason, CompactionRecord,
+    CompactionRequest, CompactionUnit, Compactor, ComponentId, ContextAmount, ContextEntry,
+    ContextSequence, ContextTransition, DeliveryMode, EncodedPayload, EvalRequest, EventBatch,
+    InvalidIdentifier, JournalError, JournalPage, JournalStore, MemStore, MessageEnvelope,
+    MessageError, MessageId, MessageSource, ModelCodec, ModelCost, ModelCostSource, ModelDelta,
+    ModelDirective, ModelEventSink, ModelProvider, ModelRequestConfig, ModelResponseMetadata,
+    OutputContract, PrincipalId, ProjectedContextEntry, Revision, RunId, RunProgress, StateError,
+    StoredEvent, Timestamp, TokenUsage,
 };
 pub use lam_deno::{
     ConsoleEntry, ConsoleLevel, EvalError, EvalOptions, EvalOutput, EvalValue, Isolate,

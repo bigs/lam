@@ -5,7 +5,8 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use lam::{
-    Actor, ActorState, Lam, MemStore, Model, ModelCodec, ModelProvider, ModelResponseMetadata,
+    Actor, ActorState, CompactionConfig, CompactionReason, CompactionRecord, ContextAmount,
+    ContextTransition, Lam, MemStore, Model, ModelCodec, ModelProvider, ModelResponseMetadata,
     Namespace, RunEvent,
 };
 use lam_openai::ModelPricing;
@@ -17,7 +18,7 @@ use serde_json::{Value, json};
 
 const FIREWORKS_MODEL: &str = "accounts/fireworks/models/deepseek-v4-flash-0731";
 const FIREWORKS_BASE_URL: &str = "https://api.fireworks.ai/inference/v1";
-const OPENAI_MODEL: &str = "gpt-5-mini";
+const OPENAI_MODEL: &str = "gpt-5.6-luna";
 const MAX_MODEL_REQUESTS: usize = 6;
 
 #[tokio::test(flavor = "current_thread")]
@@ -25,7 +26,6 @@ const MAX_MODEL_REQUESTS: usize = 6;
 async fn openai_responses_smoke() {
     let model = Responses::builder(OPENAI_MODEL)
         .api_key(required_env("OPENAI_API_KEY"))
-        .pricing(ModelPricing::new(0.25, 2.0).cached_input(0.025))
         .extra_body(json!({
             "max_output_tokens": 512,
             "reasoning": { "effort": "low" }
@@ -33,6 +33,19 @@ async fn openai_responses_smoke() {
         .build()
         .expect("valid OpenAI model configuration");
     fixture_smoke(model, "openai-live").await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires OPENAI_API_KEY and makes bounded live API calls"]
+async fn openai_responses_compaction_smoke() {
+    let model = Responses::builder(OPENAI_MODEL)
+        .api_key(required_env("OPENAI_API_KEY"))
+        .extra_body(json!({
+            "reasoning": { "effort": "low" }
+        }))
+        .build()
+        .expect("valid OpenAI model configuration");
+    compaction_smoke(model, "openai-compaction-live").await;
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -51,6 +64,85 @@ async fn fireworks_chat_completions_smoke() {
         .build()
         .expect("valid Fireworks model configuration");
     project_navigation_smoke(model).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires FIREWORKS_API_KEY and makes bounded live API calls"]
+async fn fireworks_chat_completions_compaction_smoke() {
+    let model = ChatCompletions::builder(FIREWORKS_MODEL)
+        .api_key(required_env("FIREWORKS_API_KEY"))
+        .base_url(FIREWORKS_BASE_URL)
+        .pricing(ModelPricing::new(0.14, 0.28).cached_input(0.028))
+        .extra_body(json!({
+            "reasoning_effort": "low",
+            "reasoning_history": "preserved",
+            "perf_metrics_in_response": true
+        }))
+        .build()
+        .expect("valid Fireworks model configuration");
+    compaction_smoke(model, "fireworks-compaction-live").await;
+}
+
+async fn compaction_smoke<P, C>(model: Model<P, C>, actor_id: &str)
+where
+    P: ModelProvider,
+    C: ModelCodec,
+{
+    let config = CompactionConfig::default()
+        .context_window_tokens(4_000)
+        .trigger_at(ContextAmount::Tokens(300))
+        .retain(ContextAmount::Tokens(0))
+        .summary_reserve_tokens(1_024);
+    let mut actor = Lam::builder(model)
+        .compaction_config(config)
+        .build()
+        .actor(actor_id)
+        .build()
+        .await
+        .expect("live actor starts");
+    let actor_ref = actor.actor_ref();
+    let filler = "bounded compaction fixture ".repeat(80);
+    let observation = timed_call(
+        &mut actor,
+        &format!(
+            "Remember that the required final answer is exactly COMPACTION_OK. {filler} Return exactly COMPACTION_OK."
+        ),
+    )
+    .await;
+    assert!(
+        observation
+            .phase_events
+            .iter()
+            .any(|event| event.contains("Threshold compaction")),
+        "run did not report threshold compaction: {:?}",
+        observation.phase_events
+    );
+    assert_metered("compaction", &observation.metadata);
+
+    let state = actor_ref.state().await.expect("state should project");
+    let marker = state
+        .context()
+        .iter()
+        .find(|entry| matches!(entry.entry.transition, ContextTransition::Compaction { .. }))
+        .expect("live run should persist a compaction marker");
+    let record = CompactionRecord::decode(&marker.entry.payload)
+        .expect("record should decode")
+        .expect("marker should use Lam's compaction record");
+    println!("compaction.summary {}", record.artifact.summary);
+    assert_eq!(record.reason, CompactionReason::Threshold);
+    assert!(record.source.is_some());
+    assert!(!record.artifact.is_empty());
+    assert!(
+        state.context().len() >= 3,
+        "raw covered context remains present"
+    );
+    assert!(
+        observation.output.contains("COMPACTION_OK"),
+        "post-compaction output was {}",
+        observation.output
+    );
+
+    actor.shutdown().await.expect("live actor shuts down");
 }
 
 async fn fixture_smoke<P, C>(model: Model<P, C>, actor_id: &str)
@@ -382,6 +474,34 @@ async fn observe_call(actor: &mut Actor<MemStore>, prompt: &str) -> Observation 
                 ));
                 metadata.push(completed);
             }
+            RunEvent::CompactionStarted { ref run_id, reason } => {
+                phase_events.push(format!("run {run_id} started {reason:?} compaction"));
+            }
+            RunEvent::CompactionCompleted {
+                ref run_id,
+                reason,
+                covers_through,
+                metadata: completed,
+            } => {
+                println!(
+                    "compaction.completed {}",
+                    serde_json::to_string(&completed).expect("metadata is serializable")
+                );
+                phase_events.push(format!(
+                    "run {run_id} completed {reason:?} compaction through {}",
+                    covers_through.get()
+                ));
+                metadata.push(completed);
+            }
+            RunEvent::CompactionFailed {
+                ref run_id,
+                reason,
+                ref message,
+            } => {
+                phase_events.push(format!(
+                    "run {run_id} failed {reason:?} compaction: {message}"
+                ));
+            }
             RunEvent::EvalStarted { ref run_id } => {
                 phase_events.push(format!("run {run_id} started eval {}", eval_count + 1));
             }
@@ -472,10 +592,6 @@ fn assert_metered(label: &str, metadata: &[ModelResponseMetadata]) {
         metadata.iter().all(|metadata| metadata.usage.is_some()),
         "{label} response omitted token usage"
     );
-    assert!(
-        metadata.iter().all(|metadata| metadata.cost.is_some()),
-        "{label} response omitted the configured cost estimate"
-    );
     let total_tokens = metadata
         .iter()
         .filter_map(|metadata| metadata.usage.as_ref())
@@ -486,9 +602,13 @@ fn assert_metered(label: &str, metadata: &[ModelResponseMetadata]) {
         .filter_map(|metadata| metadata.cost.as_ref())
         .map(|cost| cost.amount_usd)
         .sum::<f64>();
-    println!(
-        "run.usage label={label} total_tokens={total_tokens} estimated_cost_usd={cost_usd:.8}"
-    );
+    if metadata.iter().all(|metadata| metadata.cost.is_some()) {
+        println!(
+            "run.usage label={label} total_tokens={total_tokens} estimated_cost_usd={cost_usd:.8}"
+        );
+    } else {
+        println!("run.usage label={label} total_tokens={total_tokens} estimated_cost_unconfigured");
+    }
 }
 
 fn required_env(name: &str) -> String {
