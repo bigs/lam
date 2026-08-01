@@ -8,17 +8,26 @@ mod command;
 mod error;
 mod eval;
 mod model;
+mod notice;
+mod recovery;
 mod run;
 mod runner;
+mod runtime_event;
 mod runtime_journal;
 
 pub use actor::{
-    Actor, ActorBuilder, ActorRef, Clock, Lam, LamBuilder, LamRuntime, MessageReceipt, SystemClock,
+    AbortHandle, Actor, ActorBuilder, ActorRef, Clock, Lam, LamBuilder, LamRuntime, MessageReceipt,
+    SystemClock,
 };
 pub use error::{ActorBuildError, ActorError};
 pub use eval::EvalOutcome;
 pub use model::Model;
+pub use notice::{
+    InterruptedEvalOutcome, IsolateState, RUNTIME_COMPONENT_ID, SYSTEM_NOTICE_CODEC_ID,
+    SYSTEM_NOTICE_CODEC_VERSION, SystemNotice,
+};
 pub use run::{Run, RunEvent};
+pub use runtime_event::{RuntimeEvent, RuntimeEvents};
 
 pub use lam_core::{
     ACTOR_EVENT_SCHEMA_VERSION, ActorEvent, ActorEventData, ActorId, ActorState, AdmissionDecision,

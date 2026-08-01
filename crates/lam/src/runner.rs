@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use lam_core::{
     ActorId, ActorState, CodecId, CodecRef, ContextEntry, ContextTransition, EncodedPayload,
@@ -7,10 +8,11 @@ use lam_core::{
 };
 use lam_deno::{EvalOptions, Isolate};
 use serde::Serialize;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::actor::{Clock, RuntimeIds};
 use crate::command::{CallRequest, RunnerCommand};
+use crate::recovery::has_recoverable_work;
 use crate::runtime_journal::{
     AppendAttempt, admit_message, append_context, append_event, load_state, state_error,
 };
@@ -25,6 +27,8 @@ pub(crate) struct ActorRunner<P, C, S> {
     pub(crate) ids: Arc<RuntimeIds>,
     pub(crate) isolate: Isolate,
     pub(crate) commands: mpsc::UnboundedReceiver<RunnerCommand>,
+    pub(crate) abort: watch::Receiver<bool>,
+    pub(crate) shutdown: Arc<AtomicBool>,
 }
 
 impl<P, C, S> ActorRunner<P, C, S>
@@ -33,32 +37,71 @@ where
     C: ModelCodec,
     S: JournalStore + 'static,
 {
-    pub(crate) async fn run(mut self) {
-        while let Some(command) = self.commands.recv().await {
+    pub(crate) async fn run(mut self, wake: bool) {
+        if wake && let Err(ActorError::Aborted) = self.drain_recovered_work().await {
+            return;
+        }
+
+        loop {
+            if self.shutdown.load(Ordering::Acquire) {
+                break;
+            }
+            let command = tokio::select! {
+                biased;
+                _ = wait_for_abort(&mut self.abort) => break,
+                command = self.commands.recv() => command,
+            };
+            let Some(command) = command else {
+                break;
+            };
+            if self.shutdown.load(Ordering::Acquire) {
+                break;
+            }
             match command {
                 RunnerCommand::Wake => {
-                    let _ = self.drive_one(OutputContract::Text, None).await;
+                    if matches!(
+                        self.drive_one(OutputContract::Text, None).await,
+                        Err(ActorError::Aborted)
+                    ) {
+                        break;
+                    }
                 }
-                RunnerCommand::Call(call) => self.handle_call(*call).await,
+                RunnerCommand::Call(call) => {
+                    if self.handle_call(*call).await {
+                        break;
+                    }
+                }
                 RunnerCommand::Shutdown => break,
             }
         }
     }
 
-    async fn handle_call(&mut self, call: CallRequest) {
+    async fn drain_recovered_work(&mut self) -> Result<(), ActorError> {
+        loop {
+            self.drive_one(OutputContract::Text, None).await?;
+            let state = load_state(self.store.as_ref(), &self.actor_id).await?;
+            if !has_recoverable_work(&state) {
+                return Ok(());
+            }
+        }
+    }
+
+    async fn handle_call(&mut self, call: CallRequest) -> bool {
         let result = self.prepare_call(&call).await;
+        let aborted = matches!(result, Err(ActorError::Aborted));
         match result {
             Ok(value) => {
                 let _ = call.completion.send(Ok(value));
             }
             Err(error) => call.fail(error),
         }
+        aborted
     }
 
     async fn prepare_call(&mut self, call: &CallRequest) -> Result<serde_json::Value, ActorError> {
         loop {
             let state = load_state(self.store.as_ref(), &self.actor_id).await?;
-            if state.active_run().is_none() && state.pending_messages().next().is_none() {
+            if !has_recoverable_work(&state) {
                 break;
             }
             self.drive_one(OutputContract::Text, None).await?;
@@ -130,11 +173,17 @@ where
                     },
                 );
             });
-            let response = self.provider.invoke(request, sink).await.map_err(|error| {
-                ActorError::Provider {
-                    message: error.to_string(),
-                }
-            })?;
+            let provider = Arc::clone(&self.provider);
+            let mut abort = self.abort.clone();
+            let response = tokio::select! {
+                biased;
+                _ = wait_for_abort(&mut abort) => return Err(ActorError::Aborted),
+                result = provider.invoke(request, sink) => result.map_err(|error| {
+                    ActorError::Provider {
+                        message: error.to_string(),
+                    }
+                })?,
+            };
             emit(
                 events,
                 RunEvent::ModelCompleted {
@@ -160,13 +209,23 @@ where
                             run_id: run_id.clone(),
                         },
                     );
-                    let result = match request.timeout {
-                        Some(timeout) => {
-                            self.isolate
-                                .eval_with(&request.source, EvalOptions::default().timeout(timeout))
-                                .await
-                        }
-                        None => self.isolate.eval(&request.source).await,
+                    let mut abort = self.abort.clone();
+                    let result = tokio::select! {
+                        biased;
+                        _ = wait_for_abort(&mut abort) => return Err(ActorError::Aborted),
+                        result = async {
+                            match request.timeout {
+                                Some(timeout) => {
+                                    self.isolate
+                                        .eval_with(
+                                            &request.source,
+                                            EvalOptions::default().timeout(timeout),
+                                        )
+                                        .await
+                                }
+                                None => self.isolate.eval(&request.source).await,
+                            }
+                        } => result,
                     };
                     let outcome = match result {
                         Ok(output) => EvalOutcome::Success { output },
@@ -282,6 +341,20 @@ where
                 }
                 Err(error) => return Err(state_error(error)),
             }
+        }
+    }
+}
+
+async fn wait_for_abort(abort: &mut watch::Receiver<bool>) {
+    if *abort.borrow() {
+        return;
+    }
+    loop {
+        if abort.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+        if *abort.borrow_and_update() {
+            return;
         }
     }
 }

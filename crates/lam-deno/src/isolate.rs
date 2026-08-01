@@ -1,8 +1,7 @@
 use std::cell::Cell;
 use std::rc::Rc;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -112,7 +111,8 @@ impl IsolateBuilder {
         let thread_permit = ThreadPermit::acquire()?;
         let console = ConsoleBuffer::default();
         let generation = 1;
-        let kernel = Kernel::new(Arc::clone(&registry), console.clone(), generation).await?;
+        let mut kernel = Kernel::new(Arc::clone(&registry), console.clone(), generation).await?;
+        let interrupt = IsolateInterrupt::new(kernel.isolate_handle());
 
         Ok(Isolate {
             kernel: Some(kernel),
@@ -123,7 +123,51 @@ impl IsolateBuilder {
             next_cell_id: 1,
             default_timeout: self.default_timeout.min(self.max_timeout),
             max_timeout: self.max_timeout,
+            interrupt,
         })
+    }
+}
+
+/// Thread-safe control which interrupts the currently installed V8 isolate.
+///
+/// Interrupting execution poisons that isolate generation. Callers must stop
+/// using and drop the associated [`Isolate`]; Lam's actor runtime does this as
+/// part of its forceful abort path.
+#[derive(Clone)]
+pub struct IsolateInterrupt {
+    current: Arc<Mutex<Option<deno_core::v8::IsolateHandle>>>,
+}
+
+impl IsolateInterrupt {
+    fn new(handle: deno_core::v8::IsolateHandle) -> Self {
+        Self {
+            current: Arc::new(Mutex::new(Some(handle))),
+        }
+    }
+
+    /// Terminates JavaScript execution in the current isolate generation.
+    pub fn terminate(&self) {
+        let current = self
+            .current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(handle) = current.as_ref() {
+            handle.terminate_execution();
+        }
+    }
+
+    fn replace(&self, handle: deno_core::v8::IsolateHandle) {
+        *self
+            .current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handle);
+    }
+
+    fn clear(&self) {
+        self.current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
     }
 }
 
@@ -142,6 +186,7 @@ pub struct Isolate {
     next_cell_id: u64,
     default_timeout: Duration,
     max_timeout: Duration,
+    interrupt: IsolateInterrupt,
 }
 
 struct ThreadPermit;
@@ -179,6 +224,14 @@ impl Isolate {
     #[must_use]
     pub const fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// Returns a thread-safe handle for forcefully interrupting this isolate.
+    ///
+    /// Once invoked, the isolate must be discarded rather than reused.
+    #[must_use]
+    pub fn interrupt_handle(&self) -> IsolateInterrupt {
+        self.interrupt.clone()
     }
 
     /// Evaluates a TypeScript cell with the host's default timeout.
@@ -241,6 +294,7 @@ impl Isolate {
 
         // A terminated V8 isolate is never made reusable. Drop it before starting
         // the replacement so no stale async ops or heap state survive.
+        self.interrupt.clear();
         drop(self.kernel.take());
         self.console.clear();
 
@@ -251,7 +305,8 @@ impl Isolate {
         )
         .await
         {
-            Ok(kernel) => {
+            Ok(mut kernel) => {
+                self.interrupt.replace(kernel.isolate_handle());
                 self.kernel = Some(kernel);
                 self.generation = new_generation;
                 Err(EvalError::TimedOut {
@@ -267,6 +322,12 @@ impl Isolate {
                 message: error.to_string(),
             }),
         }
+    }
+}
+
+impl Drop for Isolate {
+    fn drop(&mut self) {
+        self.interrupt.clear();
     }
 }
 
@@ -491,9 +552,8 @@ enum ExceptionResolution {
 }
 
 struct Watchdog {
-    cancel: mpsc::Sender<()>,
-    fired: Arc<AtomicBool>,
-    thread: JoinHandle<()>,
+    cancel: Option<mpsc::Sender<()>>,
+    thread: Option<JoinHandle<bool>>,
 }
 
 impl Watchdog {
@@ -503,35 +563,47 @@ impl Watchdog {
     ) -> Result<(Self, oneshot::Receiver<()>), EvalError> {
         let (cancel, receiver) = mpsc::channel();
         let (timeout_sender, timeout_receiver) = oneshot::channel();
-        let fired = Arc::new(AtomicBool::new(false));
-        let thread_fired = Arc::clone(&fired);
         let thread = std::thread::Builder::new()
             .name("lam-isolate-watchdog".to_owned())
-            .spawn(move || {
-                if receiver.recv_timeout(timeout).is_err() {
-                    thread_fired.store(true, Ordering::SeqCst);
+            .spawn(move || match receiver.recv_timeout(timeout) {
+                Err(mpsc::RecvTimeoutError::Timeout) => {
                     isolate.terminate_execution();
                     let _ = timeout_sender.send(());
+                    true
                 }
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => false,
             })
             .map_err(EvalError::internal)?;
 
         Ok((
             Self {
-                cancel,
-                fired,
-                thread,
+                cancel: Some(cancel),
+                thread: Some(thread),
             },
             timeout_receiver,
         ))
     }
 
-    fn finish(self) -> Result<bool, EvalError> {
-        let _ = self.cancel.send(());
+    fn finish(mut self) -> Result<bool, EvalError> {
+        if let Some(cancel) = self.cancel.take() {
+            let _ = cancel.send(());
+        }
         self.thread
+            .take()
+            .expect("an unfinished watchdog owns its thread")
             .join()
-            .map_err(|_| EvalError::internal("isolate watchdog panicked"))?;
-        Ok(self.fired.load(Ordering::SeqCst))
+            .map_err(|_| EvalError::internal("isolate watchdog panicked"))
+    }
+}
+
+impl Drop for Watchdog {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            let _ = cancel.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 

@@ -1082,9 +1082,11 @@ dependencies = [
  "futures-core",
  "lam-core",
  "lam-deno",
+ "lam-redb",
  "schemars",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
 ]

@@ -54,6 +54,15 @@ pub enum ActorError {
     /// The actor thread is no longer available.
     #[error("the actor runner is unavailable")]
     Unavailable,
+    /// Forceful actor cancellation stopped the current operation.
+    #[error("the actor operation was aborted")]
+    Aborted,
+    /// The dedicated actor thread could not be joined cleanly.
+    #[error("failed to join the actor runner: {message}")]
+    RunnerJoin {
+        /// Thread or blocking-task diagnostic.
+        message: String,
+    },
     /// A terminal value did not match the requested Rust output type.
     #[error("terminal output did not match its Rust type: {message}")]
     OutputDecode {

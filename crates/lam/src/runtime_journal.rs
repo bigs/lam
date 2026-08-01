@@ -41,30 +41,44 @@ pub(crate) async fn admit_message<S>(
 where
     S: JournalStore,
 {
+    let state = load_state(store, actor_id).await?;
+    admit_message_from_state(store, actor_id, state, message)
+        .await
+        .map(|(receipt, _state)| receipt)
+}
+
+pub(crate) async fn admit_message_from_state<S>(
+    store: &S,
+    actor_id: &ActorId,
+    mut state: ActorState,
+    message: MessageEnvelope,
+) -> Result<(MessageReceipt, ActorState), ActorError>
+where
+    S: JournalStore,
+{
     loop {
-        let state = load_state(store, actor_id).await?;
         match state.plan_admission(message.clone()).map_err(state_error)? {
             AdmissionDecision::Existing { revision } => {
-                return Ok(MessageReceipt {
-                    actor_id: actor_id.clone(),
-                    message_id: message.message_id().clone(),
-                    revision,
-                });
+                return Ok((
+                    MessageReceipt {
+                        actor_id: actor_id.clone(),
+                        message_id: message.message_id().clone(),
+                        revision,
+                    },
+                    state,
+                ));
             }
             AdmissionDecision::Append(event) => {
-                match store
-                    .append(actor_id, state.revision(), EventBatch::one(event))
-                    .await
-                    .map_err(journal_error)?
-                {
-                    AppendOutcome::Appended { head } => {
-                        return Ok(MessageReceipt {
+                match append_event(store, actor_id, state, event).await? {
+                    AppendAttempt::Appended(next) => {
+                        let receipt = MessageReceipt {
                             actor_id: actor_id.clone(),
                             message_id: message.message_id().clone(),
-                            revision: head,
-                        });
+                            revision: next.revision(),
+                        };
+                        return Ok((receipt, next));
                     }
-                    AppendOutcome::Conflict { .. } => {}
+                    AppendAttempt::Conflict => state = load_state(store, actor_id).await?,
                 }
             }
         }

@@ -136,9 +136,11 @@ can define a value or helper in one evaluation and use it in a later evaluation.
 
 The isolate heap is runtime state, not the durable source of truth. After a
 process restart, Lam reconstructs the actor from durable records and inserts an
-explicit resumption message. Freezing V8 isolates, perhaps at run boundaries,
-is an interesting future optimization but is too fragile for the initial
-recovery contract.
+explicit resumption message before making the new runtime available. The
+notice states that the isolate was reset and, when derivable from the last
+native provider response, that an interrupted eval has an unknown outcome.
+Freezing V8 isolates, perhaps at run boundaries, is an interesting future
+optimization but is too fragile for the initial recovery contract.
 
 ## The `lam` TypeScript environment
 
@@ -816,6 +818,11 @@ Embedded consumers that only need input and output can simply await `call`
 without draining every event manually. The event stream must not make the
 simple path awkward.
 
+Actor-wide lifecycle events are separate from a correlated run's events.
+`Actor::take_runtime_events` returns a buffered, single-consumer stream; this
+allows `RuntimeEvent::RuntimeResumed` to remain observable even though its
+authoritative notice is admitted before `ActorBuilder::build` returns.
+
 ### No initial effects ledger
 
 **Settled.** We will not initially persist a third stream recording every
@@ -823,9 +830,10 @@ external effect or `ModelStepStarted`/`Completed` event. The recovery semantics
 for ambiguous in-flight external effects are real, but an effects ledger adds
 substantial machinery before we have a demonstrated need.
 
-Lifecycle information can first exist as runtime events and OpenTelemetry
-spans. If crash recovery requires durable outcome-unknown records later, we can
-add the minimum facts then.
+Lifecycle information otherwise exists as runtime events and OpenTelemetry
+spans. Recovery does not need a third ledger: the minimum authoritative fact is
+a structured `lam/system-notice@1` mailbox message derived from the durable
+context when a fresh runtime starts.
 
 Approval behavior belongs primarily in capability implementations and their
 TypeScript/Rust bridge rather than in a universal event-ledger abstraction.
@@ -1152,7 +1160,7 @@ input → model requests eval → persistent TypeScript executes a typed builtin
 
 #### Slice 4A: durable journal adapter
 
-**Implemented; pending review.**
+**Implemented.**
 
 `lam-redb` implements `JournalStore` with versioned actor-head and
 revision-addressed event tables. One redb write transaction compares the
@@ -1167,10 +1175,46 @@ completed runs, compaction watermarks, and raw context survive.
 
 #### Slice 4B: actor recovery policy
 
-Restart actors from disk, wake durable pending work, preserve model-visible
-context, and inject an explicit resumption message when an interrupted actor
-receives a fresh isolate. Recovery policy and actor lifecycle changes do not
-belong in the storage adapter.
+**Implemented; pending review.**
+
+Actor startup builds a fresh isolate, folds the complete actor journal, and
+then admits one host-authored `lam/system-notice@1` message before returning the
+actor. A never-before-used actor receives no notice. The structured
+`runtimeResumed` payload records `isolateState: "reset"`, the active run when
+one exists, and `interruptedEvalOutcome: "unknown"` only when the last native
+model response can be interpreted as an eval request without a following
+durable eval result. Its message ID identifies that runtime occurrence.
+
+Admission and activation are deliberately separate:
+
+- an active run receives the notice as `Steer` and wakes;
+- pending substantive mail receives a queued notice and wakes;
+- quiescent history receives a queued notice without waking;
+- pending resumption notices alone never start a model run;
+- a new `call` is admitted before notice-only mail is processed, so both enter
+  context in one batch.
+
+A startup activation continues across run boundaries until no substantive
+durable work remains. This prevents queued mail from being stranded when
+recovery must first finish an already-active run.
+
+The durable notice is the source of truth. A matching buffered
+`RuntimeEvent::RuntimeResumed` gives a TUI an immediate display event. Real
+provider codecs should represent the notice with a native system/developer
+construct where appropriate, or use clearly delimited fallback markup such as
+`<lam_system_notice>`; eval results remain distinct `lam/eval@1` context items.
+
+`Actor::shutdown` consumes the linear owner, waits for the current command,
+and joins the dedicated thread without discarding pending mail. `Actor::abort`
+instead signals out of band, drops a cancellable provider future, interrupts
+active V8 execution, and joins the thread. A separately cloneable
+`AbortHandle` carries that explicit kill authority while `ActorRef` remains a
+send-only mailbox address. Abort does not roll back host effects, append a
+shutdown marker, or fabricate an eval result. A missing result is reported as
+outcome unknown after restart. Process-local `call` waiters are not recoverable
+after process death, so autonomously recovered work uses the ordinary text
+output contract. Durable attachable jobs with persisted output contracts remain
+a possible future API.
 
 ### Slice 5: real provider codec
 

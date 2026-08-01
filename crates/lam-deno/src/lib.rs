@@ -15,4 +15,5 @@ pub use builtin::{Namespace, Never, OperationContext};
 pub use error::{EvalError, IsolateBuildError, RuntimeException};
 pub use isolate::{
     ConsoleEntry, ConsoleLevel, EvalOptions, EvalOutput, EvalValue, Isolate, IsolateBuilder,
+    IsolateInterrupt,
 };

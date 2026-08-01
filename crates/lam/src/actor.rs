@@ -7,14 +7,15 @@ use lam_core::{
     ActorId, ActorState, DeliveryMode, EncodedPayload, JournalStore, MemStore, MessageEnvelope,
     MessageId, MessageSource, ModelCodec, ModelProvider, Revision, RunId, Timestamp,
 };
-use lam_deno::{Isolate, Namespace};
+use lam_deno::{Isolate, IsolateInterrupt, Namespace};
 use serde::Serialize;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::command::RunnerCommand;
+use crate::recovery::recover_actor;
 use crate::runner::ActorRunner;
 use crate::runtime_journal::{admit_message, load_state};
-use crate::{ActorBuildError, ActorError, Model, Run};
+use crate::{ActorBuildError, ActorError, Model, Run, RuntimeEvents};
 
 /// Supplies informational host timestamps for durable actor entries.
 pub trait Clock: Send + Sync + 'static {
@@ -53,7 +54,7 @@ impl RuntimeIds {
         }
     }
 
-    fn message_id(&self) -> MessageId {
+    pub(crate) fn message_id(&self) -> MessageId {
         MessageId::new(self.next("message")).expect("runtime ids are nonempty")
     }
 
@@ -201,13 +202,18 @@ where
         let store = Arc::new(self.store);
         let ids = Arc::new(RuntimeIds::new());
         let call_active = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(AtomicBool::new(false));
         let (commands, receiver) = mpsc::unbounded_channel();
-        let (initialized, initialization) = tokio::sync::oneshot::channel();
+        let (runtime_event_sender, runtime_event_receiver) = mpsc::unbounded_channel();
+        let (abort, abort_receiver) = watch::channel(false);
+        let (initialized, initialization) = oneshot::channel();
+        let (stopped_sender, stopped) = oneshot::channel();
 
         let runner_actor_id = actor_id.clone();
         let runner_store = Arc::clone(&store);
         let runner_ids = Arc::clone(&ids);
         let runner_clock = Arc::clone(&self.clock);
+        let runner_shutdown = Arc::clone(&shutdown);
         let provider = self.model.provider;
         let codec = self.model.codec;
         let join = std::thread::Builder::new()
@@ -217,6 +223,7 @@ where
                     Ok(runtime) => runtime,
                     Err(error) => {
                         let _ = initialized.send(Err(error.to_string()));
+                        let _ = stopped_sender.send(());
                         return;
                     }
                 };
@@ -238,6 +245,25 @@ where
                             return;
                         }
                     };
+                    let interrupt = isolate.interrupt_handle();
+                    let recovery = match recover_actor(
+                        &runner_actor_id,
+                        runner_store.as_ref(),
+                        codec.as_ref(),
+                        runner_clock.as_ref(),
+                        runner_ids.as_ref(),
+                    )
+                    .await
+                    {
+                        Ok(recovery) => recovery,
+                        Err(error) => {
+                            let _ = initialized.send(Err(error.to_string()));
+                            return;
+                        }
+                    };
+                    if let Some(event) = recovery.event {
+                        let _ = runtime_event_sender.send(event);
+                    }
                     let runner = ActorRunner {
                         actor_id: runner_actor_id,
                         store: runner_store,
@@ -247,15 +273,18 @@ where
                         ids: runner_ids,
                         isolate,
                         commands: receiver,
+                        abort: abort_receiver,
+                        shutdown: runner_shutdown,
                     };
-                    let _ = initialized.send(Ok(()));
-                    runner.run().await;
+                    let _ = initialized.send(Ok(interrupt));
+                    runner.run(recovery.wake).await;
                 });
+                let _ = stopped_sender.send(());
             })
             .map_err(ActorBuildError::ThreadSpawn)?;
 
-        match initialization.await {
-            Ok(Ok(())) => {}
+        let interrupt = match initialization.await {
+            Ok(Ok(interrupt)) => interrupt,
             Ok(Err(message)) => {
                 let _ = join.join();
                 return Err(ActorBuildError::Initialization { message });
@@ -266,7 +295,7 @@ where
                     message: "actor thread exited during initialization".to_owned(),
                 });
             }
-        }
+        };
 
         let actor_ref = ActorRef {
             actor_id,
@@ -278,7 +307,11 @@ where
         Ok(Actor {
             actor_ref,
             call_active,
-            _thread: join,
+            shutdown,
+            thread: Some(join),
+            stopped: Some(stopped),
+            abort_handle: AbortHandle { interrupt, abort },
+            runtime_events: Some(RuntimeEvents::new(runtime_event_receiver)),
         })
     }
 }
@@ -290,7 +323,11 @@ where
 {
     actor_ref: ActorRef<S>,
     call_active: Arc<AtomicBool>,
-    _thread: JoinHandle<()>,
+    shutdown: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+    stopped: Option<oneshot::Receiver<()>>,
+    abort_handle: AbortHandle,
+    runtime_events: Option<RuntimeEvents>,
 }
 
 impl<S> Actor<S>
@@ -301,6 +338,21 @@ where
     #[must_use]
     pub fn actor_ref(&self) -> ActorRef<S> {
         self.actor_ref.clone()
+    }
+
+    /// Returns explicit kill authority for cancelling work from another task.
+    #[must_use]
+    pub fn abort_handle(&self) -> AbortHandle {
+        self.abort_handle.clone()
+    }
+
+    /// Takes the single-consumer actor-wide runtime event stream.
+    ///
+    /// The stream is buffered from actor startup, so a resumption event remains
+    /// observable even though its durable notice is admitted before `build`
+    /// returns.
+    pub fn take_runtime_events(&mut self) -> Option<RuntimeEvents> {
+        self.runtime_events.take()
     }
 
     /// Durably admits a value to this actor's mailbox.
@@ -334,6 +386,55 @@ where
             message,
         )
     }
+
+    /// Gracefully stops this actor and waits for its dedicated thread to exit.
+    ///
+    /// The currently executing command is allowed to finish. Pending durable
+    /// mailbox messages are not discarded.
+    pub async fn shutdown(mut self) -> Result<(), ActorError> {
+        self.shutdown.store(true, Ordering::Release);
+        let _ = self.actor_ref.commands.send(RunnerCommand::Shutdown);
+        self.join_thread().await
+    }
+
+    /// Forcefully aborts current work and waits for the actor thread to exit.
+    ///
+    /// Provider futures are dropped and active JavaScript is interrupted. Host
+    /// effects which completed before interruption are not rolled back.
+    pub async fn abort(mut self) -> Result<(), ActorError> {
+        self.abort_handle.abort();
+        self.join_thread().await
+    }
+
+    async fn join_thread(&mut self) -> Result<(), ActorError> {
+        let Some(thread) = self.thread.take() else {
+            return Ok(());
+        };
+        if let Some(stopped) = self.stopped.take() {
+            let _ = stopped.await;
+        }
+        thread.join().map_err(|panic| ActorError::RunnerJoin {
+            message: panic_message(panic),
+        })
+    }
+}
+
+/// Cloneable, explicit authority to forcefully stop an actor runtime.
+///
+/// Signalling is synchronous. Use [`Actor::abort`] on the linear owner when
+/// the caller must also wait for the dedicated thread to exit.
+#[derive(Clone)]
+pub struct AbortHandle {
+    interrupt: IsolateInterrupt,
+    abort: watch::Sender<bool>,
+}
+
+impl AbortHandle {
+    /// Cancels the actor's current operation and interrupts active JavaScript.
+    pub fn abort(&self) {
+        let _ = self.abort.send(true);
+        self.interrupt.terminate();
+    }
 }
 
 impl<S> Drop for Actor<S>
@@ -341,7 +442,20 @@ where
     S: JournalStore + 'static,
 {
     fn drop(&mut self) {
-        let _ = self.actor_ref.commands.send(RunnerCommand::Shutdown);
+        if self.thread.is_some() {
+            self.shutdown.store(true, Ordering::Release);
+            let _ = self.actor_ref.commands.send(RunnerCommand::Shutdown);
+        }
+    }
+}
+
+fn panic_message(panic: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = panic.downcast_ref::<&str>() {
+        (*message).to_owned()
+    } else if let Some(message) = panic.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "actor runner panicked without a string payload".to_owned()
     }
 }
 
