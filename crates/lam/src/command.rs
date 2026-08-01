@@ -1,0 +1,69 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use lam_core::{MessageEnvelope, OutputContract};
+use tokio::sync::{mpsc, oneshot};
+
+use crate::{ActorError, RunEvent};
+
+pub(crate) enum RunnerCommand {
+    Wake,
+    Call(Box<CallRequest>),
+    Shutdown,
+}
+
+pub(crate) struct CallRequest {
+    pub(crate) message: MessageEnvelope,
+    pub(crate) output: OutputContract,
+    pub(crate) events: mpsc::Sender<RunEvent>,
+    pub(crate) completion: oneshot::Sender<Result<serde_json::Value, ActorError>>,
+    _lease: CallLease,
+}
+
+impl CallRequest {
+    pub(crate) fn new(
+        message: MessageEnvelope,
+        output: OutputContract,
+        events: mpsc::Sender<RunEvent>,
+        completion: oneshot::Sender<Result<serde_json::Value, ActorError>>,
+        lease: CallLease,
+    ) -> Self {
+        Self {
+            message,
+            output,
+            events,
+            completion,
+            _lease: lease,
+        }
+    }
+
+    pub(crate) fn emit(&self, event: RunEvent) {
+        let _ = self.events.try_send(event);
+    }
+
+    pub(crate) fn fail(self, error: ActorError) {
+        self.emit(RunEvent::Failed {
+            message: error.to_string(),
+        });
+        let _ = self.completion.send(Err(error));
+    }
+}
+
+pub(crate) struct CallLease {
+    active: Arc<AtomicBool>,
+}
+
+impl CallLease {
+    pub(crate) fn acquire(active: Arc<AtomicBool>) -> Result<Self, ActorError> {
+        active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| ActorError::Busy)?;
+        Ok(Self { active })
+    }
+}
+
+impl Drop for CallLease {
+    fn drop(&mut self) {
+        self.active.store(false, Ordering::Release);
+    }
+}

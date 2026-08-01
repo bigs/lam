@@ -436,7 +436,7 @@ public `StateStore` trait in the initial design.
 **Settled.**
 
 ```rust,ignore
-let receipt = actor.send(value, Delivery::Steer).await?;
+let receipt = actor.send(value, DeliveryMode::Steer).await?;
 ```
 
 `value` can be any serializable Rust value. `send` returns a
@@ -459,9 +459,18 @@ let structured: Review = actor.call(input).output::<Review>().await?;
 `call` starts a new correlated run and waits for its tool-calling loop to
 finish. It supports text and schema-constrained structured output.
 
-**Proposed.** The full return is a `Run<T>` handle that can be consumed as an
-event stream or simply joined/awaited for `T`. The exact Rust ergonomics will be
-settled in the public-API slice; the semantic distinction from `send` will not.
+**Settled for Slice 3.** `Actor` is a non-cloneable linear owner, while
+`ActorRef` is a cloneable mailbox address exposing `send`. `Actor::call`
+requires `&mut self` and returns a `Run<'_, T>` which holds that mutable borrow,
+preventing overlapping calls through safe Rust while cloned references remain
+available for steering.
+
+`Run<T>` is both a `Future<Output = Result<T, _>>` and a stream of ephemeral
+runtime events. Ignoring the stream never blocks the actor. Text is the default
+output; `.output::<T>()` requires `DeserializeOwned + JsonSchema`. Runs start
+when first polled. Dropping an unpolled run prevents it from starting; dropping
+a started run detaches that observer without cancelling actor work. Until the
+detached run finishes, another `call` reports that the actor is busy.
 
 ## Model-visible context
 
@@ -761,6 +770,11 @@ builder permit instead of allowing misuse to become a native crash.
 An isolate is also local to its construction thread and is not `Send`. Timeout
 replacement occurs on that same thread and retains the residency permit.
 
+**Settled for Slice 3.** The initial single-actor runner owns one dedicated
+system thread with a current-thread async runtime, actor projection, model loop,
+and persistent isolate. Callers interact through `Actor` and `ActorRef`; the
+thread assignment is not part of their public semantics.
+
 **Deferred to the scheduler slice.** The original fixed-size design assumed one
 single-threaded executor could host multiple resident isolates. Implementation
 invalidated that assumption. The simplest safe scheduler is a bounded set of
@@ -880,7 +894,7 @@ can be disabled by the builder.
 
 ## Provider abstraction
 
-**Proposed decomposition.**
+**Settled control-flow decomposition for Slice 3.**
 
 - A model provider performs requests and exposes native response streams.
 - A codec converts Lam-native entries to provider input and recognizes
@@ -890,6 +904,31 @@ can be disabled by the builder.
 
 The abstraction must be provider-neutral at the control-flow level while
 remaining provider-lossless at the data level.
+
+The codec is pure: it encodes current context plus an output contract into one
+native request payload, then interprets the completed native response as either
+one eval request or an output candidate. The provider performs the external
+request and returns the untouched completed native payload. Only that payload
+is durable; the interpreted directive is a recomputable view.
+
+A model response may request exactly one eval. Sequential and parallel work
+belong inside that single TypeScript program, including `Promise.all` when
+appropriate. Provider parallel-tool-call controls are disabled where available;
+multiple sibling eval calls are a protocol error.
+
+The native model response is appended before Lam acts on it. An eval response
+is recorded as a continuing model entry, then the program executes exactly once
+within that live actor attempt. Its complete `lam/eval@1` success or failure is
+held in memory across compare-and-append retries and appended before steering
+messages enter context. CAS retries never rerun a completed provider request or
+eval.
+
+An output is only a terminal candidate. If a queued message wins the append
+race, Lam refolds and retries completion. If a steering message wins, Lam
+appends the same native response as continuing, consumes the steer, and makes
+another provider request. A process crash may repeat inference. A crash after
+an effecting eval begins but before its result is durable remains outcome
+unknown; Slice 3 adds no effects ledger or exactly-once claim.
 
 Initial actor-loop tests will use a deterministic scripted provider. Real
 OpenAI or Anthropic integration should not be needed to prove mailbox,
@@ -1088,9 +1127,19 @@ loop remain out of scope.
 
 ### Slice 3: actor and scripted model loop
 
-Combine the eval kernel and memory store with a deterministic fake provider.
-Implement runs, `send`, `call`, steering batches, queueing, text output,
-structured output, and simple/streaming consumption.
+**Implemented.**
+
+The eval kernel and memory store are combined behind provider-neutral model and
+codec contracts, with deterministic scripted-provider coverage. Runs, durable
+`send`, linear `call`, steering batches, queueing, text output, structured
+output, and simple/streaming consumption are implemented. Provider-native
+responses are appended before their directives are acted upon, and eval
+outcomes use the `lam/eval@1` context codec.
+
+The slice has one actor and one dedicated runner thread. It does not include
+subagents, actor-to-actor routing, child lifecycle, or the eventual scheduler.
+`Actor` is linear for calls; cloneable `ActorRef` values remain available for
+mailbox delivery. Dropping a started run only detaches its consumer.
 
 The essential end-to-end test is:
 
@@ -1182,7 +1231,6 @@ These questions are intentionally unresolved and assigned to slices:
 - default stdlib capability profile — coding capability slice;
 - `JournalStore` async and object-erasure mechanics — Slice 2;
 - context and inbox serialization format/versioning — Slice 2;
-- final `Run<T>` Rust ergonomics — Slice 3;
 - first real model provider — Slice 5;
 - context thresholds and default compaction strategy — Slice 6;
 - safe isolate activation, scheduler sizing, and actor residency policy —

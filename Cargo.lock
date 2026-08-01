@@ -1073,8 +1073,14 @@ dependencies = [
 name = "lam"
 version = "0.1.0"
 dependencies = [
+ "futures-core",
  "lam-core",
  "lam-deno",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]

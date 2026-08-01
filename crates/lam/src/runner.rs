@@ -1,0 +1,361 @@
+use std::sync::Arc;
+
+use lam_core::{
+    ActorId, ActorState, CodecId, CodecRef, ContextEntry, ContextTransition, EncodedPayload,
+    JournalStore, MessageId, MessageSource, ModelCodec, ModelDirective, ModelEventSink,
+    ModelProvider, OutputContract, RunId, RunProgress, Timestamp,
+};
+use lam_deno::{EvalOptions, Isolate};
+use serde::Serialize;
+use tokio::sync::mpsc;
+
+use crate::actor::{Clock, RuntimeIds};
+use crate::command::{CallRequest, RunnerCommand};
+use crate::runtime_journal::{
+    AppendAttempt, admit_message, append_context, append_event, load_state, state_error,
+};
+use crate::{ActorError, EvalOutcome, RunEvent};
+
+pub(crate) struct ActorRunner<P, C, S> {
+    pub(crate) actor_id: ActorId,
+    pub(crate) store: Arc<S>,
+    pub(crate) provider: Arc<P>,
+    pub(crate) codec: Arc<C>,
+    pub(crate) clock: Arc<dyn Clock>,
+    pub(crate) ids: Arc<RuntimeIds>,
+    pub(crate) isolate: Isolate,
+    pub(crate) commands: mpsc::UnboundedReceiver<RunnerCommand>,
+}
+
+impl<P, C, S> ActorRunner<P, C, S>
+where
+    P: ModelProvider,
+    C: ModelCodec,
+    S: JournalStore + 'static,
+{
+    pub(crate) async fn run(mut self) {
+        while let Some(command) = self.commands.recv().await {
+            match command {
+                RunnerCommand::Wake => {
+                    let _ = self.drive_one(OutputContract::Text, None).await;
+                }
+                RunnerCommand::Call(call) => self.handle_call(*call).await,
+                RunnerCommand::Shutdown => break,
+            }
+        }
+    }
+
+    async fn handle_call(&mut self, call: CallRequest) {
+        let result = self.prepare_call(&call).await;
+        match result {
+            Ok(value) => {
+                let _ = call.completion.send(Ok(value));
+            }
+            Err(error) => call.fail(error),
+        }
+    }
+
+    async fn prepare_call(&mut self, call: &CallRequest) -> Result<serde_json::Value, ActorError> {
+        loop {
+            let state = load_state(self.store.as_ref(), &self.actor_id).await?;
+            if state.active_run().is_none() && state.pending_messages().next().is_none() {
+                break;
+            }
+            self.drive_one(OutputContract::Text, None).await?;
+        }
+
+        admit_message(self.store.as_ref(), &self.actor_id, call.message.clone()).await?;
+        self.drive_one(call.output.clone(), Some(&call.events))
+            .await?
+            .ok_or(ActorError::State {
+                message: "call input did not start a run".to_owned(),
+            })
+    }
+
+    async fn drive_one(
+        &mut self,
+        output: OutputContract,
+        events: Option<&mpsc::Sender<RunEvent>>,
+    ) -> Result<Option<serde_json::Value>, ActorError> {
+        let mut state = load_state(self.store.as_ref(), &self.actor_id).await?;
+        let run_id = match state.active_run() {
+            Some(run_id) => run_id.clone(),
+            None => {
+                if state.eligible_messages().next().is_none() {
+                    return Ok(None);
+                }
+                self.ids.run_id()
+            }
+        };
+        emit(
+            events,
+            RunEvent::Started {
+                run_id: run_id.clone(),
+            },
+        );
+
+        if state.eligible_messages().next().is_some() {
+            let (next, delivered) = self.append_messages(state, &run_id).await?;
+            state = next;
+            emit(
+                events,
+                RunEvent::MessagesDelivered {
+                    run_id: run_id.clone(),
+                    message_ids: delivered,
+                },
+            );
+        }
+
+        loop {
+            let request = self
+                .codec
+                .encode_request(state.context(), &output)
+                .map_err(|error| ActorError::Codec {
+                    message: error.to_string(),
+                })?;
+            emit(
+                events,
+                RunEvent::ModelStarted {
+                    run_id: run_id.clone(),
+                },
+            );
+            let event_sender = events.cloned();
+            let delta_run_id = run_id.clone();
+            let sink = ModelEventSink::new(move |delta| {
+                emit(
+                    event_sender.as_ref(),
+                    RunEvent::ModelDelta {
+                        run_id: delta_run_id.clone(),
+                        delta,
+                    },
+                );
+            });
+            let response = self.provider.invoke(request, sink).await.map_err(|error| {
+                ActorError::Provider {
+                    message: error.to_string(),
+                }
+            })?;
+            emit(
+                events,
+                RunEvent::ModelCompleted {
+                    run_id: run_id.clone(),
+                },
+            );
+            let directive =
+                self.codec
+                    .interpret_response(&response)
+                    .map_err(|error| ActorError::Codec {
+                        message: error.to_string(),
+                    })?;
+            let recorded_at = self.clock.now();
+
+            match directive {
+                ModelDirective::Eval(request) => {
+                    let entry = model_entry(&run_id, RunProgress::Continue, response, recorded_at);
+                    state =
+                        append_context(self.store.as_ref(), &self.actor_id, state, entry).await?;
+                    emit(
+                        events,
+                        RunEvent::EvalStarted {
+                            run_id: run_id.clone(),
+                        },
+                    );
+                    let result = match request.timeout {
+                        Some(timeout) => {
+                            self.isolate
+                                .eval_with(&request.source, EvalOptions::default().timeout(timeout))
+                                .await
+                        }
+                        None => self.isolate.eval(&request.source).await,
+                    };
+                    let outcome = match result {
+                        Ok(output) => EvalOutcome::Success { output },
+                        Err(error) => EvalOutcome::Failure { error },
+                    };
+                    emit(
+                        events,
+                        RunEvent::EvalCompleted {
+                            run_id: run_id.clone(),
+                            outcome: outcome.clone(),
+                        },
+                    );
+                    let entry = eval_entry(&run_id, &outcome, self.clock.now())?;
+                    state =
+                        append_context(self.store.as_ref(), &self.actor_id, state, entry).await?;
+                    if state.eligible_messages().next().is_some() {
+                        let (next, delivered) = self.append_messages(state, &run_id).await?;
+                        state = next;
+                        emit(
+                            events,
+                            RunEvent::MessagesDelivered {
+                                run_id: run_id.clone(),
+                                message_ids: delivered,
+                            },
+                        );
+                    }
+                }
+                ModelDirective::Output(value) => {
+                    match self
+                        .append_output_candidate(state, &run_id, response, recorded_at)
+                        .await?
+                    {
+                        OutputAppend::Completed => {
+                            emit(events, RunEvent::Completed { run_id });
+                            return Ok(Some(value));
+                        }
+                        OutputAppend::Continued(next, delivered) => {
+                            state = next;
+                            emit(
+                                events,
+                                RunEvent::MessagesDelivered {
+                                    run_id: run_id.clone(),
+                                    message_ids: delivered,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    async fn append_messages(
+        &self,
+        mut state: ActorState,
+        run_id: &RunId,
+    ) -> Result<(ActorState, Vec<MessageId>), ActorError> {
+        let recorded_at = self.clock.now();
+        loop {
+            let eligible = state.eligible_messages().cloned().collect::<Vec<_>>();
+            let message_ids = eligible
+                .iter()
+                .map(|message| message.envelope.message_id().clone())
+                .collect::<Vec<_>>();
+            if message_ids.is_empty() {
+                return Ok((state, message_ids));
+            }
+            let payload = messages_payload(&eligible)?;
+            let entry = ContextEntry {
+                transition: ContextTransition::Messages {
+                    run_id: run_id.clone(),
+                    consumed_message_ids: message_ids.clone(),
+                },
+                payload,
+                recorded_at,
+            };
+            let event = state.plan_context_append(entry).map_err(state_error)?;
+            match append_event(self.store.as_ref(), &self.actor_id, state, event).await? {
+                AppendAttempt::Appended(next) => return Ok((next, message_ids)),
+                AppendAttempt::Conflict => {
+                    state = load_state(self.store.as_ref(), &self.actor_id).await?;
+                }
+            }
+        }
+    }
+
+    async fn append_output_candidate(
+        &self,
+        mut state: ActorState,
+        run_id: &RunId,
+        response: EncodedPayload,
+        recorded_at: Timestamp,
+    ) -> Result<OutputAppend, ActorError> {
+        loop {
+            let terminal =
+                model_entry(run_id, RunProgress::Complete, response.clone(), recorded_at);
+            match state.plan_context_append(terminal) {
+                Ok(event) => {
+                    match append_event(self.store.as_ref(), &self.actor_id, state, event).await? {
+                        AppendAttempt::Appended(_next) => return Ok(OutputAppend::Completed),
+                        AppendAttempt::Conflict => {
+                            state = load_state(self.store.as_ref(), &self.actor_id).await?;
+                        }
+                    }
+                }
+                Err(lam_core::StateError::TerminalWithPendingSteer { .. }) => {
+                    let continuing =
+                        model_entry(run_id, RunProgress::Continue, response, recorded_at);
+                    state = append_context(self.store.as_ref(), &self.actor_id, state, continuing)
+                        .await?;
+                    let (state, delivered) = self.append_messages(state, run_id).await?;
+                    return Ok(OutputAppend::Continued(state, delivered));
+                }
+                Err(error) => return Err(state_error(error)),
+            }
+        }
+    }
+}
+
+enum OutputAppend {
+    Completed,
+    Continued(ActorState, Vec<MessageId>),
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeliveredMessage<'a> {
+    message_id: &'a MessageId,
+    source: &'a MessageSource,
+    payload: &'a EncodedPayload,
+}
+
+fn messages_payload(messages: &[lam_core::AdmittedMessage]) -> Result<EncodedPayload, ActorError> {
+    let messages = messages
+        .iter()
+        .map(|message| DeliveredMessage {
+            message_id: message.envelope.message_id(),
+            source: message.envelope.source(),
+            payload: message.envelope.payload(),
+        })
+        .collect::<Vec<_>>();
+    let value = serde_json::to_value(messages).map_err(|error| ActorError::State {
+        message: format!("message context could not be encoded: {error}"),
+    })?;
+    Ok(EncodedPayload::new(codec("lam/messages"), value))
+}
+
+fn eval_entry(
+    run_id: &RunId,
+    outcome: &EvalOutcome,
+    recorded_at: Timestamp,
+) -> Result<ContextEntry, ActorError> {
+    let value = serde_json::to_value(outcome).map_err(|error| ActorError::State {
+        message: format!("eval outcome could not be encoded: {error}"),
+    })?;
+    Ok(ContextEntry {
+        transition: ContextTransition::Eval {
+            run_id: run_id.clone(),
+        },
+        payload: EncodedPayload::new(codec("lam/eval"), value),
+        recorded_at,
+    })
+}
+
+fn model_entry(
+    run_id: &RunId,
+    progress: RunProgress,
+    payload: EncodedPayload,
+    recorded_at: Timestamp,
+) -> ContextEntry {
+    ContextEntry {
+        transition: ContextTransition::Model {
+            run_id: run_id.clone(),
+            progress,
+        },
+        payload,
+        recorded_at,
+    }
+}
+
+fn codec(id: &str) -> CodecRef {
+    CodecRef::new(
+        CodecId::new(id).expect("Lam's built-in codec ids are valid"),
+        1,
+    )
+}
+
+fn emit(events: Option<&mpsc::Sender<RunEvent>>, event: RunEvent) {
+    if let Some(events) = events {
+        let _ = events.try_send(event);
+    }
+}

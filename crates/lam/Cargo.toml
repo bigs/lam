@@ -5,8 +5,14 @@ edition.workspace = true
 description = "Public facade for the Lam actor-style coding agent runtime"
 
 [dependencies]
+futures-core.workspace = true
 lam-core = { path = "../lam-core" }
 lam-deno = { path = "../lam-deno" }
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
 
 [lints]
 workspace = true

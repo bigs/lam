@@ -8,6 +8,7 @@ mod event;
 mod journal;
 mod mem_store;
 mod message;
+mod model;
 mod projection;
 mod types;
 
@@ -21,6 +22,10 @@ pub use journal::{
 };
 pub use mem_store::MemStore;
 pub use message::{DeliveryMode, MessageEnvelope, MessageError, MessageSource};
+pub use model::{
+    EvalRequest, ModelCodec, ModelDelta, ModelDirective, ModelEventSink, ModelProvider,
+    OutputContract,
+};
 pub use projection::{
     ActorState, AdmissionDecision, AdmittedMessage, ProjectedContextEntry, StateError,
 };
