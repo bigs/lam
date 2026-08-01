@@ -1,31 +1,34 @@
 use std::sync::Arc;
 
 use lam_core::{
-    ActorId, ActorState, CompactionReason, CompactionRecord, JournalStore, ModelCodec,
-    ModelProvider, RunId, compaction_prefix_len,
+    ActorId, ActorState, CompactionArtifact, CompactionOutput, CompactionPlan, CompactionReason,
+    CompactionRecord, CompactionRequest, ContextEntry, ContextTransition, EventBatch, JournalStore,
+    ModelId, ModelRequestConfig, ModelSelection, OutputContract, Revision, RunId, Timestamp,
+    compaction_prefix_len,
 };
 use tokio::sync::mpsc;
 
 use crate::compaction::{
     CompactionReceipt, compaction_request, estimated_context_tokens, model_context,
 };
+use crate::model::RegisteredModel;
 use crate::runner::{ActorRunner, emit, wait_for_abort};
-use crate::runtime_journal::{append_context, load_state};
-use crate::{ActorError, RunEvent, RuntimeEvent};
+use crate::runtime_journal::{
+    AppendAttempt, append_batch, append_context, append_event, load_state,
+};
+use crate::{ActorError, ModelSwitchPolicy, ModelSwitchReceipt, RunEvent, RuntimeEvent};
 
-impl<P, C, S> ActorRunner<P, C, S>
+impl<S> ActorRunner<S>
 where
-    P: ModelProvider,
-    C: ModelCodec,
     S: JournalStore + 'static,
 {
     pub(crate) async fn compact_current(
         &mut self,
     ) -> Result<Option<CompactionReceipt>, ActorError> {
-        if self.compactor.is_none() {
+        let state = load_state(self.store.as_ref(), &self.actor_id).await?;
+        if self.selected_model(&state)?.compactor.is_none() {
             return Err(ActorError::CompactionDisabled);
         }
-        let state = load_state(self.store.as_ref(), &self.actor_id).await?;
         let (_state, receipt) = self
             .perform_compaction(state, CompactionReason::Manual, None)
             .await?;
@@ -37,7 +40,8 @@ where
         state: ActorState,
         events: Option<&mpsc::Sender<RunEvent>>,
     ) -> Result<ActorState, ActorError> {
-        if self.compactor.is_none() {
+        let model = self.selected_model(&state)?.clone();
+        if model.compactor.is_none() {
             return Ok(state);
         }
         let trigger = self
@@ -47,8 +51,8 @@ where
         let Some(trigger) = trigger else {
             return Ok(state);
         };
-        let context = model_context(&state, self.codec.as_ref())?;
-        let before = estimated_context_tokens(&context, self.codec.as_ref())?;
+        let context = model_context(&state, &model)?;
+        let before = estimated_context_tokens(&context, &model)?;
         if before < trigger {
             return Ok(state);
         }
@@ -61,8 +65,8 @@ where
                     .to_owned(),
             });
         };
-        let context = model_context(&next, self.codec.as_ref())?;
-        let after = estimated_context_tokens(&context, self.codec.as_ref())?;
+        let context = model_context(&next, &model)?;
+        let after = estimated_context_tokens(&context, &model)?;
         if after >= before || after >= trigger {
             return Err(ActorError::Compaction {
                 message: format!(
@@ -79,9 +83,12 @@ where
         reason: CompactionReason,
         events: Option<&mpsc::Sender<RunEvent>>,
     ) -> Result<(ActorState, Option<CompactionReceipt>), ActorError> {
-        let Some(compactor) = self.compactor.as_ref().map(Arc::clone) else {
+        let model = self.selected_model(&state)?.clone();
+        let Some(compactor) = model.compactor.as_ref().map(Arc::clone) else {
             return match reason {
-                CompactionReason::Manual => Err(ActorError::CompactionDisabled),
+                CompactionReason::Manual | CompactionReason::ModelSwitch => {
+                    Err(ActorError::CompactionDisabled)
+                }
                 CompactionReason::Threshold => Ok((state, None)),
                 CompactionReason::Overflow => Err(ActorError::ContextOverflow),
             };
@@ -95,92 +102,37 @@ where
             reason,
             retain_tokens,
             self.compaction_config.summary_reserve(),
-            |replacement| self.codec.accepts_compaction_replacement(replacement),
+            &self.system_prompt,
+            None,
+            |replacement| model.accepts_compaction_replacement(replacement),
         )?;
         if compaction_prefix_len(&request.units, request.retain_tokens).is_none() {
             return Ok((state, None));
         }
 
         let run_id = state.active_run().cloned();
-        self.emit_compaction_started(events, run_id.as_ref(), reason);
-        let mut abort = self.abort.clone();
-        let plan = tokio::select! {
-            biased;
-            _ = wait_for_abort(&mut abort) => return Err(ActorError::Aborted),
-            result = compactor.compact(&request) => result,
-        };
-        let plan = match plan {
-            Ok(plan) => plan,
-            Err(error) => {
-                self.emit_compaction_failed(events, run_id.as_ref(), reason, error.to_string());
-                return Err(ActorError::Compaction {
-                    message: error.to_string(),
-                });
-            }
-        };
+        let plan = self
+            .invoke_compactor(compactor, &request, events, run_id.as_ref(), reason)
+            .await?;
         let installation: Result<_, ActorError> = async {
-            if plan.artifact.is_empty() {
-                return Err(ActorError::Compaction {
-                    message: "compactor returned an empty artifact".to_owned(),
-                });
-            }
-            if !request
-                .units
-                .iter()
-                .any(|unit| unit.covers_through() == plan.covers_through)
-            {
-                return Err(ActorError::Compaction {
-                    message: format!(
-                        "compactor cutoff {} is not an atomic context boundary",
-                        plan.covers_through.get()
-                    ),
-                });
-            }
-            let replacement = self
-                .codec
-                .materialize_compaction(&plan.artifact)
-                .map_err(|error| ActorError::Compaction {
-                    message: error.to_string(),
-                })?
-                .ok_or_else(|| ActorError::Compaction {
-                    message: "the active model codec cannot materialize compaction context"
-                        .to_owned(),
-                })?;
-            if !self.codec.accepts_compaction_replacement(&replacement) {
-                return Err(ActorError::Compaction {
-                    message: format!(
-                        "the active model codec rejected its materialized replacement {}@{}",
-                        replacement.codec.id, replacement.codec.version
-                    ),
-                });
-            }
-            let record = CompactionRecord {
-                strategy: plan.strategy.clone(),
+            let prepared = prepare_compaction(
+                &request,
+                &model,
+                plan,
                 reason,
-                source: plan.source,
-                artifact: plan.artifact,
-                replacement,
-                metadata: plan.metadata.clone(),
-            };
-            let payload = record.encode().map_err(|error| ActorError::Compaction {
-                message: format!("compaction record could not be encoded: {error}"),
-            })?;
-            let entry = lam_core::ContextEntry {
-                transition: lam_core::ContextTransition::Compaction {
-                    covers_through: plan.covers_through,
-                    run_id: run_id.clone(),
-                },
-                payload,
-                recorded_at: self.clock.now(),
-            };
-            let next = append_context(self.store.as_ref(), &self.actor_id, state, entry).await?;
-            let receipt = CompactionReceipt {
-                covers_through: plan.covers_through,
-                revision: next.revision(),
-                reason,
-                strategy: plan.strategy,
-                metadata: plan.metadata,
-            };
+                run_id.clone(),
+                self.clock.now(),
+            )?;
+            let marker_revision =
+                state
+                    .revision()
+                    .checked_advance(1)
+                    .ok_or_else(|| ActorError::State {
+                        message: "actor journal revision space is exhausted".to_owned(),
+                    })?;
+            let receipt = prepared.receipt(marker_revision);
+            let next =
+                append_context(self.store.as_ref(), &self.actor_id, state, prepared.entry).await?;
             Ok((next, receipt))
         }
         .await;
@@ -194,6 +146,160 @@ where
         trace_compaction_completed(&self.actor_id, run_id.as_ref(), &receipt);
         self.emit_compaction_completed(events, run_id.as_ref(), &receipt);
         Ok((next, Some(receipt)))
+    }
+
+    pub(crate) async fn switch_model(
+        &mut self,
+        target_id: ModelId,
+        policy: ModelSwitchPolicy,
+    ) -> Result<ModelSwitchReceipt, ActorError> {
+        let target =
+            self.models
+                .get(&target_id)
+                .cloned()
+                .ok_or_else(|| ActorError::UnknownModel {
+                    model_id: target_id.clone(),
+                })?;
+
+        loop {
+            let state = load_state(self.store.as_ref(), &self.actor_id).await?;
+            let source = self.selected_model(&state)?.clone();
+            let previous_id = state
+                .selected_model()
+                .expect("selected_model validated the durable selection")
+                .model_id
+                .clone();
+            if previous_id == target_id {
+                return Ok(ModelSwitchReceipt {
+                    previous_model_id: previous_id,
+                    selected_model_id: target_id,
+                    revision: state.revision(),
+                    compaction: None,
+                });
+            }
+            let selection = ModelSelection::new(target_id.clone(), target.descriptor().clone());
+            let selection_event = state
+                .plan_model_selection(selection)
+                .map_err(crate::runtime_journal::state_error)?;
+
+            if policy == ModelSwitchPolicy::ReuseContext {
+                let context = model_context(&state, &target)?;
+                target
+                    .encode_request(
+                        &context,
+                        &ModelRequestConfig::agent(&OutputContract::Text, &self.system_prompt),
+                    )
+                    .map_err(|message| ActorError::Codec { message })?;
+            } else {
+                let request = compaction_request(
+                    &state,
+                    CompactionReason::ModelSwitch,
+                    0,
+                    self.compaction_config.summary_reserve(),
+                    &self.system_prompt,
+                    Some(target.descriptor().clone()),
+                    |replacement| source.accepts_compaction_replacement(replacement),
+                )?;
+                if !request.units.is_empty() {
+                    let Some(compactor) = source.compactor.as_ref().map(Arc::clone) else {
+                        return Err(ActorError::CompactionDisabled);
+                    };
+                    let plan = self
+                        .invoke_compactor(
+                            compactor,
+                            &request,
+                            None,
+                            None,
+                            CompactionReason::ModelSwitch,
+                        )
+                        .await?;
+                    let installation: Result<_, ActorError> = async {
+                        let prepared = prepare_compaction(
+                            &request,
+                            &target,
+                            plan,
+                            CompactionReason::ModelSwitch,
+                            None,
+                            self.clock.now(),
+                        )?;
+                        let marker_revision =
+                            state.revision().checked_advance(1).ok_or_else(|| {
+                                ActorError::State {
+                                    message: "actor journal revision space is exhausted".to_owned(),
+                                }
+                            })?;
+                        let compaction = prepared.receipt(marker_revision);
+                        let context_event = state
+                            .plan_context_append(prepared.entry)
+                            .map_err(crate::runtime_journal::state_error)?;
+                        let batch = EventBatch::new(context_event, vec![selection_event]);
+                        let append =
+                            append_batch(self.store.as_ref(), &self.actor_id, state, batch).await?;
+                        Ok((append, compaction))
+                    }
+                    .await;
+                    let (append, compaction) = match installation {
+                        Ok(installed) => installed,
+                        Err(error) => {
+                            self.emit_compaction_failed(
+                                None,
+                                None,
+                                CompactionReason::ModelSwitch,
+                                error.to_string(),
+                            );
+                            return Err(error);
+                        }
+                    };
+                    match append {
+                        AppendAttempt::Appended(next) => {
+                            trace_compaction_completed(&self.actor_id, None, &compaction);
+                            self.emit_compaction_completed(None, None, &compaction);
+                            return Ok(ModelSwitchReceipt {
+                                previous_model_id: previous_id,
+                                selected_model_id: target_id,
+                                revision: next.revision(),
+                                compaction: Some(compaction),
+                            });
+                        }
+                        AppendAttempt::Conflict => continue,
+                    }
+                }
+            }
+
+            match append_event(self.store.as_ref(), &self.actor_id, state, selection_event).await? {
+                AppendAttempt::Appended(next) => {
+                    return Ok(ModelSwitchReceipt {
+                        previous_model_id: previous_id,
+                        selected_model_id: target_id,
+                        revision: next.revision(),
+                        compaction: None,
+                    });
+                }
+                AppendAttempt::Conflict => continue,
+            }
+        }
+    }
+
+    async fn invoke_compactor(
+        &mut self,
+        compactor: Arc<dyn lam_core::Compactor>,
+        request: &CompactionRequest,
+        events: Option<&mpsc::Sender<RunEvent>>,
+        run_id: Option<&RunId>,
+        reason: CompactionReason,
+    ) -> Result<CompactionPlan, ActorError> {
+        self.emit_compaction_started(events, run_id, reason);
+        let mut abort = self.abort.clone();
+        let result = tokio::select! {
+            biased;
+            _ = wait_for_abort(&mut abort) => return Err(ActorError::Aborted),
+            result = compactor.compact(request) => result,
+        };
+        result.map_err(|error| {
+            let message = error.to_string();
+            self.emit_compaction_failed(events, run_id, reason, message.clone());
+            ActorError::Compaction { message }
+        })
     }
 
     fn emit_compaction_started(
@@ -273,6 +379,112 @@ where
             );
         }
     }
+}
+
+struct PreparedCompaction {
+    entry: ContextEntry,
+    covers_through: lam_core::ContextSequence,
+    reason: CompactionReason,
+    strategy: String,
+    metadata: lam_core::ModelResponseMetadata,
+}
+
+impl PreparedCompaction {
+    fn receipt(&self, revision: Revision) -> CompactionReceipt {
+        CompactionReceipt {
+            covers_through: self.covers_through,
+            revision,
+            reason: self.reason,
+            strategy: self.strategy.clone(),
+            metadata: self.metadata.clone(),
+        }
+    }
+}
+
+fn prepare_compaction(
+    request: &CompactionRequest,
+    target: &RegisteredModel,
+    plan: CompactionPlan,
+    reason: CompactionReason,
+    run_id: Option<RunId>,
+    recorded_at: Timestamp,
+) -> Result<PreparedCompaction, ActorError> {
+    if !request
+        .units
+        .iter()
+        .any(|unit| unit.covers_through() == plan.covers_through)
+    {
+        return Err(ActorError::Compaction {
+            message: format!(
+                "compactor cutoff {} is not an atomic context boundary",
+                plan.covers_through.get()
+            ),
+        });
+    }
+    let (artifact, replacement) = match plan.output {
+        CompactionOutput::Artifact(artifact) => {
+            if artifact.is_empty() {
+                return Err(ActorError::Compaction {
+                    message: "compactor returned an empty artifact".to_owned(),
+                });
+            }
+            let replacement = target
+                .materialize_compaction(&artifact)
+                .map_err(|message| ActorError::Compaction { message })?
+                .ok_or_else(|| ActorError::Compaction {
+                    message: "the target model codec cannot materialize compaction context"
+                        .to_owned(),
+                })?;
+            (Some(artifact), replacement)
+        }
+        CompactionOutput::Exact {
+            replacement,
+            artifact,
+        } => {
+            if artifact.as_ref().is_some_and(CompactionArtifact::is_empty) {
+                return Err(ActorError::Compaction {
+                    message: "compactor returned an empty companion artifact".to_owned(),
+                });
+            }
+            (artifact, replacement)
+        }
+    };
+    if !target.accepts_compaction_replacement(&replacement) {
+        return Err(ActorError::Compaction {
+            message: format!(
+                "the target model codec rejected its materialized replacement {}@{}",
+                replacement.codec.id, replacement.codec.version
+            ),
+        });
+    }
+    let strategy = plan.strategy;
+    let covers_through = plan.covers_through;
+    let metadata = plan.metadata;
+    let record = CompactionRecord {
+        strategy: strategy.clone(),
+        reason,
+        source: plan.source,
+        artifact,
+        replacement,
+        metadata: metadata.clone(),
+    };
+    let payload = record.encode().map_err(|error| ActorError::Compaction {
+        message: format!("compaction record could not be encoded: {error}"),
+    })?;
+    Ok(PreparedCompaction {
+        entry: ContextEntry {
+            transition: ContextTransition::Compaction {
+                covers_through,
+                run_id,
+            },
+            payload,
+            recorded_at,
+        },
+        covers_through,
+        reason,
+        strategy,
+        metadata,
+    })
 }
 
 fn trace_compaction_completed(

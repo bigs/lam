@@ -37,6 +37,30 @@ impl HttpTransport {
         }
     }
 
+    pub(crate) fn child(&self, suffix: &str) -> Self {
+        let mut endpoint = self.endpoint.clone();
+        let path = format!("{}/{}", endpoint.path().trim_end_matches('/'), suffix);
+        endpoint.set_path(&path);
+        Self {
+            client: self.client.clone(),
+            endpoint,
+            authorization: self.authorization.clone(),
+        }
+    }
+
+    pub(crate) async fn post_json(
+        &self,
+        protocol: &'static str,
+        body: &Value,
+    ) -> Result<Value, ProviderError> {
+        match self.post_stream(protocol, body, |_| Ok(())).await? {
+            StreamBody::Json(value) => Ok(value),
+            StreamBody::Events => Err(ProviderError::MissingTerminal {
+                expected: "a JSON response body",
+            }),
+        }
+    }
+
     pub(crate) async fn post_stream(
         &self,
         protocol: &'static str,

@@ -1,15 +1,18 @@
 //! OpenAI Responses API adapter.
 
+use std::sync::Arc;
+
 use lam::{
-    CodecId, CodecRef, CompactionArtifact, ContextTransition, EncodedPayload, Model, ModelCodec,
-    ModelDelta, ModelDirective, ModelEventSink, ModelProvider, ModelRequestConfig,
+    CodecId, CodecRef, CompactionArtifact, CompactionError, CompactionOutput, CompactionPlan,
+    CompactionRequest, Compactor, ContextTransition, EncodedPayload, Model, ModelCodec, ModelDelta,
+    ModelDescriptor, ModelDirective, ModelEventSink, ModelProvider, ModelRequestConfig,
     ModelResponseMetadata, OutputContract, ProjectedContextEntry,
 };
 use serde_json::{Map, Value, json};
 
 use crate::common::{
     BuiltConfig, CODEC_VERSION, EVAL_TOOL_DESCRIPTION, OutputKind, RESPONSES_REQUEST_CODEC_ID,
-    RESPONSES_RESPONSE_CODEC_ID, SharedBuilder, eval_parameters, output_value,
+    RESPONSES_RESPONSE_CODEC_ID, SharedBuilder, codec, eval_parameters, output_value,
     parse_eval_arguments, parse_request, parse_response, request_payload, response_payload,
 };
 use crate::context::{
@@ -22,6 +25,8 @@ use crate::transport::StreamBody;
 
 const RESPONSES_PATH: &str = "/responses";
 const COMPACTION_REPLACEMENT_CODEC_ID: &str = "openai/responses-compaction";
+const COMPACTION_RESPONSE_CODEC_ID: &str = "openai/responses-compaction-response";
+const RESPONSES_DESCRIPTOR_CODEC: &str = "openai/responses";
 
 /// Codec identifier for encoded Responses request bodies.
 pub const REQUEST_CODEC_ID: &str = RESPONSES_REQUEST_CODEC_ID;
@@ -93,7 +98,9 @@ impl ResponsesBuilder {
     /// Builds a model ready for [`lam::Lam::builder`].
     pub fn build(self) -> Result<Model<ResponsesProvider, ResponsesCodec>, BuildError> {
         let (provider, codec) = self.build_parts()?;
-        Ok(Model::new(provider, codec))
+        let descriptor = ModelDescriptor::new("openai", codec.model(), RESPONSES_DESCRIPTOR_CODEC)
+            .expect("the Responses descriptor is nonempty");
+        Ok(Model::new(provider, codec).with_descriptor(descriptor))
     }
 
     /// Builds the transport and codec separately for custom composition.
@@ -229,6 +236,115 @@ impl ResponsesCodec {
     #[must_use]
     pub fn model(&self) -> &str {
         &self.model
+    }
+
+    fn compaction_body(
+        &self,
+        context: &[ProjectedContextEntry],
+        instructions: &str,
+    ) -> Result<Value, CodecError> {
+        let mut body = Map::new();
+        body.insert("model".to_owned(), Value::String(self.model.clone()));
+        body.insert("input".to_owned(), Value::Array(encode_context(context)?));
+        if !instructions.is_empty() {
+            body.insert(
+                "instructions".to_owned(),
+                Value::String(instructions.to_owned()),
+            );
+        }
+        Ok(Value::Object(body))
+    }
+}
+
+/// OpenAI's standalone Responses compaction endpoint as a Lam compactor.
+///
+/// The complete provider response is retained as provenance and its `output`
+/// array becomes the exact replay checkpoint. Model eligibility is deliberately
+/// left to explicit runtime configuration and provider errors.
+pub struct OpenAiResponsesCompactor {
+    transport: crate::transport::HttpTransport,
+    codec: Arc<ResponsesCodec>,
+    descriptor: ModelDescriptor,
+}
+
+impl OpenAiResponsesCompactor {
+    /// Uses the credentials, endpoint, model, and codec of a Responses model.
+    #[must_use]
+    pub fn new(model: &Model<ResponsesProvider, ResponsesCodec>) -> Self {
+        let (provider, codec) = model.shared_parts();
+        Self {
+            transport: provider.transport.child("compact"),
+            codec,
+            descriptor: model.descriptor().clone(),
+        }
+    }
+}
+
+impl Compactor for OpenAiResponsesCompactor {
+    fn compact<'a>(&'a self, request: &'a CompactionRequest) -> lam::CompactionFuture<'a> {
+        Box::pin(async move {
+            if let Some(target) = &request.target_model
+                && target.codec() != self.descriptor.codec()
+            {
+                return Err(CompactionError::new(format!(
+                    "native Responses checkpoint is incompatible with target codec `{}`",
+                    target.codec()
+                )));
+            }
+            let covers_through = request
+                .units
+                .last()
+                .ok_or_else(|| CompactionError::new("context has no atomic unit to compact"))?
+                .covers_through();
+            let body = self
+                .codec
+                .compaction_body(&request.context, &request.instructions)
+                .map_err(|error| CompactionError::new(error.to_string()))?;
+            let response = self
+                .transport
+                .post_json("responses_compact", &body)
+                .await
+                .map_err(|error| CompactionError::new(error.to_string()))?;
+            if response.get("object").and_then(Value::as_str) != Some("response.compaction") {
+                return Err(CompactionError::new(
+                    "Responses compaction endpoint returned an unexpected object",
+                ));
+            }
+            let output = response
+                .get("output")
+                .and_then(Value::as_array)
+                .filter(|output| !output.is_empty())
+                .ok_or_else(|| {
+                    CompactionError::new(
+                        "Responses compaction endpoint returned no canonical output",
+                    )
+                })?
+                .clone();
+            let model = response
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or(self.codec.model())
+                .to_owned();
+            let metadata = response_metadata(
+                model,
+                response.get("usage"),
+                UsageDialect::Responses,
+                self.codec.pricing,
+            );
+            Ok(CompactionPlan {
+                strategy: "openai-responses-native".to_owned(),
+                covers_through,
+                output: CompactionOutput::exact(EncodedPayload::new(
+                    compaction_replacement_codec(),
+                    Value::Array(output),
+                )),
+                source: Some(EncodedPayload::new(
+                    codec(COMPACTION_RESPONSE_CODEC_ID),
+                    response,
+                )),
+                metadata,
+            })
+        })
     }
 }
 

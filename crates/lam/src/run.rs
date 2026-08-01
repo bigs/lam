@@ -70,7 +70,7 @@ pub enum RunEvent {
         reason: CompactionReason,
         /// Inclusive raw-context boundary replaced by the marker.
         covers_through: ContextSequence,
-        /// Summary-inference usage and cost.
+        /// Compaction-inference usage and cost.
         metadata: ModelResponseMetadata,
     },
     /// A compactor failed without installing a marker.

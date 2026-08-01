@@ -1,9 +1,9 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{ContextEntry, MessageEnvelope};
+use crate::{ContextEntry, MessageEnvelope, ModelSelection};
 
 /// Current serialized schema version for actor events.
-pub const ACTOR_EVENT_SCHEMA_VERSION: u32 = 1;
+pub const ACTOR_EVENT_SCHEMA_VERSION: u32 = 2;
 
 /// One versioned fact in an actor journal.
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -32,6 +32,15 @@ impl ActorEvent {
         }
     }
 
+    /// Constructs a durable model-selection event.
+    #[must_use]
+    pub const fn model_selected(selection: ModelSelection) -> Self {
+        Self {
+            schema_version: ACTOR_EVENT_SCHEMA_VERSION,
+            event: ActorEventData::ModelSelected { selection },
+        }
+    }
+
     /// Returns the serialized event-schema version.
     #[must_use]
     pub const fn schema_version(&self) -> u32 {
@@ -53,6 +62,11 @@ impl ActorEvent {
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum ActorEventData {
+    /// The actor selected one model from its host runtime registry.
+    ModelSelected {
+        /// Stable registry identity and non-secret description.
+        selection: ModelSelection,
+    },
     /// A message became durable in the actor's mailbox.
     MessageAdmitted {
         /// Admitted envelope.

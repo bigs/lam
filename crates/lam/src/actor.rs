@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::JoinHandle;
@@ -5,8 +6,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use lam_core::{
     ActorId, ActorState, CompactionConfig, Compactor, DeliveryMode, EncodedPayload, JournalStore,
-    MemStore, MessageEnvelope, MessageId, MessageSource, ModelCodec, ModelProvider, Revision,
-    RunId, Timestamp,
+    MemStore, MessageEnvelope, MessageId, MessageSource, ModelCodec, ModelId, ModelProvider,
+    ModelSelection, Revision, RunId, Timestamp,
 };
 use lam_deno::{Isolate, IsolateInterrupt, Namespace};
 use serde::Serialize;
@@ -14,13 +15,40 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::command::RunnerCommand;
 use crate::compaction::{CompactionReceipt, SummaryTailCompactor};
+use crate::model::RegisteredModel;
 use crate::prompt::SystemPrompt;
 use crate::recovery::recover_actor;
 use crate::runner::ActorRunner;
-use crate::runtime_journal::{admit_message, load_state};
+use crate::runtime_journal::{admit_message, ensure_model_selection, load_state};
 use crate::{ActorBuildError, ActorError, Model, Run, RuntimeEvents};
 
 const RUNTIME_EVENT_BUFFER: usize = 256;
+
+/// How an explicit model switch treats existing model-visible context.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ModelSwitchPolicy {
+    /// Replace the complete effective history with a target-compatible
+    /// checkpoint before selecting the target model.
+    #[default]
+    Compact,
+    /// Reuse the current context only after the target codec can encode it.
+    ReuseContext,
+}
+
+/// Durable result of selecting another registered model.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelSwitchReceipt {
+    /// Model selected before the operation.
+    pub previous_model_id: ModelId,
+    /// Model selected after the operation.
+    pub selected_model_id: ModelId,
+    /// Journal revision containing `ModelSelected`.
+    pub revision: Revision,
+    /// Compaction installed atomically with the selection, when required.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compaction: Option<CompactionReceipt>,
+}
 
 /// Supplies informational host timestamps for durable actor entries.
 pub trait Clock: Send + Sync + 'static {
@@ -79,9 +107,16 @@ pub struct Lam;
 impl Lam {
     /// Starts a runtime builder with in-memory state and safe isolate defaults.
     #[must_use]
-    pub fn builder<P, C>(model: Model<P, C>) -> LamBuilder<P, C, MemStore> {
+    pub fn builder<P, C>(model: Model<P, C>) -> LamBuilder<MemStore>
+    where
+        P: ModelProvider,
+        C: ModelCodec,
+    {
+        let compactor = Arc::new(SummaryTailCompactor::new(model.clone()));
         LamBuilder {
-            model,
+            initial_model_id: ModelId::new("default"),
+            initial_model: RegisteredModel::new(model, Some(compactor)),
+            additional_models: Vec::new(),
             store: MemStore::new(),
             namespaces: Vec::new(),
             default_timeout: None,
@@ -90,14 +125,16 @@ impl Lam {
             clock: Arc::new(SystemClock),
             system_prompt: SystemPrompt::default(),
             compaction_config: CompactionConfig::default(),
-            compactor: ConfiguredCompactor::SummaryTail,
+            compaction_enabled: true,
         }
     }
 }
 
 /// Configures the dependencies shared by an actor runtime.
-pub struct LamBuilder<P, C, S> {
-    model: Model<P, C>,
+pub struct LamBuilder<S> {
+    initial_model_id: Result<ModelId, lam_core::InvalidIdentifier>,
+    initial_model: RegisteredModel,
+    additional_models: Vec<PendingModel>,
     store: S,
     namespaces: Vec<Namespace>,
     default_timeout: Option<Duration>,
@@ -106,21 +143,22 @@ pub struct LamBuilder<P, C, S> {
     clock: Arc<dyn Clock>,
     system_prompt: SystemPrompt,
     compaction_config: CompactionConfig,
-    compactor: ConfiguredCompactor,
+    compaction_enabled: bool,
 }
 
-enum ConfiguredCompactor {
-    SummaryTail,
-    Custom(Arc<dyn Compactor>),
-    Disabled,
+struct PendingModel {
+    id: Result<ModelId, lam_core::InvalidIdentifier>,
+    model: RegisteredModel,
 }
 
-impl<P, C, S> LamBuilder<P, C, S> {
+impl<S> LamBuilder<S> {
     /// Replaces the actor journal implementation.
     #[must_use]
-    pub fn state_store<T>(self, store: T) -> LamBuilder<P, C, T> {
+    pub fn state_store<T>(self, store: T) -> LamBuilder<T> {
         LamBuilder {
-            model: self.model,
+            initial_model_id: self.initial_model_id,
+            initial_model: self.initial_model,
+            additional_models: self.additional_models,
             store,
             namespaces: self.namespaces,
             default_timeout: self.default_timeout,
@@ -129,8 +167,51 @@ impl<P, C, S> LamBuilder<P, C, S> {
             clock: self.clock,
             system_prompt: self.system_prompt,
             compaction_config: self.compaction_config,
-            compactor: self.compactor,
+            compaction_enabled: self.compaction_enabled,
         }
+    }
+
+    /// Replaces the stable registry identity of the model passed to
+    /// [`Lam::builder`]. The default is `default`.
+    #[must_use]
+    pub fn initial_model_id(mut self, model_id: impl Into<String>) -> Self {
+        self.initial_model_id = ModelId::new(model_id);
+        self
+    }
+
+    /// Registers another switchable model with the default summary-tail
+    /// compactor backed by that model.
+    #[must_use]
+    pub fn model<P, C>(mut self, model_id: impl Into<String>, model: Model<P, C>) -> Self
+    where
+        P: ModelProvider,
+        C: ModelCodec,
+    {
+        let compactor = Arc::new(SummaryTailCompactor::new(model.clone()));
+        self.additional_models.push(PendingModel {
+            id: ModelId::new(model_id),
+            model: RegisteredModel::new(model, Some(compactor)),
+        });
+        self
+    }
+
+    /// Registers another switchable model with an explicit compactor.
+    #[must_use]
+    pub fn model_with_compactor<P, C>(
+        mut self,
+        model_id: impl Into<String>,
+        model: Model<P, C>,
+        compactor: impl Compactor,
+    ) -> Self
+    where
+        P: ModelProvider,
+        C: ModelCodec,
+    {
+        self.additional_models.push(PendingModel {
+            id: ModelId::new(model_id),
+            model: RegisteredModel::new(model, Some(Arc::new(compactor))),
+        });
+        self
     }
 
     /// Registers one Rust-backed TypeScript namespace.
@@ -174,14 +255,14 @@ impl<P, C, S> LamBuilder<P, C, S> {
     /// Replaces the default summary-tail strategy with one compactor.
     #[must_use]
     pub fn compactor(mut self, compactor: impl Compactor) -> Self {
-        self.compactor = ConfiguredCompactor::Custom(Arc::new(compactor));
+        self.initial_model.compactor = Some(Arc::new(compactor));
         self
     }
 
     /// Disables manual, threshold, and overflow compaction.
     #[must_use]
     pub fn disable_compaction(mut self) -> Self {
-        self.compactor = ConfiguredCompactor::Disabled;
+        self.compaction_enabled = false;
         self
     }
 
@@ -218,9 +299,11 @@ impl<P, C, S> LamBuilder<P, C, S> {
 
     /// Freezes runtime configuration for one actor in this slice.
     #[must_use]
-    pub fn build(self) -> LamRuntime<P, C, S> {
+    pub fn build(self) -> LamRuntime<S> {
         LamRuntime {
-            model: self.model,
+            initial_model_id: self.initial_model_id,
+            initial_model: self.initial_model,
+            additional_models: self.additional_models,
             store: self.store,
             namespaces: self.namespaces,
             default_timeout: self.default_timeout,
@@ -229,14 +312,16 @@ impl<P, C, S> LamBuilder<P, C, S> {
             clock: self.clock,
             system_prompt: self.system_prompt,
             compaction_config: self.compaction_config,
-            compactor: self.compactor,
+            compaction_enabled: self.compaction_enabled,
         }
     }
 }
 
 /// Frozen single-actor configuration.
-pub struct LamRuntime<P, C, S> {
-    model: Model<P, C>,
+pub struct LamRuntime<S> {
+    initial_model_id: Result<ModelId, lam_core::InvalidIdentifier>,
+    initial_model: RegisteredModel,
+    additional_models: Vec<PendingModel>,
     store: S,
     namespaces: Vec<Namespace>,
     default_timeout: Option<Duration>,
@@ -245,16 +330,18 @@ pub struct LamRuntime<P, C, S> {
     clock: Arc<dyn Clock>,
     system_prompt: SystemPrompt,
     compaction_config: CompactionConfig,
-    compactor: ConfiguredCompactor,
+    compaction_enabled: bool,
 }
 
-impl<P, C, S> LamRuntime<P, C, S> {
+impl<S> LamRuntime<S> {
     /// Consumes this pre-subagent runtime into an actor builder.
     #[must_use]
-    pub fn actor(self, actor_id: impl Into<String>) -> ActorBuilder<P, C, S> {
+    pub fn actor(self, actor_id: impl Into<String>) -> ActorBuilder<S> {
         ActorBuilder {
             actor_id: ActorId::new(actor_id),
-            model: self.model,
+            initial_model_id: self.initial_model_id,
+            initial_model: self.initial_model,
+            additional_models: self.additional_models,
             store: self.store,
             namespaces: self.namespaces,
             default_timeout: self.default_timeout,
@@ -263,15 +350,17 @@ impl<P, C, S> LamRuntime<P, C, S> {
             clock: self.clock,
             system_prompt: self.system_prompt,
             compaction_config: self.compaction_config,
-            compactor: self.compactor,
+            compaction_enabled: self.compaction_enabled,
         }
     }
 }
 
 /// Starts the dedicated runner for one actor.
-pub struct ActorBuilder<P, C, S> {
+pub struct ActorBuilder<S> {
     actor_id: Result<ActorId, lam_core::InvalidIdentifier>,
-    model: Model<P, C>,
+    initial_model_id: Result<ModelId, lam_core::InvalidIdentifier>,
+    initial_model: RegisteredModel,
+    additional_models: Vec<PendingModel>,
     store: S,
     namespaces: Vec<Namespace>,
     default_timeout: Option<Duration>,
@@ -280,18 +369,32 @@ pub struct ActorBuilder<P, C, S> {
     clock: Arc<dyn Clock>,
     system_prompt: SystemPrompt,
     compaction_config: CompactionConfig,
-    compactor: ConfiguredCompactor,
+    compaction_enabled: bool,
 }
 
-impl<P, C, S> ActorBuilder<P, C, S>
+impl<S> ActorBuilder<S>
 where
-    P: ModelProvider,
-    C: ModelCodec,
     S: JournalStore + 'static,
 {
     /// Builds the persistent isolate on its dedicated actor thread.
     pub async fn build(self) -> Result<Actor<S>, ActorBuildError> {
         let actor_id = self.actor_id?;
+        let initial_model_id = self
+            .initial_model_id
+            .map_err(ActorBuildError::InvalidModelId)?;
+        let mut models = BTreeMap::new();
+        models.insert(initial_model_id.clone(), self.initial_model);
+        for pending in self.additional_models {
+            let model_id = pending.id.map_err(ActorBuildError::InvalidModelId)?;
+            if models.insert(model_id.clone(), pending.model).is_some() {
+                return Err(ActorBuildError::DuplicateModelId { model_id });
+            }
+        }
+        if !self.compaction_enabled {
+            for model in models.values_mut() {
+                model.compactor = None;
+            }
+        }
         self.compaction_config
             .validate()
             .map_err(ActorBuildError::InvalidCompactionConfig)?;
@@ -311,16 +414,6 @@ where
         let runner_ids = Arc::clone(&ids);
         let runner_clock = Arc::clone(&self.clock);
         let runner_shutdown = Arc::clone(&shutdown);
-        let provider = self.model.provider;
-        let codec = self.model.codec;
-        let compactor: Option<Arc<dyn Compactor>> = match self.compactor {
-            ConfiguredCompactor::SummaryTail => Some(Arc::new(SummaryTailCompactor::from_parts(
-                Arc::clone(&provider),
-                Arc::clone(&codec),
-            ))),
-            ConfiguredCompactor::Custom(compactor) => Some(compactor),
-            ConfiguredCompactor::Disabled => None,
-        };
         let join = std::thread::Builder::new()
             .name(format!("lam-{actor_name}"))
             .spawn(move || {
@@ -356,12 +449,50 @@ where
                     };
                     let system_prompt = self.system_prompt.render(&isolate.api_inventory());
                     let interrupt = isolate.interrupt_handle();
+                    let initial_descriptor = models
+                        .get(&initial_model_id)
+                        .expect("the initial model was inserted")
+                        .descriptor()
+                        .clone();
+                    let initial_selection =
+                        ModelSelection::new(initial_model_id, initial_descriptor);
+                    let (state, created) = match ensure_model_selection(
+                        runner_store.as_ref(),
+                        &runner_actor_id,
+                        initial_selection,
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(error) => {
+                            let _ = initialized.send(Err(error.to_string()));
+                            return;
+                        }
+                    };
+                    let selection = state
+                        .selected_model()
+                        .expect("model initialization establishes a selection");
+                    let Some(selected_model) = models.get(&selection.model_id) else {
+                        let _ = initialized.send(Err(format!(
+                            "durable model `{}` is not present in the runtime registry",
+                            selection.model_id
+                        )));
+                        return;
+                    };
+                    if selected_model.descriptor() != &selection.descriptor {
+                        let _ = initialized.send(Err(format!(
+                            "durable model `{}` descriptor does not match the runtime registry",
+                            selection.model_id
+                        )));
+                        return;
+                    }
                     let recovery = match recover_actor(
                         &runner_actor_id,
                         runner_store.as_ref(),
-                        codec.as_ref(),
+                        selected_model,
                         runner_clock.as_ref(),
                         runner_ids.as_ref(),
+                        !created,
                     )
                     .await
                     {
@@ -377,14 +508,12 @@ where
                     let runner = ActorRunner {
                         actor_id: runner_actor_id,
                         store: runner_store,
-                        provider,
-                        codec,
+                        models,
                         clock: runner_clock,
                         ids: runner_ids,
                         isolate,
                         system_prompt,
                         compaction_config: self.compaction_config,
-                        compactor,
                         commands: receiver,
                         abort: abort_receiver,
                         shutdown: runner_shutdown,
@@ -496,6 +625,39 @@ where
         self.actor_ref
             .commands
             .send(RunnerCommand::Compact(completion))
+            .map_err(|_| ActorError::Unavailable)?;
+        result.await.map_err(|_| ActorError::Unavailable)?
+    }
+
+    /// Compacts existing history and selects another registered model.
+    pub async fn switch_model(
+        &mut self,
+        model_id: impl Into<String>,
+    ) -> Result<ModelSwitchReceipt, ActorError> {
+        self.switch_model_with_policy(model_id, ModelSwitchPolicy::Compact)
+            .await
+    }
+
+    /// Selects another registered model using an explicit context policy.
+    pub async fn switch_model_with_policy(
+        &mut self,
+        model_id: impl Into<String>,
+        policy: ModelSwitchPolicy,
+    ) -> Result<ModelSwitchReceipt, ActorError> {
+        if self.call_active.load(Ordering::Acquire) {
+            return Err(ActorError::Busy);
+        }
+        let model_id = ModelId::new(model_id).map_err(|error| ActorError::InvalidModelId {
+            message: error.to_string(),
+        })?;
+        let (completion, result) = oneshot::channel();
+        self.actor_ref
+            .commands
+            .send(RunnerCommand::SwitchModel {
+                model_id,
+                policy,
+                completion,
+            })
             .map_err(|_| ActorError::Unavailable)?;
         result.await.map_err(|_| ActorError::Unavailable)?
     }

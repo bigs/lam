@@ -5,8 +5,9 @@ use std::num::NonZeroUsize;
 use lam_core::{
     ActorEvent, ActorId, ActorState, AdmissionDecision, AppendOutcome, CodecId, CodecRef,
     ContextEntry, ContextSequence, ContextTransition, DeliveryMode, EncodedPayload, EventBatch,
-    JournalPage, JournalStore, MemStore, MessageEnvelope, MessageId, MessageSource, Revision,
-    RunId, RunProgress, StateError, StoredEvent, Timestamp,
+    JournalPage, JournalStore, MemStore, MessageEnvelope, MessageId, MessageSource,
+    ModelDescriptor, ModelId, ModelSelection, Revision, RunId, RunProgress, StateError,
+    StoredEvent, Timestamp,
 };
 use serde_json::json;
 
@@ -37,6 +38,13 @@ fn context(transition: ContextTransition, value: serde_json::Value, time: i64) -
         payload: EncodedPayload::lam_json(value).expect("fixture JSON is valid"),
         recorded_at: Timestamp::from_unix_millis(time),
     }
+}
+
+fn model_selection(id: &str, model: &str) -> ModelSelection {
+    ModelSelection::new(
+        ModelId::new(id).unwrap(),
+        ModelDescriptor::new("test", model, "test/codec").unwrap(),
+    )
 }
 
 async fn append(
@@ -372,12 +380,142 @@ fn actor_events_have_a_stable_versioned_serde_shape() {
     let event =
         ActorEvent::message_admitted(message("serialized", DeliveryMode::Steer, "hello", 1));
     let encoded = serde_json::to_value(&event).expect("event should serialize");
-    assert_eq!(encoded["schemaVersion"], json!(1));
+    assert_eq!(encoded["schemaVersion"], json!(2));
     assert_eq!(encoded["event"]["type"], json!("messageAdmitted"));
     assert_eq!(
         serde_json::from_value::<ActorEvent>(encoded).expect("event should deserialize"),
         event
     );
+}
+
+#[test]
+fn model_selection_is_durable_and_cannot_change_during_a_run() {
+    let initial = model_selection("primary", "model-a");
+    let state = ActorState::new()
+        .fold_page(JournalPage {
+            head: Revision::new(1),
+            events: vec![StoredEvent {
+                revision: Revision::new(1),
+                event: ActorEvent::model_selected(initial.clone()),
+            }],
+        })
+        .unwrap();
+    assert_eq!(state.selected_model(), Some(&initial));
+
+    let message = message("run-message", DeliveryMode::Steer, "start", 1);
+    let state = state
+        .fold_page(JournalPage {
+            head: Revision::new(3),
+            events: vec![
+                StoredEvent {
+                    revision: Revision::new(2),
+                    event: ActorEvent::message_admitted(message),
+                },
+                StoredEvent {
+                    revision: Revision::new(3),
+                    event: ActorEvent::context_appended(context(
+                        ContextTransition::Messages {
+                            run_id: RunId::new("active").unwrap(),
+                            consumed_message_ids: message_ids(&["run-message"]),
+                        },
+                        json!([]),
+                        2,
+                    )),
+                },
+            ],
+        })
+        .unwrap();
+    assert!(matches!(
+        state.plan_model_selection(model_selection("other", "model-b")),
+        Err(StateError::ModelSwitchDuringRun { .. })
+    ));
+}
+
+#[test]
+fn first_model_selection_can_label_an_active_legacy_run() {
+    let message = message("legacy-run-message", DeliveryMode::Steer, "start", 1);
+    let run_id = RunId::new("legacy-active").unwrap();
+    let state = ActorState::new()
+        .fold_page(JournalPage {
+            head: Revision::new(2),
+            events: vec![
+                StoredEvent {
+                    revision: Revision::new(1),
+                    event: ActorEvent::message_admitted(message),
+                },
+                StoredEvent {
+                    revision: Revision::new(2),
+                    event: ActorEvent::context_appended(context(
+                        ContextTransition::Messages {
+                            run_id: run_id.clone(),
+                            consumed_message_ids: message_ids(&["legacy-run-message"]),
+                        },
+                        json!([]),
+                        2,
+                    )),
+                },
+            ],
+        })
+        .unwrap();
+
+    let selection = model_selection("primary", "legacy-model");
+    let event = state
+        .plan_model_selection(selection.clone())
+        .expect("migration may establish the first selection during an active run");
+    let state = state
+        .fold_page(JournalPage {
+            head: Revision::new(3),
+            events: vec![StoredEvent {
+                revision: Revision::new(3),
+                event,
+            }],
+        })
+        .unwrap();
+
+    assert_eq!(state.selected_model(), Some(&selection));
+    assert_eq!(state.active_run(), Some(&run_id));
+    assert!(matches!(
+        state.plan_model_selection(model_selection("other", "other-model")),
+        Err(StateError::ModelSwitchDuringRun { .. })
+    ));
+}
+
+#[test]
+fn model_identity_cannot_be_rebound_and_v1_events_still_project() {
+    let selected = model_selection("stable", "model-a");
+    let state = ActorState::new()
+        .fold_page(JournalPage {
+            head: Revision::new(1),
+            events: vec![StoredEvent {
+                revision: Revision::new(1),
+                event: ActorEvent::model_selected(selected),
+            }],
+        })
+        .unwrap();
+    assert!(matches!(
+        state.plan_model_selection(model_selection("stable", "model-b")),
+        Err(StateError::ModelDescriptorChanged { .. })
+    ));
+
+    let mut encoded = serde_json::to_value(ActorEvent::message_admitted(message(
+        "legacy",
+        DeliveryMode::Steer,
+        "old",
+        1,
+    )))
+    .unwrap();
+    encoded["schemaVersion"] = json!(1);
+    let legacy: ActorEvent = serde_json::from_value(encoded).unwrap();
+    let projected = ActorState::new()
+        .fold_page(JournalPage {
+            head: Revision::new(1),
+            events: vec![StoredEvent {
+                revision: Revision::new(1),
+                event: legacy,
+            }],
+        })
+        .unwrap();
+    assert_eq!(projected.pending_messages().count(), 1);
 }
 
 #[test]

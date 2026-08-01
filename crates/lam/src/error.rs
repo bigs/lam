@@ -4,6 +4,15 @@ pub enum ActorBuildError {
     /// The actor identifier was empty.
     #[error(transparent)]
     InvalidActorId(#[from] lam_core::InvalidIdentifier),
+    /// A configured model registry identity was empty.
+    #[error("invalid model id: {0}")]
+    InvalidModelId(#[source] lam_core::InvalidIdentifier),
+    /// The runtime registry contained the same model identity twice.
+    #[error("model id `{model_id}` was registered more than once")]
+    DuplicateModelId {
+        /// Duplicated registry key.
+        model_id: lam_core::ModelId,
+    },
     /// Compaction thresholds or budgets are internally inconsistent.
     #[error("invalid compaction configuration: {0}")]
     InvalidCompactionConfig(#[source] lam_core::CompactionConfigError),
@@ -21,6 +30,18 @@ pub enum ActorBuildError {
 /// One actor operation could not complete.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum ActorError {
+    /// A requested model registry identity was empty.
+    #[error("invalid model id: {message}")]
+    InvalidModelId {
+        /// Validation diagnostic.
+        message: String,
+    },
+    /// A requested model is not present in this runtime registry.
+    #[error("model `{model_id}` is not registered")]
+    UnknownModel {
+        /// Missing registry key.
+        model_id: lam_core::ModelId,
+    },
     /// A Rust input could not cross Lam's JSON boundary.
     #[error("input could not be serialized: {message}")]
     InputSerialization {

@@ -2,7 +2,7 @@ use std::num::NonZeroUsize;
 
 use lam_core::{
     ActorEvent, ActorId, ActorState, AdmissionDecision, AppendOutcome, ContextEntry, EventBatch,
-    JournalPage, JournalStore, MessageEnvelope, StoredEvent,
+    JournalPage, JournalStore, MessageEnvelope, ModelSelection, StoredEvent,
 };
 
 use crate::ActorError;
@@ -29,6 +29,35 @@ where
         state = state.fold_page(page).map_err(state_error)?;
         if state.revision() == head {
             return Ok(state);
+        }
+    }
+}
+
+/// Establishes the first durable model selection, or returns the selection
+/// already authoritative for a reopened actor.
+pub(crate) async fn ensure_model_selection<S>(
+    store: &S,
+    actor_id: &ActorId,
+    initial: ModelSelection,
+) -> Result<(ActorState, bool), ActorError>
+where
+    S: JournalStore,
+{
+    let mut state = load_state(store, actor_id).await?;
+    let mut created = state.revision() == lam_core::Revision::ZERO;
+    loop {
+        if state.selected_model().is_some() {
+            return Ok((state, false));
+        }
+        let event = state
+            .plan_model_selection(initial.clone())
+            .map_err(state_error)?;
+        match append_event(store, actor_id, state, event).await? {
+            AppendAttempt::Appended(next) => return Ok((next, created)),
+            AppendAttempt::Conflict => {
+                created = false;
+                state = load_state(store, actor_id).await?;
+            }
         }
     }
 }
@@ -114,21 +143,40 @@ pub(crate) async fn append_event<S>(
 where
     S: JournalStore,
 {
+    append_batch(store, actor_id, state, EventBatch::one(event)).await
+}
+
+pub(crate) async fn append_batch<S>(
+    store: &S,
+    actor_id: &ActorId,
+    state: ActorState,
+    batch: EventBatch,
+) -> Result<AppendAttempt, ActorError>
+where
+    S: JournalStore,
+{
     let expected = state.revision();
+    let mut revision = expected;
+    let events = batch
+        .iter()
+        .cloned()
+        .map(|event| {
+            revision = revision
+                .checked_advance(1)
+                .ok_or_else(|| ActorError::State {
+                    message: "actor journal revision space is exhausted".to_owned(),
+                })?;
+            Ok(StoredEvent { revision, event })
+        })
+        .collect::<Result<Vec<_>, ActorError>>()?;
     match store
-        .append(actor_id, expected, EventBatch::one(event.clone()))
+        .append(actor_id, expected, batch)
         .await
         .map_err(journal_error)?
     {
         AppendOutcome::Appended { head } => {
             let state = state
-                .fold_page(JournalPage {
-                    head,
-                    events: vec![StoredEvent {
-                        revision: head,
-                        event,
-                    }],
-                })
+                .fold_page(JournalPage { head, events })
                 .map_err(state_error)?;
             Ok(AppendAttempt::Appended(state))
         }

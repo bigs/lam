@@ -7,12 +7,14 @@ use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use lam::{
-    Actor, ActorError, ActorRef, ContextTransition, DeliveryMode, EncodedPayload,
-    InterruptedEvalOutcome, IsolateState, Lam, MessageSource, Model, ModelEventSink, ModelProvider,
-    Namespace, Never, RunProgress, RuntimeEvent, SYSTEM_NOTICE_CODEC_ID,
-    SYSTEM_NOTICE_CODEC_VERSION, SystemNotice,
+    Actor, ActorError, ActorEvent, ActorId, ActorRef, AppendOutcome, ContextEntry,
+    ContextTransition, DeliveryMode, EncodedPayload, EventBatch, InterruptedEvalOutcome,
+    IsolateState, JournalStore, Lam, MessageEnvelope, MessageId, MessageSource, Model,
+    ModelDescriptor, ModelEventSink, ModelProvider, Namespace, Never, Revision, RunId, RunProgress,
+    RuntimeEvent, SYSTEM_NOTICE_CODEC_ID, SYSTEM_NOTICE_CODEC_VERSION, SystemNotice, Timestamp,
 };
 use lam_redb::RedbStore;
+use serde_json::json;
 
 use support::{ScriptError, ScriptedCodec, ScriptedProvider, eval, output};
 
@@ -64,6 +66,63 @@ async fn build_actor(
         .build()
         .await
         .expect("fixture actor should build")
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn active_version_one_run_gains_its_first_model_selection_on_reopen() {
+    let directory = tempfile::tempdir().expect("temporary directory should exist");
+    let path = directory.path().join("legacy-active.redb");
+    let store = RedbStore::create(&path).expect("store should open");
+    let actor_id = ActorId::new("durable").unwrap();
+    let message_id = MessageId::new("legacy-message").unwrap();
+    let run_id = RunId::new("legacy-run").unwrap();
+    let message = MessageEnvelope::new(
+        message_id.clone(),
+        MessageSource::User { principal: None },
+        DeliveryMode::Steer,
+        EncodedPayload::lam_json(json!({ "message": "legacy" })).unwrap(),
+        Timestamp::from_unix_millis(1),
+    )
+    .unwrap();
+    let messages = ContextEntry {
+        transition: ContextTransition::Messages {
+            run_id: run_id.clone(),
+            consumed_message_ids: vec![message_id],
+        },
+        payload: EncodedPayload::lam_json(json!([{ "message": "legacy" }])).unwrap(),
+        recorded_at: Timestamp::from_unix_millis(2),
+    };
+    let version_one = |event: ActorEvent| {
+        let mut value = serde_json::to_value(event).unwrap();
+        value["schemaVersion"] = json!(1);
+        serde_json::from_value(value).unwrap()
+    };
+    let outcome = store
+        .append(
+            &actor_id,
+            Revision::ZERO,
+            EventBatch::new(
+                version_one(ActorEvent::message_admitted(message)),
+                vec![version_one(ActorEvent::context_appended(messages))],
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        AppendOutcome::Appended {
+            head: Revision::new(2)
+        }
+    );
+
+    let provider = ScriptedProvider::new([output("recovered")]);
+    let actor = build_actor(store, provider.clone(), []).await;
+    let state = wait_for_context(&actor.actor_ref(), 3).await;
+    assert_eq!(state.active_run(), None);
+    assert!(state.is_run_completed(&run_id));
+    assert!(state.selected_model().is_some());
+    assert_eq!(provider.requests().len(), 1);
+    actor.shutdown().await.expect("shutdown should join");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -179,6 +238,106 @@ async fn repeated_graceful_restarts_wait_until_a_call_batches_the_notices() {
     assert_eq!(consumed_message_ids[0], first_notice_id);
     assert_eq!(consumed_message_ids[1], notice_id);
     actor.shutdown().await.expect("shutdown should join");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn reopen_resolves_the_durable_model_selection_from_the_registry() {
+    let directory = tempfile::tempdir().expect("temporary directory should exist");
+    let path = directory.path().join("selected-model.redb");
+    let source = ScriptedProvider::new([output("source answer"), output("portable state")]);
+    let target = ScriptedProvider::new([]);
+    let mut actor = Lam::builder(Model::new(source, ScriptedCodec))
+        .initial_model_id("source")
+        .model("target", Model::new(target, ScriptedCodec))
+        .state_store(RedbStore::create(&path).expect("store should open"))
+        .build()
+        .actor("durable-selection")
+        .build()
+        .await
+        .unwrap();
+    assert_eq!(actor.call("first").await.unwrap(), "source answer");
+    actor.switch_model("target").await.unwrap();
+    actor.shutdown().await.unwrap();
+
+    let reopened_source = ScriptedProvider::new([]);
+    let reopened_target = ScriptedProvider::new([output("target answer")]);
+    let mut actor = Lam::builder(Model::new(reopened_source.clone(), ScriptedCodec))
+        .initial_model_id("source")
+        .model("target", Model::new(reopened_target.clone(), ScriptedCodec))
+        .state_store(RedbStore::open(&path).expect("store should reopen"))
+        .build()
+        .actor("durable-selection")
+        .build()
+        .await
+        .unwrap();
+    assert_eq!(
+        actor
+            .actor_ref()
+            .state()
+            .await
+            .unwrap()
+            .selected_model()
+            .unwrap()
+            .model_id
+            .as_str(),
+        "target"
+    );
+    assert_eq!(actor.call("second").await.unwrap(), "target answer");
+    assert!(reopened_source.requests().is_empty());
+    assert_eq!(reopened_target.requests().len(), 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn reopen_rejects_a_missing_or_rebound_durable_model() {
+    let directory = tempfile::tempdir().expect("temporary directory should exist");
+    let path = directory.path().join("registry-mismatch.redb");
+    let source = ScriptedProvider::new([output("source answer"), output("portable state")]);
+    let mut actor = Lam::builder(Model::new(source, ScriptedCodec))
+        .initial_model_id("source")
+        .model(
+            "target",
+            Model::new(ScriptedProvider::new([]), ScriptedCodec),
+        )
+        .state_store(RedbStore::create(&path).unwrap())
+        .build()
+        .actor("registry-mismatch")
+        .build()
+        .await
+        .unwrap();
+    assert_eq!(actor.call("first").await.unwrap(), "source answer");
+    actor.switch_model("target").await.unwrap();
+    actor.shutdown().await.unwrap();
+
+    let missing = Lam::builder(Model::new(ScriptedProvider::new([]), ScriptedCodec))
+        .initial_model_id("source")
+        .state_store(RedbStore::open(&path).unwrap())
+        .build()
+        .actor("registry-mismatch")
+        .build()
+        .await;
+    let Err(missing) = missing else {
+        panic!("reopen should reject a missing durable model");
+    };
+    assert!(
+        missing
+            .to_string()
+            .contains("not present in the runtime registry")
+    );
+
+    let rebound = Model::new(ScriptedProvider::new([]), ScriptedCodec)
+        .with_descriptor(ModelDescriptor::new("different", "different", "different").unwrap());
+    let mismatch = Lam::builder(Model::new(ScriptedProvider::new([]), ScriptedCodec))
+        .initial_model_id("source")
+        .model("target", rebound)
+        .state_store(RedbStore::open(&path).unwrap())
+        .build()
+        .actor("registry-mismatch")
+        .build()
+        .await;
+    let Err(mismatch) = mismatch else {
+        panic!("reopen should reject a rebound durable model");
+    };
+    assert!(mismatch.to_string().contains("descriptor does not match"));
 }
 
 #[tokio::test(flavor = "current_thread")]

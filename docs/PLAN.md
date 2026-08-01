@@ -69,9 +69,9 @@ not by sharing an interpreter or mutable heap.
 
 ### Durable facts are append-only
 
-**Settled.** Mailbox admission and model-visible context are the two critical
-durable records. Context history is retained even when a compacted view is used
-for a model request.
+**Settled.** Model selection, mailbox admission, and model-visible context are
+the critical durable records. Context history is retained even when a compacted
+view is used for a model request.
 
 ### Preserve provider truth
 
@@ -551,8 +551,8 @@ codec-tagged payloads and computed views.
   Lam-native codec.
 - Provider-generated messages and reasoning items are stored in that provider's
   native format without normalizing away fields.
-- Compaction records durably retain their untouched source response, portable
-  artifact, and exact codec-specific replacement view.
+- Compaction records durably retain their untouched source response, optional
+  portable artifact, and exact codec-specific replacement view.
 
 Provider reasoning models may return encrypted or otherwise opaque reasoning
 traces that must be replayed exactly. Lam must not deserialize such a payload
@@ -588,7 +588,7 @@ records:
 - the context sequence it `covers_through`;
 - the trigger and stable strategy name;
 - the untouched summary-provider response, when one exists;
-- a neutral summary plus optional exact excerpts;
+- an optional neutral summary plus exact excerpts;
 - the exact codec-tagged replacement inserted into future requests;
 - normalized usage and cost metadata.
 
@@ -635,18 +635,22 @@ Compaction reasons are:
 
 - `Threshold`, evaluated immediately before model-request encoding;
 - `Overflow`, after a provider classifies one request as context overflow;
-- `Manual`, exposed through `Actor::compact`.
+- `Manual`, exposed through `Actor::compact`;
+- `ModelSwitch`, which replaces the complete effective history before a target
+  model is selected.
 
-`disable_compaction` disables all three. In particular, overflow returns a
+`disable_compaction` disables all four. In particular, overflow returns a
 typed error instead of silently activating an emergency strategy.
 
 ### Compactor contract and built-ins
 
-**Settled for Slice 6A.** One public `Compactor` is active. Its immutable request
-contains only the reason, ordered atomic units, previous neutral artifact,
-retained-tail target, and summary-output cap. It proposes a cutoff and artifact;
-the actor engine remains authoritative for validation, native materialization,
-and compare-and-append installation.
+**Settled for Slices 6A–6B.** One public `Compactor` is active per registered
+model. Its immutable request contains the reason, complete effective context,
+active instructions, ordered atomic units, previous neutral artifact,
+retained-tail target, summary-output cap, and an optional model-switch target
+descriptor. It proposes a cutoff and either a portable artifact or an exact
+provider checkpoint; the actor engine remains authoritative for validation,
+target-codec materialization, and compare-and-append installation.
 
 Atomic units prevent a continuing model response from being separated from its
 eval outcome or recovery/steering closure. A proposed cutoff must be the end of
@@ -683,11 +687,39 @@ Steering admitted while a summary request is outstanding is delivered after
 the marker append and before the next agent inference. Marker installation does
 not make mailbox delivery wait for another model boundary.
 
-### Slice 6B boundary
+### Model switching and native compaction
 
-Model switching and provider-native compaction remain Slice 6B. A native
-compactor will store the complete endpoint response and materialize its opaque
-or encrypted replacement without translating it into a smaller common type.
+**Settled for Slice 6B.** Runtime model registrations are heterogeneous and
+keyed by a stable `ModelId`. A durable `ModelSelected` event contains that key
+and a non-secret provider/model/codec descriptor; credentials, endpoints,
+clients, and executable configuration remain solely in the host registry. New
+actors write this as their genesis event. Reopened actors resolve the durable
+selection and reject a missing key or changed descriptor rather than silently
+falling back to builder order.
+
+`Actor::switch_model` is serialized with calls and compacts by default. It
+compacts the complete effective history with the source model's configured
+compactor, validates or materializes the result with the target codec, then
+atomically appends the compaction marker and target `ModelSelected` event. Any
+provider, codec, compactor, validation, or append failure leaves the source
+selection authoritative. `ModelSwitchPolicy::ReuseContext` is the explicit
+escape hatch: it first asks the target codec to encode the complete current
+view, then appends only the selection. Switching during an active run is
+invalid.
+
+Native versus neutral compaction is explicit configuration. The universal
+default remains `SummaryTailCompactor`; `FallbackCompactor` can compose a
+native implementation with summary-tail without teaching the core a model
+capability table. A native compactor can inspect the target descriptor and fail
+fast when its checkpoint codec is incompatible, allowing that explicit
+fallback to run.
+
+`OpenAiResponsesCompactor` implements the standalone `/responses/compact`
+endpoint. It supplies the complete effective input and active instructions,
+retains the complete `response.compaction` JSON as `source`, and persists the
+returned canonical `output` array unchanged as the exact replacement. Its
+neutral artifact is absent rather than synthesized. Normalized usage and cost
+remain observable, while the authoritative native response is preserved.
 Incompatible markers remain durable history but are ignored by request
 projection.
 
@@ -699,11 +731,13 @@ to discard the user's full history.
 
 ### Critical state
 
-**Settled.** The initial durable state is one authoritative append-only journal
-per actor. It begins with exactly two domain event kinds:
+**Settled.** Durable state is one authoritative append-only journal per actor.
+Its closed vocabulary now contains three domain event kinds:
 
-1. `MessageAdmitted`, containing the durable message envelope;
-2. `ContextAppended`, containing one model-visible `ContextEntry`. Its
+1. `ModelSelected`, containing a stable model registry identity and non-secret
+   descriptor;
+2. `MessageAdmitted`, containing the durable message envelope;
+3. `ContextAppended`, containing one model-visible `ContextEntry`. Its
    `Messages` transition carries any inbox message identifiers atomically
    consumed into that entry.
 
@@ -1384,6 +1418,12 @@ model. They forced one threshold compaction, resumed the original instruction,
 verified the durable marker alongside complete raw history, and emitted usage
 and configured cost estimates for both summary and continuation requests.
 
+The Slice 6B standalone native-compaction smoke passed on 2026-08-01 with
+`gpt-5.6-luna`. Three bounded requests established a continuation token,
+created a native `response.compaction` checkpoint, and replayed that opaque
+checkpoint to recover the exact token. Native usage was present for all three
+requests; the run consumed 383, 322, and 537 total tokens respectively.
+
 ### Slice 5B: model instructions and manifest synopsis
 
 **Implemented.**
@@ -1457,10 +1497,12 @@ summaries, redb reopen, and complete raw-history retention.
 
 ### Slice 6B: model switching and provider-native compaction
 
-Define model-switch behavior over compatible and incompatible markers. Add
-provider-native compaction where the selected adapter supports it, beginning
-with the OpenAI Responses compaction endpoint, while preserving opaque outputs
-exactly.
+**Implemented.** Durable model identity, heterogeneous registry lookup,
+compact-by-default switching, explicit reuse, atomic checkpoint/selection
+append, exact/portable compaction outputs, and standalone OpenAI Responses
+compaction are complete. Native output, including opaque encrypted checkpoint
+items, is preserved exactly; native-to-neutral fallback remains explicit
+composition.
 
 ### Slice 7: scheduler and multiple actors
 

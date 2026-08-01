@@ -69,6 +69,11 @@ string_identifier!(
     "actor identifier"
 );
 string_identifier!(
+    /// Stable host-defined identity of one registered model configuration.
+    ModelId,
+    "model identifier"
+);
+string_identifier!(
     /// Stable identity of one admitted mailbox message.
     MessageId,
     "message identifier"
@@ -93,6 +98,92 @@ string_identifier!(
     CodecId,
     "codec identifier"
 );
+
+/// Non-secret identity recorded whenever an actor selects a model.
+///
+/// Authentication, endpoints, clients, and other executable configuration
+/// remain in the runtime registry. This descriptor exists so historical logs
+/// remain intelligible and a reopened actor cannot silently bind the same
+/// [`ModelId`] to a different model.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelDescriptor {
+    provider: String,
+    model: String,
+    codec: String,
+}
+
+impl ModelDescriptor {
+    /// Constructs a validated, non-secret model description.
+    pub fn new(
+        provider: impl Into<String>,
+        model: impl Into<String>,
+        codec: impl Into<String>,
+    ) -> Result<Self, InvalidIdentifier> {
+        let provider = nonempty(provider.into(), "model provider descriptor")?;
+        let model = nonempty(model.into(), "model name descriptor")?;
+        let codec = nonempty(codec.into(), "model codec descriptor")?;
+        Ok(Self {
+            provider,
+            model,
+            codec,
+        })
+    }
+
+    /// Returns the provider family label.
+    #[must_use]
+    pub fn provider(&self) -> &str {
+        &self.provider
+    }
+
+    /// Returns the provider's model identifier.
+    #[must_use]
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    /// Returns the context/wire codec family label.
+    #[must_use]
+    pub fn codec(&self) -> &str {
+        &self.codec
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), InvalidIdentifier> {
+        nonempty(self.provider.clone(), "model provider descriptor")?;
+        nonempty(self.model.clone(), "model name descriptor")?;
+        nonempty(self.codec.clone(), "model codec descriptor")?;
+        Ok(())
+    }
+}
+
+/// The model currently selected by one actor journal.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelSelection {
+    /// Stable registry key.
+    pub model_id: ModelId,
+    /// Durable, non-secret registry description.
+    pub descriptor: ModelDescriptor,
+}
+
+impl ModelSelection {
+    /// Couples a registry identity with its durable descriptor.
+    #[must_use]
+    pub const fn new(model_id: ModelId, descriptor: ModelDescriptor) -> Self {
+        Self {
+            model_id,
+            descriptor,
+        }
+    }
+}
+
+fn nonempty(value: String, kind: &'static str) -> Result<String, InvalidIdentifier> {
+    if value.trim().is_empty() {
+        Err(InvalidIdentifier { kind })
+    } else {
+        Ok(value)
+    }
+}
 
 /// Actor-journal position after an append.
 #[derive(

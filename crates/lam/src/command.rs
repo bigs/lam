@@ -1,16 +1,21 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use lam_core::{MessageEnvelope, OutputContract};
+use lam_core::{MessageEnvelope, ModelId, OutputContract};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::CompactionReceipt;
 use crate::{ActorError, RunEvent};
+use crate::{CompactionReceipt, ModelSwitchPolicy, ModelSwitchReceipt};
 
 pub(crate) enum RunnerCommand {
     Wake,
     Call(Box<CallRequest>),
     Compact(oneshot::Sender<Result<Option<CompactionReceipt>, ActorError>>),
+    SwitchModel {
+        model_id: ModelId,
+        policy: ModelSwitchPolicy,
+        completion: oneshot::Sender<Result<ModelSwitchReceipt, ActorError>>,
+    },
     Shutdown,
 }
 

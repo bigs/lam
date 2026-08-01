@@ -2,7 +2,7 @@
 
 use lam::{
     CodecId, CodecRef, CompactionArtifact, ContextTransition, EncodedPayload, Model, ModelCodec,
-    ModelDelta, ModelDirective, ModelEventSink, ModelProvider, ModelRequestConfig,
+    ModelDelta, ModelDescriptor, ModelDirective, ModelEventSink, ModelProvider, ModelRequestConfig,
     ModelResponseMetadata, OutputContract, ProjectedContextEntry,
 };
 use serde_json::{Map, Value, json};
@@ -22,6 +22,7 @@ use crate::transport::StreamBody;
 
 const CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
 const COMPACTION_REPLACEMENT_CODEC_ID: &str = "openai/chat-compaction";
+const CHAT_DESCRIPTOR_CODEC: &str = "openai/chat-completions";
 
 /// Codec identifier for encoded Chat Completions request bodies.
 pub const REQUEST_CODEC_ID: &str = CHAT_REQUEST_CODEC_ID;
@@ -111,7 +112,10 @@ impl ChatCompletionsBuilder {
     /// Builds a model ready for [`lam::Lam::builder`].
     pub fn build(self) -> Result<Model<ChatCompletionsProvider, ChatCompletionsCodec>, BuildError> {
         let (provider, codec) = self.build_parts()?;
-        Ok(Model::new(provider, codec))
+        let descriptor =
+            ModelDescriptor::new("openai-compatible", codec.model(), CHAT_DESCRIPTOR_CODEC)
+                .expect("the Chat Completions descriptor is nonempty");
+        Ok(Model::new(provider, codec).with_descriptor(descriptor))
     }
 
     /// Builds the transport and codec separately for custom composition.

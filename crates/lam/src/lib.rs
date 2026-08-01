@@ -20,7 +20,7 @@ mod runtime_journal;
 
 pub use actor::{
     AbortHandle, Actor, ActorBuilder, ActorRef, Clock, Lam, LamBuilder, LamRuntime, MessageReceipt,
-    SystemClock,
+    ModelSwitchPolicy, ModelSwitchReceipt, SystemClock,
 };
 pub use compaction::{
     CompactionReceipt, FallbackCompactor, SummaryTailCompactor, TruncateOldestCompactor,
@@ -39,14 +39,15 @@ pub use lam_core::{
     ACTOR_EVENT_SCHEMA_VERSION, ActorEvent, ActorEventData, ActorId, ActorState, AdmissionDecision,
     AdmittedMessage, AppendOutcome, COMPACTION_RECORD_CODEC_ID, COMPACTION_RECORD_CODEC_VERSION,
     CodecId, CodecRef, CompactionArtifact, CompactionConfig, CompactionConfigError,
-    CompactionError, CompactionFuture, CompactionPlan, CompactionReason, CompactionRecord,
-    CompactionRequest, CompactionUnit, Compactor, ComponentId, ContextAmount, ContextEntry,
-    ContextSequence, ContextTransition, DeliveryMode, EncodedPayload, EvalRequest, EventBatch,
-    InvalidIdentifier, JournalError, JournalPage, JournalStore, MemStore, MessageEnvelope,
-    MessageError, MessageId, MessageSource, ModelCodec, ModelCost, ModelCostSource, ModelDelta,
-    ModelDirective, ModelEventSink, ModelProvider, ModelRequestConfig, ModelResponseMetadata,
-    OutputContract, PrincipalId, ProjectedContextEntry, Revision, RunId, RunProgress, StateError,
-    StoredEvent, Timestamp, TokenUsage,
+    CompactionError, CompactionFuture, CompactionOutput, CompactionPlan, CompactionReason,
+    CompactionRecord, CompactionRequest, CompactionUnit, Compactor, ComponentId, ContextAmount,
+    ContextEntry, ContextSequence, ContextTransition, DeliveryMode, EncodedPayload, EvalRequest,
+    EventBatch, InvalidIdentifier, JournalError, JournalPage, JournalStore, MemStore,
+    MessageEnvelope, MessageError, MessageId, MessageSource, ModelCodec, ModelCost,
+    ModelCostSource, ModelDelta, ModelDescriptor, ModelDirective, ModelEventSink, ModelId,
+    ModelProvider, ModelRequestConfig, ModelResponseMetadata, ModelSelection, OutputContract,
+    PrincipalId, ProjectedContextEntry, Revision, RunId, RunProgress, StateError, StoredEvent,
+    Timestamp, TokenUsage, atomic_compaction_units, compaction_prefix_len, estimate_entry_tokens,
 };
 pub use lam_deno::{
     ConsoleEntry, ConsoleLevel, EvalError, EvalOptions, EvalOutput, EvalValue, Isolate,

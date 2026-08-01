@@ -71,7 +71,7 @@ async fn actor_projection_survives_database_reopen() {
                             }))
                             .expect("fixture JSON is valid"),
                         ),
-                        artifact: CompactionArtifact::summary("complete"),
+                        artifact: Some(CompactionArtifact::summary("complete")),
                         replacement: EncodedPayload::new(
                             codec.clone(),
                             json!({ "role": "user", "text": "complete" }),
@@ -118,7 +118,7 @@ async fn actor_projection_survives_database_reopen() {
     let record = CompactionRecord::decode(&compaction.entry.payload)
         .expect("record should decode")
         .expect("payload is a compaction record");
-    assert_eq!(record.artifact.summary, "complete");
+    assert_eq!(record.artifact.unwrap().summary, "complete");
     assert_eq!(record.source.unwrap().value["raw"], "provider response");
     assert_eq!(record.replacement.value["text"], "complete");
     assert_eq!(state.context().len(), 3, "raw context remains available");

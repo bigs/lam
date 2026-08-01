@@ -25,8 +25,8 @@ adapter crates. They provide:
 - ordered, structured `console` capture which can be disabled by the builder;
 - host-bounded timeouts that discard and replace a poisoned isolate;
 - no ambient filesystem, process, network, or `Deno` authority;
-- one append-only, actor-local journal containing admitted messages and
-  model-visible context;
+- one append-only, actor-local journal containing model selection, admitted
+  messages, and model-visible context;
 - a pluggable typed `JournalStore` contract and pure-Rust `MemStore`;
 - pure projections for pending delivery, context history, run completion, and
   compaction markers;
@@ -42,11 +42,16 @@ adapter crates. They provide:
 - configurable 90%-by-default context compaction with a model-generated
   summary plus exact tail, deterministic truncation, manual triggering, and a
   public `Compactor` extension point;
-- append-only compaction records containing the raw source response, neutral
-  artifact, exact materialized replay item, and usage/cost metadata;
+- append-only compaction records containing the raw source response, an
+  optional neutral artifact, the exact replay checkpoint, and usage/cost
+  metadata;
+- a heterogeneous model registry with durable selection, compact-by-default
+  switching, an explicit context-reuse policy, and atomic checkpoint/selection
+  commits;
 - a pure-Rust `redb` journal backend; and
-- lossless OpenAI Responses and OpenAI-compatible Chat Completions adapters
-  with token/reasoning streaming, native usage preservation, normalized usage
+- lossless OpenAI Responses and OpenAI-compatible Chat Completions adapters,
+  including explicitly configured native OpenAI Responses compaction, with
+  token/reasoning streaming, native usage preservation, normalized usage
   events, and opt-in cost estimates.
 
 The isolate bootstrap is kernel-owned TypeScript installed through Deno's
@@ -98,6 +103,39 @@ let mut actor = Lam::builder(model)
     .build()
     .await?;
 let answer: String = actor.call("Inspect this project").await?;
+```
+
+Models are registered under stable host-defined identities. Every new actor
+writes its initial `ModelSelected` event before any messages; reopening resolves
+that durable identity against the supplied registry and rejects missing or
+rebound entries. Switching compacts the complete effective history by default,
+then atomically installs the target-compatible checkpoint and selection.
+Compatible histories may opt into a preflighted reuse instead:
+
+```rust,ignore
+use lam::ModelSwitchPolicy;
+
+let receipt = actor.switch_model("fast").await?;
+let receipt = actor
+    .switch_model_with_policy("deep", ModelSwitchPolicy::ReuseContext)
+    .await?;
+```
+
+OpenAI native compaction is opt-in and composes with the universal summary-tail
+fallback without a capability table or model-name heuristic:
+
+```rust,ignore
+use lam::{FallbackCompactor, Lam, SummaryTailCompactor};
+use lam_openai::responses::{OpenAiResponsesCompactor, Responses};
+
+let model = Responses::builder("gpt-5.6-luna")
+    .api_key(std::env::var("OPENAI_API_KEY")?)
+    .build()?;
+let compactor = FallbackCompactor::new(
+    OpenAiResponsesCompactor::new(&model),
+    SummaryTailCompactor::new(model.clone()),
+);
+let runtime = Lam::builder(model).compactor(compactor).build();
 ```
 
 The separate Chat Completions builder accepts compatible provider extensions

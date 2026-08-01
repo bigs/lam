@@ -11,7 +11,7 @@ use lam::{
 };
 use lam_openai::ModelPricing;
 use lam_openai::chat_completions::ChatCompletions;
-use lam_openai::responses::Responses;
+use lam_openai::responses::{OpenAiResponsesCompactor, Responses};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -46,6 +46,64 @@ async fn openai_responses_compaction_smoke() {
         .build()
         .expect("valid OpenAI model configuration");
     compaction_smoke(model, "openai-compaction-live").await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires OPENAI_API_KEY and makes three bounded live API calls"]
+async fn openai_responses_native_compaction_smoke() {
+    let model = Responses::builder(OPENAI_MODEL)
+        .api_key(required_env("OPENAI_API_KEY"))
+        .extra_body(json!({
+            "max_output_tokens": 256,
+            "reasoning": { "effort": "low" }
+        }))
+        .build()
+        .expect("valid OpenAI model configuration");
+    let native = OpenAiResponsesCompactor::new(&model);
+    let mut actor = Lam::builder(model)
+        .compactor(native)
+        .compaction_config(CompactionConfig::default().retain(ContextAmount::Tokens(0)))
+        .build()
+        .actor("openai-native-compaction-live")
+        .build()
+        .await
+        .expect("live actor starts");
+    let actor_ref = actor.actor_ref();
+
+    let first = timed_call(
+        &mut actor,
+        "Remember the exact continuation token NATIVE_COMPACTION_OK. Reply briefly that you have remembered it.",
+    )
+    .await;
+    assert_metered("native-compaction-before", &first.metadata);
+    let receipt = actor
+        .compact()
+        .await
+        .expect("native compaction succeeds")
+        .expect("context is compactable");
+    assert_eq!(receipt.strategy, "openai-responses-native");
+    assert_metered("native-compaction", std::slice::from_ref(&receipt.metadata));
+
+    let state = actor_ref.state().await.expect("state should project");
+    let marker = state.context().last().expect("marker is appended");
+    let record = CompactionRecord::decode(&marker.entry.payload)
+        .expect("record should decode")
+        .expect("marker should be a compaction record");
+    assert!(record.artifact.is_none());
+    assert_eq!(
+        record.source.as_ref().unwrap().value["object"],
+        "response.compaction"
+    );
+    assert!(!record.replacement.value.as_array().unwrap().is_empty());
+
+    let after = timed_call(
+        &mut actor,
+        "What exact continuation token did I ask you to remember? Return only that token.",
+    )
+    .await;
+    assert_eq!(after.output.trim(), "NATIVE_COMPACTION_OK");
+    assert_metered("native-compaction-after", &after.metadata);
+    actor.shutdown().await.expect("live actor shuts down");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -128,10 +186,23 @@ where
     let record = CompactionRecord::decode(&marker.entry.payload)
         .expect("record should decode")
         .expect("marker should use Lam's compaction record");
-    println!("compaction.summary {}", record.artifact.summary);
+    println!(
+        "compaction.summary {}",
+        record
+            .artifact
+            .as_ref()
+            .expect("portable compaction")
+            .summary
+    );
     assert_eq!(record.reason, CompactionReason::Threshold);
     assert!(record.source.is_some());
-    assert!(!record.artifact.is_empty());
+    assert!(
+        !record
+            .artifact
+            .as_ref()
+            .expect("portable compaction")
+            .is_empty()
+    );
     assert!(
         state.context().len() >= 3,
         "raw covered context remains present"

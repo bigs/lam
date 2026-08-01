@@ -4,15 +4,15 @@ use std::pin::Pin;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CodecId, CodecRef, ContextSequence, ContextTransition, EncodedPayload, ModelResponseMetadata,
-    ProjectedContextEntry, RunProgress,
+    CodecId, CodecRef, ContextSequence, ContextTransition, EncodedPayload, ModelDescriptor,
+    ModelResponseMetadata, ProjectedContextEntry, RunProgress,
 };
 
 /// Codec used by Lam's durable compaction records.
 pub const COMPACTION_RECORD_CODEC_ID: &str = "lam/compaction";
 
 /// Current durable compaction-record representation.
-pub const COMPACTION_RECORD_CODEC_VERSION: u32 = 1;
+pub const COMPACTION_RECORD_CODEC_VERSION: u32 = 2;
 
 /// One context-relative token amount.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -221,6 +221,8 @@ pub enum CompactionReason {
     Threshold,
     /// A provider rejected an inference because its context was too large.
     Overflow,
+    /// A model switch requested context prepared for the target model.
+    ModelSwitch,
 }
 
 /// Portable model-visible result of Lam-managed compaction.
@@ -259,14 +261,15 @@ pub struct CompactionRecord {
     pub strategy: String,
     /// Trigger which requested this compaction.
     pub reason: CompactionReason,
-    /// Untouched provider response used to derive the artifact, when applicable.
+    /// Untouched provider response used to derive this checkpoint, when applicable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<EncodedPayload>,
-    /// Provider-neutral summary and optional excerpts.
-    pub artifact: CompactionArtifact,
+    /// Optional provider-neutral summary and excerpts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<CompactionArtifact>,
     /// Exact codec-specific context item replayed to the model.
     pub replacement: EncodedPayload,
-    /// Normalized usage and cost from summary inference.
+    /// Normalized usage and cost from compaction inference.
     #[serde(default)]
     pub metadata: ModelResponseMetadata,
 }
@@ -282,7 +285,9 @@ impl CompactionRecord {
 
     /// Decodes a Lam compaction payload.
     pub fn decode(payload: &EncodedPayload) -> Result<Option<Self>, serde_json::Error> {
-        if payload.codec != compaction_record_codec() {
+        if payload.codec.id.as_str() != COMPACTION_RECORD_CODEC_ID
+            || !(1..=COMPACTION_RECORD_CODEC_VERSION).contains(&payload.codec.version)
+        {
             return Ok(None);
         }
         serde_json::from_value(payload.value.clone()).map(Some)
@@ -323,10 +328,7 @@ impl CompactionUnit {
 #[must_use]
 pub fn atomic_compaction_units(context: &[ProjectedContextEntry]) -> Vec<CompactionUnit> {
     let mut units: Vec<CompactionUnit> = Vec::new();
-    for entry in context
-        .iter()
-        .filter(|entry| !matches!(entry.entry.transition, ContextTransition::Compaction { .. }))
-    {
+    for entry in context {
         let joins_previous = units.last().is_some_and(|unit| {
             let Some(previous) = unit.entries.last() else {
                 return false;
@@ -370,6 +372,12 @@ pub fn estimate_entry_tokens(entry: &ProjectedContextEntry) -> u64 {
 pub struct CompactionRequest {
     /// Trigger requesting this operation.
     pub reason: CompactionReason,
+    /// Complete effective model-visible context at the compaction snapshot.
+    pub context: Vec<ProjectedContextEntry>,
+    /// Ephemeral instructions active for that context.
+    pub instructions: String,
+    /// Target selected by a model-switch compaction, when present.
+    pub target_model: Option<ModelDescriptor>,
     /// Ordered atomic context units not already covered by the previous artifact.
     pub units: Vec<CompactionUnit>,
     /// Previously accumulated neutral summary, when compacting repeatedly.
@@ -380,6 +388,31 @@ pub struct CompactionRequest {
     pub max_output_tokens: u64,
 }
 
+/// Model-visible value proposed by one compactor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CompactionOutput {
+    /// Portable state which the target codec must materialize.
+    Artifact(CompactionArtifact),
+    /// Exact provider-native state which must be replayed unchanged.
+    Exact {
+        /// Canonical codec-specific replacement.
+        replacement: EncodedPayload,
+        /// Optional portable companion for inspection or later conversion.
+        artifact: Option<CompactionArtifact>,
+    },
+}
+
+impl CompactionOutput {
+    /// Constructs an exact replacement without inventing a portable view.
+    #[must_use]
+    pub const fn exact(replacement: EncodedPayload) -> Self {
+        Self::Exact {
+            replacement,
+            artifact: None,
+        }
+    }
+}
+
 /// Successful proposal returned to the actor engine for validation and commit.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CompactionPlan {
@@ -387,11 +420,11 @@ pub struct CompactionPlan {
     pub strategy: String,
     /// Inclusive raw context boundary replaced by the artifact.
     pub covers_through: ContextSequence,
-    /// Portable summary produced by the compactor.
-    pub artifact: CompactionArtifact,
-    /// Untouched provider response used to derive the artifact.
+    /// Portable or exact model-visible output produced by the compactor.
+    pub output: CompactionOutput,
+    /// Untouched provider response used to derive the checkpoint.
     pub source: Option<EncodedPayload>,
-    /// Normalized summary-inference usage and cost.
+    /// Normalized compaction-inference usage and cost.
     pub metadata: ModelResponseMetadata,
 }
 
@@ -561,7 +594,7 @@ mod tests {
             strategy: "summary-tail".to_owned(),
             reason: CompactionReason::Threshold,
             source: None,
-            artifact: CompactionArtifact::summary("state"),
+            artifact: Some(CompactionArtifact::summary("state")),
             replacement: replacement.clone(),
             metadata: ModelResponseMetadata::default(),
         };
@@ -569,5 +602,30 @@ mod tests {
         let decoded = CompactionRecord::decode(&encoded).unwrap().unwrap();
         assert_eq!(decoded.replacement, replacement);
         assert_eq!(decoded, record);
+    }
+
+    #[test]
+    fn version_one_compaction_record_remains_readable() {
+        let replacement =
+            EncodedPayload::lam_json(json!({ "role": "user", "text": "legacy state" })).unwrap();
+        let encoded = EncodedPayload::new(
+            CodecRef::new(CodecId::new(COMPACTION_RECORD_CODEC_ID).unwrap(), 1),
+            json!({
+                "strategy": "summary-tail",
+                "reason": "manual",
+                "artifact": {
+                    "summary": "legacy state",
+                    "excerpts": []
+                },
+                "replacement": replacement
+            }),
+        );
+
+        let decoded = CompactionRecord::decode(&encoded).unwrap().unwrap();
+        assert_eq!(decoded.strategy, "summary-tail");
+        assert_eq!(decoded.reason, CompactionReason::Manual);
+        assert_eq!(decoded.artifact.unwrap().summary, "legacy state");
+        assert_eq!(decoded.replacement, replacement);
+        assert_eq!(decoded.metadata, ModelResponseMetadata::default());
     }
 }

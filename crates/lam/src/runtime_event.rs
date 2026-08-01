@@ -54,7 +54,7 @@ pub enum RuntimeEvent {
         revision: Revision,
         /// Stable name of the selected strategy.
         strategy: String,
-        /// Summary-inference usage and cost.
+        /// Compaction-inference usage and cost.
         metadata: ModelResponseMetadata,
     },
     /// A compactor failed without installing a marker.

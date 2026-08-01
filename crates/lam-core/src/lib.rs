@@ -18,9 +18,10 @@ pub mod test_support;
 
 pub use compaction::{
     COMPACTION_RECORD_CODEC_ID, COMPACTION_RECORD_CODEC_VERSION, CompactionArtifact,
-    CompactionConfig, CompactionConfigError, CompactionError, CompactionFuture, CompactionPlan,
-    CompactionReason, CompactionRecord, CompactionRequest, CompactionUnit, Compactor,
-    ContextAmount, atomic_compaction_units, compaction_prefix_len, estimate_entry_tokens,
+    CompactionConfig, CompactionConfigError, CompactionError, CompactionFuture, CompactionOutput,
+    CompactionPlan, CompactionReason, CompactionRecord, CompactionRequest, CompactionUnit,
+    Compactor, ContextAmount, atomic_compaction_units, compaction_prefix_len,
+    estimate_entry_tokens,
 };
 pub use context::{ContextEntry, ContextTransition, RunProgress};
 pub use event::{ACTOR_EVENT_SCHEMA_VERSION, ActorEvent, ActorEventData};
@@ -39,5 +40,5 @@ pub use projection::{
 };
 pub use types::{
     ActorId, CodecId, CodecRef, ComponentId, ContextSequence, EncodedPayload, InvalidIdentifier,
-    MessageId, PrincipalId, Revision, RunId, Timestamp,
+    MessageId, ModelDescriptor, ModelId, ModelSelection, PrincipalId, Revision, RunId, Timestamp,
 };

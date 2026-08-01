@@ -2,15 +2,17 @@
 
 mod support;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::task::Poll;
 use std::time::Duration;
 
 use lam::{
-    Actor, ActorError, CompactionArtifact, CompactionConfig, CompactionPlan, CompactionReason,
-    CompactionRecord, CompactionRequest, Compactor, ContextAmount, ContextSequence,
-    ContextTransition, DeliveryMode, Lam, MemStore, Model, ModelDelta, ModelResponseMetadata,
-    Namespace, Never, Run, RunEvent, RunProgress, RuntimeEvent,
+    Actor, ActorError, CompactionArtifact, CompactionConfig, CompactionOutput, CompactionPlan,
+    CompactionReason, CompactionRecord, CompactionRequest, Compactor, ContextAmount,
+    ContextSequence, ContextTransition, DeliveryMode, EncodedPayload, Lam, MemStore, Model,
+    ModelDelta, ModelResponseMetadata, ModelSwitchPolicy, Namespace, Never, Run, RunEvent,
+    RunProgress, RuntimeEvent,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -35,7 +37,78 @@ impl Compactor for InvalidCutCompactor {
             Ok(CompactionPlan {
                 strategy: "invalid-cut".to_owned(),
                 covers_through: ContextSequence::new(2),
-                artifact: CompactionArtifact::summary("invalid"),
+                output: CompactionOutput::Artifact(CompactionArtifact::summary("invalid")),
+                source: None,
+                metadata: ModelResponseMetadata::default(),
+            })
+        })
+    }
+}
+
+struct ExactCheckpointCompactor;
+
+impl Compactor for ExactCheckpointCompactor {
+    fn compact<'a>(&'a self, request: &'a CompactionRequest) -> lam::CompactionFuture<'a> {
+        Box::pin(async move {
+            let covers_through = request.units.last().unwrap().covers_through();
+            Ok(CompactionPlan {
+                strategy: "exact-checkpoint".to_owned(),
+                covers_through,
+                output: CompactionOutput::exact(EncodedPayload::new(
+                    lam::CodecRef::new(lam::CodecId::new("test/scripted-compaction").unwrap(), 1),
+                    json!({ "native": "opaque" }),
+                )),
+                source: Some(
+                    EncodedPayload::lam_json(json!({
+                        "full": "provider response"
+                    }))
+                    .unwrap(),
+                ),
+                metadata: ModelResponseMetadata::default(),
+            })
+        })
+    }
+}
+
+#[derive(Default)]
+struct ExactThenPortableCompactor {
+    calls: AtomicUsize,
+}
+
+impl Compactor for ExactThenPortableCompactor {
+    fn compact<'a>(&'a self, request: &'a CompactionRequest) -> lam::CompactionFuture<'a> {
+        Box::pin(async move {
+            let covers_through = request.units.last().unwrap().covers_through();
+            if self.calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                return Ok(CompactionPlan {
+                    strategy: "exact-checkpoint".to_owned(),
+                    covers_through,
+                    output: CompactionOutput::exact(EncodedPayload::new(
+                        lam::CodecRef::new(
+                            lam::CodecId::new("test/scripted-compaction").unwrap(),
+                            1,
+                        ),
+                        json!({ "native": "opaque" }),
+                    )),
+                    source: None,
+                    metadata: ModelResponseMetadata::default(),
+                });
+            }
+            if !request.units.iter().any(|unit| {
+                unit.entries().iter().any(|entry| {
+                    matches!(entry.entry.transition, ContextTransition::Compaction { .. })
+                })
+            }) {
+                return Err(lam::CompactionError::new(
+                    "the previous exact checkpoint was omitted",
+                ));
+            }
+            Ok(CompactionPlan {
+                strategy: "portable-checkpoint".to_owned(),
+                covers_through,
+                output: CompactionOutput::Artifact(CompactionArtifact::summary(
+                    "portable checkpoint",
+                )),
                 source: None,
                 metadata: ModelResponseMetadata::default(),
             })
@@ -57,6 +130,21 @@ async fn build_actor(
         .build()
         .await
         .expect("fixture actor should build")
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn new_actor_starts_with_one_durable_model_selection() {
+    let actor = Lam::builder(Model::new(ScriptedProvider::new([]), ScriptedCodec))
+        .initial_model_id("primary")
+        .build()
+        .actor("genesis")
+        .build()
+        .await
+        .unwrap();
+    let state = actor.actor_ref().state().await.unwrap();
+    assert_eq!(state.revision(), lam::Revision::new(1));
+    assert!(state.context().is_empty());
+    assert_eq!(state.selected_model().unwrap().model_id.as_str(), "primary");
 }
 
 async fn wait_for_model_start(run: &mut Run<'_, String>) {
@@ -192,7 +280,7 @@ async fn manual_compaction_materializes_one_durable_replay_record() {
     let record = CompactionRecord::decode(&marker.entry.payload)
         .unwrap()
         .expect("durable compaction record");
-    assert_eq!(record.artifact.summary, "compact state");
+    assert_eq!(record.artifact.unwrap().summary, "compact state");
     assert_eq!(record.reason, CompactionReason::Manual);
     assert!(record.source.is_some(), "raw summary response is retained");
     assert_eq!(
@@ -220,6 +308,183 @@ async fn manual_compaction_materializes_one_durable_replay_record() {
         5,
         "raw pre-compaction entries remain"
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn exact_compaction_checkpoint_bypasses_neutral_materialization() {
+    let provider = ScriptedProvider::new([output("first"), output("second")]);
+    let mut actor = Lam::builder(Model::new(provider.clone(), ScriptedCodec))
+        .compactor(ExactCheckpointCompactor)
+        .compaction_config(CompactionConfig::default().retain(ContextAmount::Tokens(0)))
+        .build()
+        .actor("exact-compaction")
+        .build()
+        .await
+        .unwrap();
+    let actor_ref = actor.actor_ref();
+
+    assert_eq!(actor.call("first").await.unwrap(), "first");
+    actor.compact().await.unwrap().unwrap();
+    let state = actor_ref.state().await.unwrap();
+    let record = CompactionRecord::decode(&state.context().last().unwrap().entry.payload)
+        .unwrap()
+        .unwrap();
+    assert!(record.artifact.is_none());
+    assert_eq!(record.replacement.value["native"], "opaque");
+    assert_eq!(record.source.unwrap().value["full"], "provider response");
+
+    assert_eq!(actor.call("second").await.unwrap(), "second");
+    assert_eq!(
+        provider.requests().len(),
+        2,
+        "exact compaction does no inference"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn model_switch_recompacts_a_marker_only_exact_checkpoint() {
+    let source = ScriptedProvider::new([output("source answer")]);
+    let target = ScriptedProvider::new([output("target answer")]);
+    let mut actor = Lam::builder(Model::new(source, ScriptedCodec))
+        .initial_model_id("source")
+        .compactor(ExactThenPortableCompactor::default())
+        .compaction_config(CompactionConfig::default().retain(ContextAmount::Tokens(0)))
+        .model("target", Model::new(target.clone(), ScriptedCodec))
+        .build()
+        .actor("exact-marker-switch")
+        .build()
+        .await
+        .unwrap();
+
+    assert_eq!(actor.call("first").await.unwrap(), "source answer");
+    actor.compact().await.unwrap().unwrap();
+    let receipt = actor.switch_model("target").await.unwrap();
+    assert_eq!(receipt.compaction.unwrap().strategy, "portable-checkpoint");
+    assert_eq!(actor.call("second").await.unwrap(), "target answer");
+    assert!(
+        target.requests()[0].value["context"][0]
+            .to_string()
+            .contains("portable checkpoint")
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn neutral_recompaction_includes_an_exact_checkpoint_and_its_tail() {
+    let provider = ScriptedProvider::new([
+        output("first answer"),
+        output("second answer"),
+        output("third answer"),
+    ]);
+    let mut actor = Lam::builder(Model::new(provider.clone(), ScriptedCodec))
+        .compactor(ExactThenPortableCompactor::default())
+        .compaction_config(CompactionConfig::default().retain(ContextAmount::Tokens(0)))
+        .build()
+        .actor("exact-marker-tail")
+        .build()
+        .await
+        .unwrap();
+
+    assert_eq!(actor.call("first").await.unwrap(), "first answer");
+    actor.compact().await.unwrap().unwrap();
+    assert_eq!(actor.call("second").await.unwrap(), "second answer");
+    let receipt = actor.compact().await.unwrap().unwrap();
+    assert_eq!(receipt.strategy, "portable-checkpoint");
+    assert_eq!(actor.call("third").await.unwrap(), "third answer");
+    assert!(
+        provider.requests()[2].value["context"][0]
+            .to_string()
+            .contains("portable checkpoint")
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn model_switch_compacts_then_atomically_selects_the_target() {
+    let source = ScriptedProvider::new([output("source answer"), output("portable state")]);
+    let target = ScriptedProvider::new([output("target answer")]);
+    let mut actor = Lam::builder(Model::new(source.clone(), ScriptedCodec))
+        .initial_model_id("source")
+        .model("target", Model::new(target.clone(), ScriptedCodec))
+        .build()
+        .actor("switching")
+        .build()
+        .await
+        .unwrap();
+    let actor_ref = actor.actor_ref();
+
+    assert_eq!(actor.call("first").await.unwrap(), "source answer");
+    let receipt = actor.switch_model("target").await.unwrap();
+    assert_eq!(receipt.previous_model_id.as_str(), "source");
+    assert_eq!(receipt.selected_model_id.as_str(), "target");
+    let compaction = receipt.compaction.expect("default switch compacts");
+    assert_eq!(compaction.reason, CompactionReason::ModelSwitch);
+    assert_eq!(compaction.revision.get() + 1, receipt.revision.get());
+
+    let state = actor_ref.state().await.unwrap();
+    assert_eq!(state.selected_model().unwrap().model_id.as_str(), "target");
+    let marker = state.context().last().unwrap();
+    let record = CompactionRecord::decode(&marker.entry.payload)
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.reason, CompactionReason::ModelSwitch);
+    assert_eq!(record.artifact.unwrap().summary, "portable state");
+
+    assert_eq!(actor.call("second").await.unwrap(), "target answer");
+    assert_eq!(source.requests().len(), 2);
+    assert_eq!(source.requests()[1].value["enableEval"], false);
+    let target_requests = target.requests();
+    assert_eq!(target_requests.len(), 1);
+    assert_eq!(
+        target_requests[0].value["context"][0]["transition"]["kind"],
+        "compaction"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn failed_model_switch_leaves_selection_and_context_unchanged() {
+    let source = ScriptedProvider::new([output("source answer"), output("portable state")]);
+    let target = ScriptedProvider::new([]);
+    let mut actor = Lam::builder(Model::new(source, ScriptedCodec))
+        .initial_model_id("source")
+        .model("target", Model::new(target, RejectingCompactionCodec))
+        .build()
+        .actor("failed-switch")
+        .build()
+        .await
+        .unwrap();
+    let actor_ref = actor.actor_ref();
+    assert_eq!(actor.call("first").await.unwrap(), "source answer");
+    let before = actor_ref.state().await.unwrap();
+
+    let error = actor.switch_model("target").await.unwrap_err();
+    assert!(error.to_string().contains("target model codec rejected"));
+    let after = actor_ref.state().await.unwrap();
+    assert_eq!(after.revision(), before.revision());
+    assert_eq!(after.context(), before.context());
+    assert_eq!(after.selected_model(), before.selected_model());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn reuse_context_switch_preflights_without_compaction() {
+    let source = ScriptedProvider::new([output("source answer")]);
+    let target = ScriptedProvider::new([output("target answer")]);
+    let mut actor = Lam::builder(Model::new(source.clone(), ScriptedCodec))
+        .initial_model_id("source")
+        .model("target", Model::new(target.clone(), ScriptedCodec))
+        .build()
+        .actor("reuse-switch")
+        .build()
+        .await
+        .unwrap();
+    assert_eq!(actor.call("first").await.unwrap(), "source answer");
+
+    let receipt = actor
+        .switch_model_with_policy("target", ModelSwitchPolicy::ReuseContext)
+        .await
+        .unwrap();
+    assert!(receipt.compaction.is_none());
+    assert_eq!(source.requests().len(), 1);
+    assert_eq!(actor.call("second").await.unwrap(), "target answer");
+    assert_eq!(target.requests().len(), 1);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -326,7 +591,7 @@ async fn repeated_compaction_updates_the_summary_and_selects_the_newest_marker()
     let newest = CompactionRecord::decode(&markers[1].entry.payload)
         .unwrap()
         .unwrap();
-    assert_eq!(newest.artifact.summary, "summary two");
+    assert_eq!(newest.artifact.unwrap().summary, "summary two");
     assert_eq!(
         state.context().len(),
         8,

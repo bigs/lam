@@ -1,10 +1,10 @@
 use lam_core::{
     ActorId, ActorState, CodecId, CodecRef, ComponentId, ContextTransition, DeliveryMode,
-    EncodedPayload, JournalStore, MessageEnvelope, MessageSource, ModelCodec, ModelDirective,
-    Revision,
+    EncodedPayload, JournalStore, MessageEnvelope, MessageSource, ModelDirective,
 };
 
 use crate::actor::{Clock, RuntimeIds};
+use crate::model::RegisteredModel;
 use crate::runtime_journal::{admit_message_from_state, load_state};
 use crate::{
     ActorError, InterruptedEvalOutcome, IsolateState, RUNTIME_COMPONENT_ID, RuntimeEvent,
@@ -16,19 +16,19 @@ pub(crate) struct StartupRecovery {
     pub(crate) event: Option<RuntimeEvent>,
 }
 
-pub(crate) async fn recover_actor<C, S>(
+pub(crate) async fn recover_actor<S>(
     actor_id: &ActorId,
     store: &S,
-    codec: &C,
+    model: &RegisteredModel,
     clock: &dyn Clock,
     ids: &RuntimeIds,
+    announce: bool,
 ) -> Result<StartupRecovery, ActorError>
 where
-    C: ModelCodec,
     S: JournalStore,
 {
     let state = load_state(store, actor_id).await?;
-    if state.revision() == Revision::ZERO {
+    if !announce {
         return Ok(StartupRecovery {
             wake: false,
             event: None,
@@ -36,7 +36,7 @@ where
     }
 
     let resumed_run_id = state.active_run().cloned();
-    let interrupted_eval_outcome = interrupted_eval_outcome(&state, codec);
+    let interrupted_eval_outcome = interrupted_eval_outcome(&state, model);
     let notice = SystemNotice::runtime_resumed(resumed_run_id.clone(), interrupted_eval_outcome);
     let payload = EncodedPayload::new(
         system_notice_codec(),
@@ -97,10 +97,10 @@ fn is_runtime_resumption(message: &MessageEnvelope) -> bool {
         )
 }
 
-fn interrupted_eval_outcome<C>(state: &ActorState, codec: &C) -> Option<InterruptedEvalOutcome>
-where
-    C: ModelCodec,
-{
+fn interrupted_eval_outcome(
+    state: &ActorState,
+    model: &RegisteredModel,
+) -> Option<InterruptedEvalOutcome> {
     let active_run = state.active_run()?;
     let last_step = state.context().iter().rev().find(|projected| {
         !matches!(
@@ -112,7 +112,7 @@ where
         return None;
     };
     matches!(
-        codec.interpret_response(&last_step.entry.payload),
+        model.interpret_response(&last_step.entry.payload),
         Ok(ModelDirective::Eval(_))
     )
     .then_some(InterruptedEvalOutcome::Unknown)

@@ -7,17 +7,18 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use lam::{
-    CodecId, CodecRef, CompactionArtifact, CompactionReason, CompactionRecord, ContextEntry,
-    ContextSequence, ContextTransition, EncodedPayload, ModelCodec, ModelCostSource, ModelDelta,
-    ModelDirective, ModelEventSink, ModelProvider, ModelRequestConfig, ModelResponseMetadata,
-    OutputContract, ProjectedContextEntry, Revision, RunEvent, RunId, RunProgress, Timestamp,
+    CodecId, CodecRef, CompactionArtifact, CompactionOutput, CompactionReason, CompactionRecord,
+    CompactionRequest, Compactor, ContextEntry, ContextSequence, ContextTransition, EncodedPayload,
+    ModelCodec, ModelCostSource, ModelDelta, ModelDirective, ModelEventSink, ModelProvider,
+    ModelRequestConfig, ModelResponseMetadata, OutputContract, ProjectedContextEntry, Revision,
+    RunEvent, RunId, RunProgress, Timestamp,
 };
 use lam_openai::chat_completions::{
     ChatCompletions, REQUEST_CODEC_ID as CHAT_REQUEST_CODEC_ID,
     RESPONSE_CODEC_ID as CHAT_RESPONSE_CODEC_ID,
 };
 use lam_openai::responses::{
-    REQUEST_CODEC_ID as RESPONSES_REQUEST_CODEC_ID,
+    OpenAiResponsesCompactor, REQUEST_CODEC_ID as RESPONSES_REQUEST_CODEC_ID,
     RESPONSE_CODEC_ID as RESPONSES_RESPONSE_CODEC_ID, Responses,
 };
 use lam_openai::{BuildError, ModelPricing};
@@ -173,7 +174,7 @@ fn responses_compaction_replays_only_the_durable_materialized_view() {
         strategy: "summary-tail".to_owned(),
         reason: CompactionReason::Threshold,
         source: Some(source),
-        artifact,
+        artifact: Some(artifact),
         replacement,
         metadata: ModelResponseMetadata::default(),
     };
@@ -210,6 +211,174 @@ fn responses_compaction_replays_only_the_durable_materialized_view() {
         .unwrap();
     assert!(summary_request.value["body"].get("tools").is_none());
     assert_eq!(summary_request.value["body"]["max_output_tokens"], 512);
+}
+
+#[tokio::test]
+async fn responses_native_compactor_preserves_the_canonical_checkpoint() {
+    let native = json!({
+        "id": "cmp_1",
+        "object": "response.compaction",
+        "model": "gpt-test",
+        "output": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "retained" }]
+            },
+            {
+                "type": "compaction",
+                "id": "cmp_item_1",
+                "encrypted_content": "opaque-checkpoint"
+            }
+        ],
+        "usage": {
+            "input_tokens": 120,
+            "output_tokens": 8,
+            "total_tokens": 128
+        }
+    });
+    let server = MockServer::start("application/json", native.to_string());
+    let model = Responses::builder("gpt-test")
+        .api_key("test-key")
+        .base_url(format!("{}/v1", server.origin))
+        .build()
+        .expect("valid adapter");
+    let compactor = OpenAiResponsesCompactor::new(&model);
+    let context = vec![user_message("history")];
+    let request = CompactionRequest {
+        reason: CompactionReason::Manual,
+        context: context.clone(),
+        instructions: "runtime instructions".to_owned(),
+        target_model: None,
+        units: lam::atomic_compaction_units(&context),
+        previous: None,
+        retain_tokens: 0,
+        max_output_tokens: 512,
+    };
+
+    let plan = compactor
+        .compact(&request)
+        .await
+        .expect("native compaction");
+    assert_eq!(plan.strategy, "openai-responses-native");
+    assert_eq!(plan.covers_through, ContextSequence::new(1));
+    let CompactionOutput::Exact {
+        replacement,
+        artifact,
+    } = plan.output
+    else {
+        panic!("native compaction must return an exact checkpoint");
+    };
+    assert!(artifact.is_none());
+    assert_eq!(replacement.value, native["output"]);
+    assert_eq!(plan.source.expect("full response retained").value, native);
+    assert_eq!(plan.metadata.usage.unwrap().total_tokens, 128);
+
+    let request = server.finish();
+    assert_eq!(request.path, "/v1/responses/compact");
+    assert_eq!(request.body["model"], "gpt-test");
+    assert_eq!(request.body["instructions"], "runtime instructions");
+    assert_eq!(request.body["input"][0]["role"], "user");
+    assert!(request.body.get("tools").is_none());
+    assert!(request.body.get("stream").is_none());
+    assert!(request.body.get("store").is_none());
+}
+
+#[tokio::test]
+async fn responses_native_checkpoint_is_installed_and_replayed_by_the_actor() {
+    let first = json!({
+        "id": "resp_first",
+        "object": "response",
+        "status": "completed",
+        "model": "gpt-test",
+        "output": [{
+            "type": "message",
+            "role": "assistant",
+            "content": [{ "type": "output_text", "text": "first" }]
+        }]
+    });
+    let compacted = json!({
+        "id": "cmp_actor",
+        "object": "response.compaction",
+        "model": "gpt-test",
+        "output": [{
+            "type": "compaction",
+            "id": "cmp_item",
+            "encrypted_content": "actor-opaque-checkpoint"
+        }]
+    });
+    let second = json!({
+        "id": "resp_second",
+        "object": "response",
+        "status": "completed",
+        "model": "gpt-test",
+        "output": [{
+            "type": "message",
+            "role": "assistant",
+            "content": [{ "type": "output_text", "text": "second" }]
+        }]
+    });
+    let server = MockServer::start_mixed(vec![
+        (
+            "text/event-stream",
+            format!(
+                "event: response.completed\ndata: {}\n\n",
+                json!({ "type": "response.completed", "response": first })
+            ),
+        ),
+        ("application/json", compacted.to_string()),
+        (
+            "text/event-stream",
+            format!(
+                "event: response.completed\ndata: {}\n\n",
+                json!({ "type": "response.completed", "response": second })
+            ),
+        ),
+    ]);
+    let model = Responses::builder("gpt-test")
+        .api_key("test-key")
+        .base_url(format!("{}/v1", server.origin))
+        .build()
+        .unwrap();
+    let native = OpenAiResponsesCompactor::new(&model);
+    let mut actor = lam::Lam::builder(model)
+        .compactor(native)
+        .compaction_config(lam::CompactionConfig::default().retain(lam::ContextAmount::Tokens(0)))
+        .build()
+        .actor("native-compaction")
+        .build()
+        .await
+        .unwrap();
+    let actor_ref = actor.actor_ref();
+
+    assert_eq!(actor.call("first task").await.unwrap(), "first");
+    actor.compact().await.unwrap().unwrap();
+    let state = actor_ref.state().await.unwrap();
+    let record = CompactionRecord::decode(&state.context().last().unwrap().entry.payload)
+        .unwrap()
+        .unwrap();
+    assert!(record.artifact.is_none());
+    assert_eq!(
+        record.replacement.value[0]["encrypted_content"],
+        "actor-opaque-checkpoint"
+    );
+    assert_eq!(record.source.unwrap().value, compacted);
+    assert_eq!(actor.call("second task").await.unwrap(), "second");
+    actor.shutdown().await.unwrap();
+
+    let requests = server.finish_all();
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| request.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["/v1/responses", "/v1/responses/compact", "/v1/responses"]
+    );
+    assert_eq!(
+        requests[2].body["input"][0]["encrypted_content"],
+        "actor-opaque-checkpoint"
+    );
+    assert_eq!(requests[2].body["input"][1]["role"], "user");
 }
 
 #[test]
@@ -383,7 +552,7 @@ fn chat_compaction_replays_only_the_durable_materialized_view() {
             "response",
             json!({ "private_reasoning": "raw-compaction-secret" }),
         )),
-        artifact,
+        artifact: Some(artifact),
         replacement,
         metadata: ModelResponseMetadata::default(),
     };
@@ -1013,12 +1182,21 @@ impl MockServer {
     }
 
     fn start_sequence(content_type: &'static str, response_bodies: Vec<String>) -> Self {
+        Self::start_mixed(
+            response_bodies
+                .into_iter()
+                .map(|body| (content_type, body))
+                .collect(),
+        )
+    }
+
+    fn start_mixed(responses: Vec<(&'static str, String)>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
         let address = listener.local_addr().expect("mock address");
         let (sender, request) = mpsc::channel();
-        let expected_requests = response_bodies.len();
+        let expected_requests = responses.len();
         let join = std::thread::spawn(move || {
-            for response_body in response_bodies {
+            for (content_type, response_body) in responses {
                 let (mut stream, _) = listener.accept().expect("accept request");
                 let captured = read_request(&mut stream);
                 sender.send(captured).expect("capture request");

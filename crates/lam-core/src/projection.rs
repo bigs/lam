@@ -1,9 +1,9 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
     ACTOR_EVENT_SCHEMA_VERSION, ActorEvent, ActorEventData, ContextEntry, ContextSequence,
     ContextTransition, DeliveryMode, JournalPage, MessageEnvelope, MessageError, MessageId,
-    Revision, RunId, RunProgress, StoredEvent,
+    ModelDescriptor, ModelId, ModelSelection, Revision, RunId, RunProgress, StoredEvent,
 };
 
 /// One admitted message as viewed through the actor projection.
@@ -34,6 +34,8 @@ pub struct ActorState {
     revision: Revision,
     messages: Vec<AdmittedMessage>,
     context: Vec<ProjectedContextEntry>,
+    selected_model: Option<Box<ModelSelection>>,
+    model_descriptors: BTreeMap<ModelId, ModelDescriptor>,
     active_run: Option<RunId>,
     completed_runs: BTreeSet<RunId>,
 }
@@ -63,6 +65,12 @@ impl ActorState {
     #[must_use]
     pub fn context(&self) -> &[ProjectedContextEntry] {
         &self.context
+    }
+
+    /// Returns the durable model currently selected by this actor.
+    #[must_use]
+    pub fn selected_model(&self) -> Option<&ModelSelection> {
+        self.selected_model.as_deref()
     }
 
     /// Returns one admitted message by identity.
@@ -193,8 +201,21 @@ impl ActorState {
         Ok(ActorEvent::context_appended(entry))
     }
 
+    /// Validates and plans a model selection at the current journal head.
+    pub fn plan_model_selection(
+        &self,
+        selection: ModelSelection,
+    ) -> Result<ActorEvent, StateError> {
+        self.revision
+            .checked_advance(1)
+            .ok_or(StateError::RevisionExhausted)?;
+        self.validate_model_selection(&selection)?;
+        Ok(ActorEvent::model_selected(selection))
+    }
+
     fn apply_stored_event(&mut self, stored: StoredEvent) -> Result<(), StateError> {
-        if stored.event.schema_version() != ACTOR_EVENT_SCHEMA_VERSION {
+        let schema_version = stored.event.schema_version();
+        if schema_version == 0 || schema_version > ACTOR_EVENT_SCHEMA_VERSION {
             return Err(StateError::UnsupportedEventVersion {
                 revision: stored.revision,
                 found: stored.event.schema_version(),
@@ -202,7 +223,18 @@ impl ActorState {
             });
         }
 
-        match stored.event.into_data() {
+        let data = stored.event.into_data();
+        if schema_version == 1 && matches!(data, ActorEventData::ModelSelected { .. }) {
+            return Err(StateError::UnsupportedEventVersion {
+                revision: stored.revision,
+                found: schema_version,
+                supported: ACTOR_EVENT_SCHEMA_VERSION,
+            });
+        }
+        match data {
+            ActorEventData::ModelSelected { selection } => {
+                self.apply_model_selection(selection)?;
+            }
             ActorEventData::MessageAdmitted { message } => {
                 self.apply_message(stored.revision, message)?;
             }
@@ -211,6 +243,42 @@ impl ActorState {
             }
         }
         self.revision = stored.revision;
+        Ok(())
+    }
+
+    fn apply_model_selection(&mut self, selection: ModelSelection) -> Result<(), StateError> {
+        self.validate_model_selection(&selection)?;
+        self.model_descriptors
+            .entry(selection.model_id.clone())
+            .or_insert_with(|| selection.descriptor.clone());
+        self.selected_model = Some(Box::new(selection));
+        Ok(())
+    }
+
+    fn validate_model_selection(&self, selection: &ModelSelection) -> Result<(), StateError> {
+        selection
+            .descriptor
+            .validate()
+            .map_err(|error| StateError::InvalidModelDescriptor {
+                model_id: selection.model_id.clone(),
+                message: error.to_string(),
+            })?;
+        if self.selected_model.is_some()
+            && let Some(run_id) = &self.active_run
+        {
+            return Err(StateError::ModelSwitchDuringRun {
+                run_id: run_id.clone(),
+            });
+        }
+        if let Some(existing) = self.model_descriptors.get(&selection.model_id)
+            && existing != &selection.descriptor
+        {
+            return Err(StateError::ModelDescriptorChanged {
+                model_id: selection.model_id.clone(),
+                existing: Box::new(existing.clone()),
+                actual: Box::new(selection.descriptor.clone()),
+            });
+        }
         Ok(())
     }
 
@@ -477,6 +545,30 @@ pub enum StateError {
     TerminalWithPendingSteer {
         /// Pending steering identities.
         message_ids: Vec<MessageId>,
+    },
+    /// A model switch was attempted while a tool-calling loop was active.
+    #[error("cannot switch models while run `{run_id}` is active")]
+    ModelSwitchDuringRun {
+        /// Active run.
+        run_id: RunId,
+    },
+    /// A stable model registry key was rebound to a different descriptor.
+    #[error("model `{model_id}` descriptor changed from {existing:?} to {actual:?}")]
+    ModelDescriptorChanged {
+        /// Stable registry identity.
+        model_id: ModelId,
+        /// Descriptor first observed in this actor journal.
+        existing: Box<ModelDescriptor>,
+        /// Conflicting descriptor.
+        actual: Box<ModelDescriptor>,
+    },
+    /// A durable model descriptor contained an empty identity field.
+    #[error("model `{model_id}` has an invalid descriptor: {message}")]
+    InvalidModelDescriptor {
+        /// Stable registry identity.
+        model_id: ModelId,
+        /// Validation diagnostic.
+        message: String,
     },
     /// Actor-journal revision arithmetic overflowed.
     #[error("actor journal revision space is exhausted")]

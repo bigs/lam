@@ -1,11 +1,12 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use lam_core::{
-    ActorId, ActorState, CodecId, CodecRef, CompactionConfig, CompactionReason, Compactor,
-    ContextEntry, ContextTransition, EncodedPayload, JournalStore, MessageId, MessageSource,
-    ModelCodec, ModelDirective, ModelEventSink, ModelProvider, ModelRequestConfig,
-    ModelResponseMetadata, OutputContract, RunId, RunProgress, Timestamp,
+    ActorId, ActorState, CodecId, CodecRef, CompactionConfig, CompactionReason, ContextEntry,
+    ContextTransition, EncodedPayload, JournalStore, MessageId, MessageSource, ModelDirective,
+    ModelEventSink, ModelId, ModelRequestConfig, ModelResponseMetadata, OutputContract, RunId,
+    RunProgress, Timestamp,
 };
 use lam_deno::{EvalOptions, Isolate};
 use serde::Serialize;
@@ -14,35 +15,56 @@ use tokio::sync::{mpsc, watch};
 use crate::actor::{Clock, RuntimeIds};
 use crate::command::{CallRequest, RunnerCommand};
 use crate::compaction::{estimated_context_tokens, model_context};
+use crate::model::RegisteredModel;
 use crate::recovery::has_recoverable_work;
 use crate::runtime_journal::{
     AppendAttempt, admit_message, append_context, append_event, load_state, state_error,
 };
 use crate::{ActorError, EvalOutcome, RunEvent, RuntimeEvent};
 
-pub(crate) struct ActorRunner<P, C, S> {
+pub(crate) struct ActorRunner<S> {
     pub(crate) actor_id: ActorId,
     pub(crate) store: Arc<S>,
-    pub(crate) provider: Arc<P>,
-    pub(crate) codec: Arc<C>,
+    pub(crate) models: BTreeMap<ModelId, RegisteredModel>,
     pub(crate) clock: Arc<dyn Clock>,
     pub(crate) ids: Arc<RuntimeIds>,
     pub(crate) isolate: Isolate,
     pub(crate) system_prompt: String,
     pub(crate) compaction_config: CompactionConfig,
-    pub(crate) compactor: Option<Arc<dyn Compactor>>,
     pub(crate) commands: mpsc::UnboundedReceiver<RunnerCommand>,
     pub(crate) abort: watch::Receiver<bool>,
     pub(crate) shutdown: Arc<AtomicBool>,
     pub(crate) runtime_events: mpsc::Sender<RuntimeEvent>,
 }
 
-impl<P, C, S> ActorRunner<P, C, S>
+impl<S> ActorRunner<S>
 where
-    P: ModelProvider,
-    C: ModelCodec,
     S: JournalStore + 'static,
 {
+    pub(crate) fn selected_model(
+        &self,
+        state: &ActorState,
+    ) -> Result<&RegisteredModel, ActorError> {
+        let selection = state.selected_model().ok_or_else(|| ActorError::State {
+            message: "actor journal has no model selection".to_owned(),
+        })?;
+        let model =
+            self.models
+                .get(&selection.model_id)
+                .ok_or_else(|| ActorError::UnknownModel {
+                    model_id: selection.model_id.clone(),
+                })?;
+        if model.descriptor() != &selection.descriptor {
+            return Err(ActorError::State {
+                message: format!(
+                    "durable model `{}` descriptor does not match the runtime registry",
+                    selection.model_id
+                ),
+            });
+        }
+        Ok(model)
+    }
+
     pub(crate) async fn run(mut self, wake: bool) {
         if wake && let Err(ActorError::Aborted) = self.drain_recovered_work().await {
             return;
@@ -79,6 +101,18 @@ where
                 }
                 RunnerCommand::Compact(completion) => {
                     let result = self.compact_current().await;
+                    let aborted = matches!(result, Err(ActorError::Aborted));
+                    let _ = completion.send(result);
+                    if aborted {
+                        break;
+                    }
+                }
+                RunnerCommand::SwitchModel {
+                    model_id,
+                    policy,
+                    completion,
+                } => {
+                    let result = self.switch_model(model_id, policy).await;
                     let aborted = matches!(result, Err(ActorError::Aborted));
                     let _ = completion.send(result);
                     if aborted {
@@ -135,6 +169,7 @@ where
         events: Option<&mpsc::Sender<RunEvent>>,
     ) -> Result<Option<serde_json::Value>, ActorError> {
         let mut state = load_state(self.store.as_ref(), &self.actor_id).await?;
+        let model = self.selected_model(&state)?.clone();
         let run_id = match state.active_run() {
             Some(run_id) => run_id.clone(),
             None => {
@@ -150,21 +185,17 @@ where
                 run_id: run_id.clone(),
             },
         );
-
         loop {
             state = self.deliver_eligible(state, &run_id, events).await?;
             state = self.maybe_compact(state, events).await?;
             state = self.deliver_eligible(state, &run_id, events).await?;
             let mut overflow_retried = false;
             let response = loop {
-                let context = model_context(&state, self.codec.as_ref())?;
+                let context = model_context(&state, &model)?;
                 let config = ModelRequestConfig::agent(&output, &self.system_prompt);
-                let request = self
-                    .codec
+                let request = model
                     .encode_request(&context, &config)
-                    .map_err(|error| ActorError::Codec {
-                        message: error.to_string(),
-                    })?;
+                    .map_err(|message| ActorError::Codec { message })?;
                 emit(
                     events,
                     RunEvent::ModelStarted {
@@ -182,23 +213,22 @@ where
                         },
                     );
                 });
-                let provider = Arc::clone(&self.provider);
                 let mut abort = self.abort.clone();
                 let result = tokio::select! {
                     biased;
                     _ = wait_for_abort(&mut abort) => return Err(ActorError::Aborted),
-                    result = provider.invoke(request, sink) => result,
+                    result = model.invoke(request, sink) => result,
                 };
                 match result {
                     Ok(response) => break response,
-                    Err(error) if self.provider.is_context_overflow(&error) => {
+                    Err(error) if error.context_overflow => {
                         if overflow_retried {
                             return Err(ActorError::ContextOverflow);
                         }
-                        if self.compactor.is_none() {
+                        if model.compactor.is_none() {
                             return Err(ActorError::ContextOverflow);
                         }
-                        let before = estimated_context_tokens(&context, self.codec.as_ref())?;
+                        let before = estimated_context_tokens(&context, &model)?;
                         let (next, receipt) = self
                             .perform_compaction(state, CompactionReason::Overflow, events)
                             .await?;
@@ -208,8 +238,8 @@ where
                                     .to_owned(),
                             });
                         };
-                        let after_context = model_context(&next, self.codec.as_ref())?;
-                        let after = estimated_context_tokens(&after_context, self.codec.as_ref())?;
+                        let after_context = model_context(&next, &model)?;
+                        let after = estimated_context_tokens(&after_context, &model)?;
                         if after >= before {
                             return Err(ActorError::Compaction {
                                 message: format!(
@@ -222,12 +252,12 @@ where
                     }
                     Err(error) => {
                         return Err(ActorError::Provider {
-                            message: error.to_string(),
+                            message: error.message,
                         });
                     }
                 }
             };
-            let metadata = self.codec.response_metadata(&response);
+            let metadata = model.response_metadata(&response);
             trace_model_completed(&self.actor_id, &run_id, &metadata);
             emit(
                 events,
@@ -236,12 +266,9 @@ where
                     metadata,
                 },
             );
-            let directive =
-                self.codec
-                    .interpret_response(&response)
-                    .map_err(|error| ActorError::Codec {
-                        message: error.to_string(),
-                    })?;
+            let directive = model
+                .interpret_response(&response)
+                .map_err(|message| ActorError::Codec { message })?;
             let recorded_at = self.clock.now();
 
             match directive {
