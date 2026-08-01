@@ -6,6 +6,14 @@ description = "Durable redb state-store implementation for Lam"
 
 [dependencies]
 lam-core = { path = "../lam-core" }
+redb.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+lam-core = { path = "../lam-core", features = ["test-support"] }
+tempfile.workspace = true
+tokio.workspace = true
 
 [lints]
 workspace = true

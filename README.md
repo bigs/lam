@@ -66,7 +66,7 @@ residency after we establish a safe lifecycle contract with `rusty_v8`.
 - `lam`: public facade and single-actor model runner
 - `lam-core`: actor journal, mailbox, context, and storage contracts
 - `lam-deno`: embedded Deno isolate and typed builtin bridge
-- `lam-redb`: reserved for the future durable `redb` adapter
+- `lam-redb`: durable `JournalStore` adapter with versioned redb tables
 
 The future TUI will be distributed as an executable named `lam` from a
 separately named workspace package, so it does not displace the `lam` library

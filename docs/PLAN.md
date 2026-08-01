@@ -1150,10 +1150,27 @@ input → model requests eval → persistent TypeScript executes a typed builtin
 
 ### Slice 4: `redb` durability and recovery
 
-Implement the ordered key schema and transaction boundaries in `lam-redb`.
-Run the shared store suite, restart actors from disk, preserve admitted inbox
-messages, rebuild context projections and compaction watermarks, and inject an
-explicit resumption message.
+#### Slice 4A: durable journal adapter
+
+**Implemented; pending review.**
+
+`lam-redb` implements `JournalStore` with versioned actor-head and
+revision-addressed event tables. One redb write transaction compares the
+actor-local head, appends a consecutive event batch, and advances the head.
+Read transactions observe the head and bounded event page from one snapshot.
+Actor events use their versioned Serde JSON representation as the authoritative
+stored value.
+
+The shared store suite covers the backend contract. A close/reopen test rebuilds
+the same projection from bounded pages and proves that pending inbox messages,
+completed runs, compaction watermarks, and raw context survive.
+
+#### Slice 4B: actor recovery policy
+
+Restart actors from disk, wake durable pending work, preserve model-visible
+context, and inject an explicit resumption message when an interrupted actor
+receives a fresh isolate. Recovery policy and actor lifecycle changes do not
+belong in the storage adapter.
 
 ### Slice 5: real provider codec
 
