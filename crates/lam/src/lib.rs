@@ -9,6 +9,7 @@ mod error;
 mod eval;
 mod model;
 mod notice;
+mod prompt;
 mod recovery;
 mod run;
 mod runner;

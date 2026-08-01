@@ -85,6 +85,7 @@ impl ModelCodec for ScriptedCodec {
         &self,
         context: &[lam::ProjectedContextEntry],
         output: &OutputContract,
+        system_prompt: &str,
     ) -> Result<EncodedPayload, Self::Error> {
         let context = context
             .iter()
@@ -101,7 +102,11 @@ impl ModelCodec for ScriptedCodec {
                 json!({ "kind": "structured", "schema": schema })
             }
         };
-        Ok(native(json!({ "context": context, "output": output })))
+        Ok(native(json!({
+            "context": context,
+            "output": output,
+            "systemPrompt": system_prompt,
+        })))
     }
 
     fn interpret_response(&self, response: &EncodedPayload) -> Result<ModelDirective, Self::Error> {

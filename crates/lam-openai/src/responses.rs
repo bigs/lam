@@ -7,7 +7,7 @@ use lam::{
 use serde_json::{Map, Value, json};
 
 use crate::common::{
-    BuiltConfig, CODEC_VERSION, OutputKind, RESPONSES_REQUEST_CODEC_ID,
+    BuiltConfig, CODEC_VERSION, EVAL_TOOL_DESCRIPTION, OutputKind, RESPONSES_REQUEST_CODEC_ID,
     RESPONSES_RESPONSE_CODEC_ID, SharedBuilder, eval_parameters, output_value,
     parse_eval_arguments, parse_request, parse_response, request_payload, response_payload,
 };
@@ -65,8 +65,9 @@ impl ResponsesBuilder {
 
     /// Adds provider-specific top-level request fields.
     ///
-    /// Lam overwrites protocol invariants including `model`, `input`, `store`,
-    /// `stream`, `tools`, and `parallel_tool_calls`.
+    /// lam overwrites protocol invariants including `model`, `input`,
+    /// `instructions`, `store`, `stream`, `tools`, and
+    /// `parallel_tool_calls`.
     #[must_use]
     pub fn extra_body(mut self, extra_body: Value) -> Self {
         self.shared = self.shared.extra_body(extra_body);
@@ -232,12 +233,20 @@ impl ModelCodec for ResponsesCodec {
         &self,
         context: &[ProjectedContextEntry],
         output: &OutputContract,
+        system_prompt: &str,
     ) -> Result<EncodedPayload, Self::Error> {
         let input = encode_context(context)?;
         let mut body = self.extra_body.clone();
         let include = include_encrypted_reasoning(body.remove("include"))?;
         body.insert("model".to_owned(), Value::String(self.model.clone()));
         body.insert("input".to_owned(), Value::Array(input));
+        body.remove("instructions");
+        if !system_prompt.is_empty() {
+            body.insert(
+                "instructions".to_owned(),
+                Value::String(system_prompt.to_owned()),
+            );
+        }
         body.insert("store".to_owned(), Value::Bool(false));
         body.insert("stream".to_owned(), Value::Bool(true));
         body.insert("parallel_tool_calls".to_owned(), Value::Bool(false));
@@ -399,7 +408,7 @@ fn eval_tool() -> Value {
     json!({
         "type": "function",
         "name": "eval",
-        "description": "Evaluate one TypeScript program in Lam's persistent isolate. Put sequential work in one program and use Promise.all for independent work.",
+        "description": EVAL_TOOL_DESCRIPTION,
         "parameters": eval_parameters(),
         "strict": true
     })

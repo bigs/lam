@@ -144,11 +144,13 @@ pub trait ModelCodec: Send + Sync + 'static {
     /// Codec-specific interpretation failure.
     type Error: Error + Send + Sync + 'static;
 
-    /// Encodes model-visible context and the requested output shape.
+    /// Encodes model-visible context, the requested output shape, and runtime
+    /// instructions which are deliberately not part of durable context.
     fn encode_request(
         &self,
         context: &[ProjectedContextEntry],
         output: &OutputContract,
+        system_prompt: &str,
     ) -> Result<EncodedPayload, Self::Error>;
 
     /// Interprets one untouched completed provider response.

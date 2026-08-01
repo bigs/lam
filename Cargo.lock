@@ -1275,6 +1275,7 @@ dependencies = [
  "futures-util",
  "lam",
  "reqwest",
+ "schemars",
  "serde",
  "serde_json",
  "tempfile",

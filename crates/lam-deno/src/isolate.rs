@@ -41,10 +41,10 @@ pub enum EvalValue {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EvalOutput {
-    /// Last expression, with returned Promises automatically awaited.
-    pub value: EvalValue,
+    /// Final expression, with returned Promises automatically awaited.
+    pub result: EvalValue,
     /// Console calls made while this cell ran.
-    pub console: Vec<ConsoleEntry>,
+    pub logs: Vec<ConsoleEntry>,
 }
 
 /// Per-cell evaluation overrides.
@@ -67,6 +67,7 @@ pub struct IsolateBuilder {
     namespaces: Vec<Namespace>,
     default_timeout: Duration,
     max_timeout: Duration,
+    capture_console: bool,
 }
 
 impl Default for IsolateBuilder {
@@ -75,6 +76,7 @@ impl Default for IsolateBuilder {
             namespaces: Vec::new(),
             default_timeout: DEFAULT_TIMEOUT,
             max_timeout: DEFAULT_MAX_TIMEOUT,
+            capture_console: true,
         }
     }
 }
@@ -101,6 +103,16 @@ impl IsolateBuilder {
         self
     }
 
+    /// Enables or disables collection of `console` calls in eval outputs.
+    ///
+    /// The JavaScript `console` global remains available when capture is
+    /// disabled; calls are simply discarded.
+    #[must_use]
+    pub const fn capture_console(mut self, capture: bool) -> Self {
+        self.capture_console = capture;
+        self
+    }
+
     /// Validates the registry and starts the first isolate generation.
     pub async fn build(self) -> Result<Isolate, IsolateBuildError> {
         if self.default_timeout.is_zero() || self.max_timeout.is_zero() {
@@ -109,7 +121,7 @@ impl IsolateBuilder {
 
         let registry = Arc::new(Registry::build(self.namespaces)?);
         let thread_permit = ThreadPermit::acquire()?;
-        let console = ConsoleBuffer::default();
+        let console = ConsoleBuffer::new(self.capture_console);
         let generation = 1;
         let mut kernel = Kernel::new(Arc::clone(&registry), console.clone(), generation).await?;
         let interrupt = IsolateInterrupt::new(kernel.isolate_handle());
@@ -234,6 +246,16 @@ impl Isolate {
         self.interrupt.clone()
     }
 
+    /// Returns a compact model-facing synopsis of the installed APIs.
+    ///
+    /// The synopsis is derived from the same manifest used by `lam.dir()`
+    /// inside the isolate. Full documentation and schemas remain available
+    /// through that builtin.
+    #[must_use]
+    pub fn api_inventory(&self) -> String {
+        self.registry.prompt_inventory()
+    }
+
     /// Evaluates a TypeScript cell with the host's default timeout.
     pub async fn eval(&mut self, source: &str) -> Result<EvalOutput, EvalError> {
         self.eval_with(source, EvalOptions::default()).await
@@ -282,9 +304,9 @@ impl Isolate {
 
         let result = result
             .ok_or_else(|| EvalError::internal("watchdog ended evaluation without firing"))?;
-        result.map(|value| EvalOutput {
-            value,
-            console: self.console.take(),
+        result.map(|result| EvalOutput {
+            result,
+            logs: self.console.take(),
         })
     }
 

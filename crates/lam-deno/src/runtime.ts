@@ -42,7 +42,7 @@ interface LamOps {
     functionName: string,
     input: JsonValue,
   ): Promise<BuiltinCallResult>;
-  op_lam_console(level: ConsoleLevel, message: string): void;
+  op_lam_console(level: ConsoleLevel, args: JsonValue[]): void;
   op_lam_manifest(query: DirQuery | null): NamespaceDescriptor[];
 }
 
@@ -137,25 +137,20 @@ function invoke(
   );
 }
 
-function formatConsoleArg(value: unknown): string {
-  if (typeof value === "string") {
-    return value;
+function normalizeConsoleArg(value: unknown): JsonValue {
+  const normalized = normalize(value);
+  if (normalized.kind === "json") {
+    return normalized.value;
   }
-
   try {
-    const encoded = JSON.stringify(value);
-    return encoded === undefined ? String(value) : encoded;
+    return String(value);
   } catch {
-    try {
-      return String(value);
-    } catch {
-      return "<unprintable>";
-    }
+    return "<unprintable>";
   }
 }
 
 function captureConsole(level: ConsoleLevel, args: unknown[]): void {
-  writeConsole(level, args.map(formatConsoleArg).join(" "));
+  writeConsole(level, args.map(normalizeConsoleArg));
 }
 
 const console = Object.freeze({
@@ -207,7 +202,10 @@ function namespaceObject(path: string): NamespaceObject {
 for (const namespace of descriptors) {
   const target = namespaceObject(namespace.path);
   for (const fn of namespace.functions) {
-    if (namespace.path === "lam" && fn.name === "dir") {
+    if (
+      namespace.path === "lam" &&
+      (fn.name === "dir" || fn.name === "result")
+    ) {
       continue;
     }
 
@@ -225,6 +223,12 @@ Object.defineProperty(lam, "dir", {
   configurable: false,
   enumerable: true,
   value: (query?: DirQuery) => manifest(query ?? null),
+  writable: false,
+});
+Object.defineProperty(lam, "result", {
+  configurable: false,
+  enumerable: true,
+  value: <T extends JsonValue>(value: T): T => value,
   writable: false,
 });
 

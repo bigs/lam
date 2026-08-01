@@ -7,9 +7,9 @@ use lam::{
 use serde_json::{Map, Value, json};
 
 use crate::common::{
-    BuiltConfig, CHAT_REQUEST_CODEC_ID, CHAT_RESPONSE_CODEC_ID, CODEC_VERSION, OutputKind,
-    SharedBuilder, eval_parameters, output_value, parse_eval_arguments, parse_request,
-    parse_response, request_payload, response_payload,
+    BuiltConfig, CHAT_REQUEST_CODEC_ID, CHAT_RESPONSE_CODEC_ID, CODEC_VERSION,
+    EVAL_TOOL_DESCRIPTION, OutputKind, SharedBuilder, eval_parameters, output_value,
+    parse_eval_arguments, parse_request, parse_response, request_payload, response_payload,
 };
 use crate::context::{
     LAM_CODEC_VERSION, LAM_EVAL_CODEC_ID, LAM_MESSAGES_CODEC_ID, NativeRole, eval_output, is_codec,
@@ -276,6 +276,7 @@ impl ModelCodec for ChatCompletionsCodec {
         &self,
         context: &[ProjectedContextEntry],
         output: &OutputContract,
+        system_prompt: &str,
     ) -> Result<EncodedPayload, Self::Error> {
         let mut messages = encode_context(context)?;
         let mut body = self.extra_body.clone();
@@ -298,17 +299,14 @@ impl ModelCodec for ChatCompletionsCodec {
         body.insert("parallel_tool_calls".to_owned(), Value::Bool(false));
         body.insert("tools".to_owned(), Value::Array(vec![eval_tool()]));
         body.insert("tool_choice".to_owned(), Value::String("auto".to_owned()));
+        let mut system_sections = Vec::new();
+        if !system_prompt.is_empty() {
+            system_sections.push(system_prompt.to_owned());
+        }
         if let OutputContract::Structured { schema } = output {
-            messages.insert(
-                0,
-                json!({
-                    "role": "system",
-                    "content": format!(
-                        "Return only JSON matching this schema: <lam_output_schema>{}</lam_output_schema>",
-                        schema
-                    )
-                }),
-            );
+            system_sections.push(format!(
+                "Return only JSON matching this schema: <lam_output_schema>{schema}</lam_output_schema>"
+            ));
             body.insert(
                 "response_format".to_owned(),
                 json!({
@@ -318,6 +316,15 @@ impl ModelCodec for ChatCompletionsCodec {
                         "schema": schema,
                         "strict": true
                     }
+                }),
+            );
+        }
+        if !system_sections.is_empty() {
+            messages.insert(
+                0,
+                json!({
+                    "role": "system",
+                    "content": system_sections.join("\n\n")
                 }),
             );
         }
@@ -444,7 +451,7 @@ fn eval_tool() -> Value {
         "type": "function",
         "function": {
             "name": "eval",
-            "description": "Evaluate one TypeScript program in Lam's persistent isolate. Put sequential work in one program and use Promise.all for independent work.",
+            "description": EVAL_TOOL_DESCRIPTION,
             "parameters": eval_parameters(),
             "strict": true
         }

@@ -6,6 +6,7 @@ use std::sync::Arc;
 use deno_core::{Extension, ExtensionFileSource, OpState, op2};
 use deno_error::JsErrorBox;
 use serde::Serialize;
+use serde_json::Value;
 
 use crate::builtin::{CallResult, DirQuery, NamespaceDescriptor, OperationContext, Registry};
 use crate::transpile;
@@ -32,24 +33,37 @@ pub enum ConsoleLevel {
 pub struct ConsoleEntry {
     /// Console method used by the program.
     pub level: ConsoleLevel,
-    /// Safely formatted arguments.
-    pub message: String,
+    /// JSON arguments in their original order, with textual fallbacks for
+    /// values which JSON cannot represent.
+    pub args: Vec<Value>,
 }
 
-#[derive(Clone, Default)]
-pub(crate) struct ConsoleBuffer(Rc<RefCell<Vec<ConsoleEntry>>>);
+#[derive(Clone)]
+pub(crate) struct ConsoleBuffer {
+    capture: bool,
+    entries: Rc<RefCell<Vec<ConsoleEntry>>>,
+}
 
 impl ConsoleBuffer {
+    pub(crate) fn new(capture: bool) -> Self {
+        Self {
+            capture,
+            entries: Rc::new(RefCell::new(Vec::new())),
+        }
+    }
+
     pub(crate) fn clear(&self) {
-        self.0.borrow_mut().clear();
+        self.entries.borrow_mut().clear();
     }
 
     pub(crate) fn take(&self) -> Vec<ConsoleEntry> {
-        std::mem::take(&mut *self.0.borrow_mut())
+        std::mem::take(&mut *self.entries.borrow_mut())
     }
 
     fn push(&self, entry: ConsoleEntry) {
-        self.0.borrow_mut().push(entry);
+        if self.capture {
+            self.entries.borrow_mut().push(entry);
+        }
     }
 }
 
@@ -92,11 +106,11 @@ fn op_lam_manifest(
     state.borrow::<Arc<Registry>>().manifest(query.as_ref())
 }
 
-#[op2(fast)]
+#[op2]
 fn op_lam_console(
     state: &mut OpState,
     #[string] level: String,
-    #[string] message: String,
+    #[serde] args: Vec<Value>,
 ) -> Result<(), JsErrorBox> {
     let level = match level.as_str() {
         "debug" => ConsoleLevel::Debug,
@@ -108,7 +122,7 @@ fn op_lam_console(
     };
     state
         .borrow::<ConsoleBuffer>()
-        .push(ConsoleEntry { level, message });
+        .push(ConsoleEntry { level, args });
     Ok(())
 }
 

@@ -121,7 +121,10 @@ contract was established for this design.
 **Settled and implemented.** `eval` accepts TypeScript, not merely JavaScript.
 Each cell is parsed and transpiled with `deno_ast`, then evaluated as a
 persistent REPL cell. Type-only syntax is erased, top-level `await` works, and
-the final expression is returned after awaiting it when it is a Promise.
+the final expression is returned after awaiting it when it is a Promise. The
+synchronous `lam.result(value)` identity helper makes that final value explicit
+without introducing hidden result state or early-return semantics; bare final
+expressions remain valid.
 
 The initial kernel is intentionally module-less: static imports, exports, and
 dynamic `import()` are rejected during transpilation. Cells receive a stable
@@ -162,17 +165,27 @@ domain-specific capabilities without modifying Lam.
 
 ### Discoverability
 
-**Settled.** `lam.dir()` exposes the available namespace tree. Its output
+**Settled and implemented.** `lam.dir()` exposes the available namespace tree. Its output
 includes function names, documentation, input schemas, output schemas, error
 schemas, and capability availability.
 
-The system prompt also contains a compact inventory of core modules that were
-instantiated for the actor. The model therefore does not need to begin every
-session with `lam.dir()`. It can use `lam.dir()` to inspect unfamiliar or
-dynamically registered namespaces in detail.
+The default system prompt contains a compact inventory of every function
+instantiated for the actor. Each line is derived from the same immutable
+manifest and includes the callable path, a TypeScript-like input/output shape,
+and the first paragraph of its Rust-authored documentation. The synopsis is a
+deliberately lossy orientation aid; `lam.dir()` remains authoritative for full
+documentation and exact input, output, and error schemas. The model therefore
+does not need to begin every session with discovery.
 
 The inventory must reflect the actor's actual capabilities. Disabled or
 unauthorized modules must not be advertised as usable.
+
+System instructions are runtime configuration rather than durable context.
+The builder can append application instructions to the generated default with
+`annotate_system_prompt`, or replace the default and inventory completely with
+`system_prompt`. Annotations survive replacement and retain registration order,
+making those operations order-independent. Provider codecs encode the one
+logical prompt through their native instruction surface.
 
 ### Initial standard-library direction
 
@@ -921,11 +934,12 @@ can be disabled by the builder.
 The abstraction must be provider-neutral at the control-flow level while
 remaining provider-lossless at the data level.
 
-The codec is pure: it encodes current context plus an output contract into one
-native request payload, then interprets the completed native response as either
-one eval request or an output candidate. The provider performs the external
-request and returns the untouched completed native payload. Only that payload
-is durable; the interpreted directive is a recomputable view.
+The codec is pure: it encodes current context, runtime system instructions, and
+an output contract into one native request payload, then interprets the
+completed native response as either one eval request or an output candidate.
+The provider performs the external request and returns the untouched completed
+native payload. Only that payload is durable; the system instructions are
+configuration and the interpreted directive is a recomputable view.
 
 A model response may request exactly one eval. Sequential and parallel work
 belong inside that single TypeScript program, including `Promise.all` when
@@ -1073,9 +1087,12 @@ The eval contract is:
 - cells execute serially and successful cells share lexical and global state;
 - top-level `await` works, and a final Promise is awaited even when the source
   did not spell `await`;
-- a successful result is either `EvalValue::Undefined` or JSON;
-- `console.debug`, `log`, `info`, `warn`, and `error` become structured entries
-  on `EvalOutput`;
+- `EvalOutput.result` is either `EvalValue::Undefined` or JSON;
+- `console.debug`, `log`, `info`, `warn`, and `error` become ordered entries in
+  `EvalOutput.logs`; JSON-compatible arguments retain their structure and
+  position, while unsupported values receive a textual fallback;
+- console capture is enabled by default and can be disabled with
+  `IsolateBuilder::capture_console` without removing the JavaScript global;
 - non-JSON values and cycles produce `ResultNotSerializable`;
 - JavaScript exceptions retain their native CDP details;
 - typed builtin rejections are catchable as structured values in TypeScript and
@@ -1084,8 +1101,9 @@ The eval contract is:
 Namespace functions take one typed input and return
 `Future<Output = Result<O, E>>`. Serde performs the actual boundary conversion,
 while `schemars` derives discoverable input, output, and error schemas from the
-same Rust types. The kernel's only built-in namespace function is synchronous
-`lam.dir`; embedding applications register everything else explicitly.
+same Rust types. The kernel's only built-in namespace functions are synchronous
+`lam.dir` and `lam.result`; embedding applications register everything else
+explicitly.
 
 The runtime bootstrap is kernel-owned TypeScript and is the only checked-in
 source for that layer. It is an embedded Deno extension ESM entry point,
@@ -1093,12 +1111,12 @@ transpiled through `RuntimeOptions::extension_transpiler` with the already
 pinned `deno_ast` dependency. Extension state installs the Rust registry,
 console buffer, and isolate generation before the ESM runs. The bootstrap calls
 `op_lam_manifest` once to materialize every configured namespace, routes
-ordinary functions through `op_lam_call`, implements `lam.dir()` against the
-same manifest op, captures console output, and then removes the ambient `Deno`
-bootstrap object. There is no manual `execute_script` injection, extension-
-specific TypeScript shim, npm toolchain, build script, bundle, or generated
-runtime file. A bare isolate has no filesystem, network, process, URL/fetch,
-npm, or third-party framework runtime.
+ordinary functions through `op_lam_call`, implements synchronous `lam.dir()`
+and `lam.result()` facades, captures console output, and then removes the
+ambient `Deno` bootstrap object. There is no manual `execute_script` injection,
+extension-specific TypeScript shim, npm toolchain, build script, bundle, or
+generated runtime file. A bare isolate has no filesystem, network, process,
+URL/fetch, npm, or third-party framework runtime.
 
 Each eval has a host timeout bounded by the builder's maximum. When it fires,
 Lam interrupts V8, considers that isolate poisoned, drops it and pending Rust
@@ -1298,6 +1316,66 @@ OpenAI Responses with `gpt-5-mini` (resolved to
 including cached-input detail where applicable, and the configured price view
 produced bounded USD estimates. These tests validate current provider behavior;
 secrets and network-dependent tests remain outside the default suite.
+
+### Slice 5B: model instructions and manifest synopsis
+
+**Implemented.**
+
+The actor supplies one concise, provider-neutral system prompt on every model
+request. Its default is deliberately minimal:
+
+```text
+You are a coding agent with one tool, `eval`, which runs TypeScript in a persistent Deno isolate. Use registered APIs for host interaction and `lam.dir()` for their complete documentation and schemas.
+
+Available APIs:
+{manifest-derived synopsis}
+```
+
+There are no examples or generic tool-loop exhortations. The `eval` declaration
+itself explains top-level await, persistent top-level state, final-expression
+results, registered APIs, sequencing in one program, and `Promise.all` for
+independent work.
+
+The API synopsis is generated after isolate construction from precisely the
+installed registry. Ordinary functions are shown as
+`path(input: Shape): Promise<Output>` followed by the first documentation
+paragraph. `lam.dir()` has its synchronous optional-query signature. Full
+schemas, typed errors, and remaining documentation stay available through
+`lam.dir()` rather than bloating every request. The synopsis also advertises
+`lam.result<T extends JsonValue>(value: T): T`, so models can make their final
+eval value explicit without an example in the system prompt.
+
+`LamBuilder::annotate_system_prompt` appends embedding-specific instructions to
+the generated default. `LamBuilder::system_prompt` replaces the default and API
+inventory completely; annotations remain ordered regardless of when the
+replacement is configured. The logical prompt is not appended to durable actor
+context. The Responses codec sends it as top-level `instructions`; Chat
+Completions prepends one `system` message, combining the prompt with any
+structured-output instruction when necessary. Provider-specific `extra_body`
+cannot override these runtime-owned fields.
+
+### Slice 5C: explicit eval results and structured console capture
+
+**Implemented.**
+
+The persistent TypeScript runtime exposes `lam.result(value)` as a synchronous
+identity function. It is manifest-described, appears in the generated API
+synopsis, and is intended as the final expression of an eval. It neither stores
+mutable state nor changes control flow, and existing bare final expressions
+continue to work.
+
+Successful `EvalOutput` values have two distinct surfaces: `result` contains
+the final JSON value (or `undefined`), while `logs` contains `console.debug`,
+`log`, `info`, `warn`, and `error` calls in emission order. Each log retains its
+level and ordered argument array. JSON-compatible arguments cross structurally;
+arguments which JSON cannot represent degrade individually to safe text rather
+than flattening the whole call.
+
+Console capture defaults on. `IsolateBuilder::capture_console` and
+`LamBuilder::capture_console` can disable collection for an embedding, while
+the familiar JavaScript `console` global remains callable and its entries are
+discarded. The eval tool description briefly identifies `lam.result`; the
+manifest remains the authoritative documentation surface.
 
 ### Slice 6: compaction strategies
 

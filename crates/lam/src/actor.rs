@@ -12,6 +12,7 @@ use serde::Serialize;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::command::RunnerCommand;
+use crate::prompt::SystemPrompt;
 use crate::recovery::recover_actor;
 use crate::runner::ActorRunner;
 use crate::runtime_journal::{admit_message, load_state};
@@ -81,7 +82,9 @@ impl Lam {
             namespaces: Vec::new(),
             default_timeout: None,
             max_timeout: None,
+            capture_console: true,
             clock: Arc::new(SystemClock),
+            system_prompt: SystemPrompt::default(),
         }
     }
 }
@@ -93,7 +96,9 @@ pub struct LamBuilder<P, C, S> {
     namespaces: Vec<Namespace>,
     default_timeout: Option<Duration>,
     max_timeout: Option<Duration>,
+    capture_console: bool,
     clock: Arc<dyn Clock>,
+    system_prompt: SystemPrompt,
 }
 
 impl<P, C, S> LamBuilder<P, C, S> {
@@ -106,7 +111,9 @@ impl<P, C, S> LamBuilder<P, C, S> {
             namespaces: self.namespaces,
             default_timeout: self.default_timeout,
             max_timeout: self.max_timeout,
+            capture_console: self.capture_console,
             clock: self.clock,
+            system_prompt: self.system_prompt,
         }
     }
 
@@ -114,6 +121,23 @@ impl<P, C, S> LamBuilder<P, C, S> {
     #[must_use]
     pub fn namespace(mut self, namespace: Namespace) -> Self {
         self.namespaces.push(namespace);
+        self
+    }
+
+    /// Replaces the complete model system prompt.
+    ///
+    /// This removes the default prompt and generated API inventory. Later or
+    /// earlier annotations are still appended in registration order.
+    #[must_use]
+    pub fn system_prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.system_prompt.replace(prompt);
+        self
+    }
+
+    /// Appends instructions to the default or replacement system prompt.
+    #[must_use]
+    pub fn annotate_system_prompt(mut self, instructions: impl Into<String>) -> Self {
+        self.system_prompt.annotate(instructions);
         self
     }
 
@@ -128,6 +152,16 @@ impl<P, C, S> LamBuilder<P, C, S> {
     #[must_use]
     pub const fn max_eval_timeout(mut self, timeout: Duration) -> Self {
         self.max_timeout = Some(timeout);
+        self
+    }
+
+    /// Enables or disables collection of JavaScript `console` calls.
+    ///
+    /// Capture is enabled by default. Disabling it leaves `console` available
+    /// to evaluated programs but omits its calls from model-visible outcomes.
+    #[must_use]
+    pub const fn capture_console(mut self, capture: bool) -> Self {
+        self.capture_console = capture;
         self
     }
 
@@ -147,7 +181,9 @@ impl<P, C, S> LamBuilder<P, C, S> {
             namespaces: self.namespaces,
             default_timeout: self.default_timeout,
             max_timeout: self.max_timeout,
+            capture_console: self.capture_console,
             clock: self.clock,
+            system_prompt: self.system_prompt,
         }
     }
 }
@@ -159,7 +195,9 @@ pub struct LamRuntime<P, C, S> {
     namespaces: Vec<Namespace>,
     default_timeout: Option<Duration>,
     max_timeout: Option<Duration>,
+    capture_console: bool,
     clock: Arc<dyn Clock>,
+    system_prompt: SystemPrompt,
 }
 
 impl<P, C, S> LamRuntime<P, C, S> {
@@ -173,7 +211,9 @@ impl<P, C, S> LamRuntime<P, C, S> {
             namespaces: self.namespaces,
             default_timeout: self.default_timeout,
             max_timeout: self.max_timeout,
+            capture_console: self.capture_console,
             clock: self.clock,
+            system_prompt: self.system_prompt,
         }
     }
 }
@@ -186,7 +226,9 @@ pub struct ActorBuilder<P, C, S> {
     namespaces: Vec<Namespace>,
     default_timeout: Option<Duration>,
     max_timeout: Option<Duration>,
+    capture_console: bool,
     clock: Arc<dyn Clock>,
+    system_prompt: SystemPrompt,
 }
 
 impl<P, C, S> ActorBuilder<P, C, S>
@@ -241,6 +283,7 @@ where
                     if let Some(timeout) = self.max_timeout {
                         isolate_builder = isolate_builder.max_timeout(timeout);
                     }
+                    isolate_builder = isolate_builder.capture_console(self.capture_console);
                     let isolate = match isolate_builder.build().await {
                         Ok(isolate) => isolate,
                         Err(error) => {
@@ -248,6 +291,7 @@ where
                             return;
                         }
                     };
+                    let system_prompt = self.system_prompt.render(&isolate.api_inventory());
                     let interrupt = isolate.interrupt_handle();
                     let recovery = match recover_actor(
                         &runner_actor_id,
@@ -275,6 +319,7 @@ where
                         clock: runner_clock,
                         ids: runner_ids,
                         isolate,
+                        system_prompt,
                         commands: receiver,
                         abort: abort_receiver,
                         shutdown: runner_shutdown,

@@ -9,6 +9,7 @@ mod builtin;
 mod error;
 mod inspector;
 mod isolate;
+mod prompt;
 mod transpile;
 
 pub use builtin::{Namespace, Never, OperationContext};

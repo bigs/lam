@@ -98,7 +98,7 @@ fn application_namespace() -> Namespace {
     )
     .function(
         "echo",
-        "Returns its input and the invoking isolate generation.",
+        "Returns its input and the invoking isolate generation.\n\nThis second paragraph remains available through lam.dir.",
         |context, input: EchoInput| async move {
             Ok::<_, Never>(EchoOutput {
                 text: input.text,
@@ -133,7 +133,7 @@ async fn persistent_typescript_repl_contract() {
         .await
         .expect("ambient host APIs should be hidden");
     assert_eq!(
-        json_result(hidden.value),
+        json_result(hidden.result),
         json!(["undefined", "undefined", "undefined"])
     );
 
@@ -141,26 +141,37 @@ async fn persistent_typescript_repl_contract() {
         .eval("let base: number = 40;")
         .await
         .expect("typed declaration should transpile");
-    assert_eq!(declaration.value, EvalValue::Undefined);
+    assert_eq!(declaration.result, EvalValue::Undefined);
 
     let result = isolate
         .eval("await Promise.resolve(base + 2)")
         .await
         .expect("state and top-level await should work");
-    assert_eq!(json_result(result.value), json!(42));
+    assert_eq!(json_result(result.result), json!(42));
 
     let console = isolate
-        .eval(r#"console.info("answer", { value: base + 2 }); base"#)
+        .eval(r#"console.info("answer", { value: base + 2 }, undefined, 1n); base"#)
         .await
         .expect("console output should be captured");
-    assert_eq!(json_result(console.value), json!(40));
+    assert_eq!(json_result(console.result), json!(40));
     assert_eq!(
-        console.console,
+        console.logs,
         vec![ConsoleEntry {
             level: ConsoleLevel::Info,
-            message: r#"answer {"value":42}"#.to_owned(),
+            args: vec![
+                json!("answer"),
+                json!({ "value": 42 }),
+                json!("undefined"),
+                json!("1"),
+            ],
         }]
     );
+
+    let explicit = isolate
+        .eval("lam.result({ answer: base + 2 })")
+        .await
+        .expect("lam.result should make the final value explicit");
+    assert_eq!(json_result(explicit.result), json!({ "answer": 42 }));
 
     let non_json = isolate
         .eval("1n")
@@ -195,7 +206,7 @@ async fn promise_native_builtins_are_typed_and_discoverable() {
         .eval("lam.dir({ path: 'lam.math' })")
         .await
         .expect("lam.dir should be synchronous and serializable");
-    let discovered = json_result(discovered.value);
+    let discovered = json_result(discovered.result);
     assert_eq!(discovered[0]["path"], json!("lam.math"));
     assert_eq!(discovered[0]["functions"][0]["name"], json!("add"));
     assert!(discovered[0]["functions"][0]["inputSchema"]["properties"]["left"].is_object());
@@ -205,15 +216,22 @@ async fn promise_native_builtins_are_typed_and_discoverable() {
         .eval("lam.dir({ path: 'lam.dir' })")
         .await
         .expect("the discovery function should describe itself");
-    let kernel_contract = json_result(kernel_contract.value).to_string();
+    let kernel_contract = json_result(kernel_contract.result).to_string();
     assert!(kernel_contract.contains(r#""inputSchema""#));
     assert!(!kernel_contract.contains(r#""input_schema""#));
+
+    let result_contract = isolate
+        .eval("lam.dir({ path: 'lam.result' })")
+        .await
+        .expect("the explicit result helper should describe itself");
+    let result_contract = json_result(result_contract.result);
+    assert_eq!(result_contract[0]["functions"][0]["name"], "result");
 
     let promise = isolate
         .eval("lam.math.add({ left: 20, right: 22 }) instanceof Promise")
         .await
         .expect("Rust builtins should expose ordinary JavaScript Promises");
-    assert_eq!(json_result(promise.value), json!(true));
+    assert_eq!(json_result(promise.result), json!(true));
 
     let sum = isolate
         .eval(
@@ -225,7 +243,7 @@ async fn promise_native_builtins_are_typed_and_discoverable() {
         .await
         .expect("ordinary Promise composition should work");
     assert_eq!(
-        json_result(sum.value),
+        json_result(sum.result),
         json!([{ "sum": 42 }, { "quotient": 42 }])
     );
 
@@ -242,7 +260,7 @@ async fn promise_native_builtins_are_typed_and_discoverable() {
         .await
         .expect("typed builtin rejections should be catchable as their raw value");
     assert_eq!(
-        json_result(caught.value),
+        json_result(caught.result),
         json!({
             "caught": {
                 "type": "divisionByZero",
@@ -286,7 +304,7 @@ async fn rust_registration_materializes_nested_namespaces_from_the_manifest() {
         .await
         .expect("a Rust-only registration should become callable TypeScript");
     assert_eq!(
-        json_result(result.value),
+        json_result(result.result),
         json!({
             "text": "hello",
             "isolateGeneration": 1,
@@ -297,7 +315,7 @@ async fn rust_registration_materializes_nested_namespaces_from_the_manifest() {
         .eval("lam.dir({ path: 'acme.catalog.text.echo' })")
         .await
         .expect("lam.dir should project the same Rust manifest");
-    let discovered = json_result(discovered.value);
+    let discovered = json_result(discovered.result);
     assert_eq!(discovered[0]["path"], json!("acme.catalog.text"));
     assert_eq!(discovered[0]["functions"][0]["name"], json!("echo"));
     assert!(
@@ -313,7 +331,30 @@ async fn rust_registration_materializes_nested_namespaces_from_the_manifest() {
         )
         .await
         .expect("JavaScript mutations must not alter the Rust manifest");
-    assert_eq!(json_result(authoritative.value), json!("acme.catalog.text"));
+    assert_eq!(
+        json_result(authoritative.result),
+        json!("acme.catalog.text")
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn model_api_inventory_is_a_compact_view_of_the_manifest() {
+    let isolate = test_isolate().await;
+    let inventory = isolate.api_inventory();
+
+    assert!(inventory.contains(
+        "- `lam.dir(query?: { path?: string }): NamespaceDescriptor[]` — Discover installed namespaces, functions, and inferred schemas."
+    ));
+    assert!(inventory.contains(
+        "- `lam.result<T extends JsonValue>(value: T): T` — Returns a JSON-serializable value unchanged, making the eval's final result explicit. Use it as the last expression."
+    ));
+    assert!(inventory.contains(
+        "- `lam.math.add(input: { left: number; right: number }): Promise<{ sum: number }>` — Adds two numbers across an asynchronous Rust op boundary."
+    ));
+    assert!(inventory.contains(
+        "- `acme.catalog.text.echo(input: { text: string }): Promise<{ text: string; isolateGeneration: number }>` — Returns its input and the invoking isolate generation."
+    ), "unexpected inventory:\n{inventory}");
+    assert!(!inventory.contains("This second paragraph"));
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -332,7 +373,7 @@ async fn isolates_do_not_share_javascript_state() {
         .await
         .expect("second isolate should remain independent");
 
-    assert_eq!(json_result(value.value), json!("undefined"));
+    assert_eq!(json_result(value.result), json!("undefined"));
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -372,13 +413,30 @@ async fn timeout_discards_and_replaces_the_isolate() {
         .eval("typeof survivor")
         .await
         .expect("fresh generation should be ready before timeout is returned");
-    assert_eq!(json_result(state.value), json!("undefined"));
+    assert_eq!(json_result(state.result), json!("undefined"));
 
     let builtin = isolate
         .eval("lam.math.add({ left: 40, right: 2 })")
         .await
         .expect("registered capabilities should be restored");
-    assert_eq!(json_result(builtin.value), json!({ "sum": 42 }));
+    assert_eq!(json_result(builtin.result), json!({ "sum": 42 }));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn console_capture_can_be_disabled_without_removing_console() {
+    let mut isolate = Isolate::builder()
+        .capture_console(false)
+        .build()
+        .await
+        .expect("test isolate should initialize");
+
+    let output = isolate
+        .eval("console.log('discarded', { value: 42 }); lam.result(typeof console.log)")
+        .await
+        .expect("console should remain callable when capture is disabled");
+
+    assert_eq!(json_result(output.result), json!("function"));
+    assert!(output.logs.is_empty());
 }
 
 #[tokio::test(flavor = "current_thread")]

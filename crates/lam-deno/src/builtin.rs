@@ -46,13 +46,13 @@ pub(crate) struct DirQuery {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct FunctionDescriptor {
     /// Function name relative to its namespace.
-    name: String,
+    pub(crate) name: String,
     /// Human-readable documentation.
-    docs: String,
+    pub(crate) docs: String,
     /// JSON Schema inferred from the Rust input type.
-    input_schema: Value,
+    pub(crate) input_schema: Value,
     /// JSON Schema inferred from the Rust success type.
-    output_schema: Value,
+    pub(crate) output_schema: Value,
     /// JSON Schema inferred from the Rust typed-error type.
     error_schema: Value,
 }
@@ -62,11 +62,11 @@ pub(crate) struct FunctionDescriptor {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct NamespaceDescriptor {
     /// Fully-qualified JavaScript path, such as `lam.math` or `acme.search`.
-    path: String,
+    pub(crate) path: String,
     /// Human-readable namespace documentation.
     docs: String,
     /// Functions registered directly beneath this namespace.
-    functions: Vec<FunctionDescriptor>,
+    pub(crate) functions: Vec<FunctionDescriptor>,
 }
 
 /// A typed namespace which can be installed into an isolate.
@@ -221,7 +221,7 @@ impl Registry {
         let mut descriptors = vec![lam_namespace_descriptor()];
         let mut functions = BTreeMap::new();
         let mut namespace_paths = BTreeSet::from(["lam".to_owned()]);
-        let mut function_paths = BTreeSet::from(["lam.dir".to_owned()]);
+        let mut function_paths = BTreeSet::from(["lam.dir".to_owned(), "lam.result".to_owned()]);
 
         for namespace in namespaces {
             validate_path("namespace", &namespace.path)?;
@@ -298,6 +298,10 @@ impl Registry {
             .collect()
     }
 
+    pub(crate) fn prompt_inventory(&self) -> String {
+        crate::prompt::render_inventory(&self.namespaces)
+    }
+
     pub(crate) async fn call(
         &self,
         namespace: String,
@@ -320,13 +324,24 @@ fn lam_namespace_descriptor() -> NamespaceDescriptor {
     NamespaceDescriptor {
         path: "lam".to_owned(),
         docs: "Lam kernel utilities.".to_owned(),
-        functions: vec![FunctionDescriptor {
-            name: "dir".to_owned(),
-            docs: "Discover installed namespaces, functions, and inferred schemas.".to_owned(),
-            input_schema: schema_value::<Option<DirQuery>>(),
-            output_schema: schema_value::<Vec<NamespaceDescriptor>>(),
-            error_schema: schema_value::<Never>(),
-        }],
+        functions: vec![
+            FunctionDescriptor {
+                name: "dir".to_owned(),
+                docs: "Discover installed namespaces, functions, and inferred schemas."
+                    .to_owned(),
+                input_schema: schema_value::<Option<DirQuery>>(),
+                output_schema: schema_value::<Vec<NamespaceDescriptor>>(),
+                error_schema: schema_value::<Never>(),
+            },
+            FunctionDescriptor {
+                name: "result".to_owned(),
+                docs: "Returns a JSON-serializable value unchanged, making the eval's final result explicit. Use it as the last expression."
+                    .to_owned(),
+                input_schema: schema_value::<Value>(),
+                output_schema: schema_value::<Value>(),
+                error_schema: schema_value::<Never>(),
+            },
+        ],
     }
 }
 

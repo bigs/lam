@@ -19,7 +19,10 @@ adapter crates. They provide:
 - ordinary JavaScript `Promise` values for asynchronous Rust builtins;
 - typed Rust namespace registration with inferred JSON Schemas;
 - synchronous capability discovery through `lam.dir()`;
-- JSON-only results and structured console capture;
+- a compact manifest-derived default system prompt, with builder methods to
+  replace it or append application instructions;
+- JSON-only final results, including the explicit `lam.result(value)` helper;
+- ordered, structured `console` capture which can be disabled by the builder;
 - host-bounded timeouts that discard and replace a poisoned isolate;
 - no ambient filesystem, process, network, or `Deno` authority;
 - one append-only, actor-local journal containing admitted messages and
@@ -49,6 +52,13 @@ not maintain TypeScript shims. The bootstrap is transpiled by the same pinned
 `deno_ast` used for eval cells, so Lam has no npm install, JavaScript bundling
 step, checked-in generated runtime, or dependency on Effect.
 
+The actor renders its model instructions from the same builtin manifest. The
+default names every installed function with its inferred input/output shape and
+the first paragraph of its Rust-authored documentation; `lam.dir()` retains the
+complete schemas and documentation. Embeddings can append focused instructions
+with `annotate_system_prompt` or replace the generated prompt entirely with
+`system_prompt`.
+
 ```rust,ignore
 use lam::{Isolate, Namespace, Never};
 
@@ -59,7 +69,9 @@ let math = Namespace::new("acme.math", "Application arithmetic.").function(
 );
 
 let mut isolate = Isolate::builder().namespace(math).build().await?;
-let output = isolate.eval("await acme.math.double(21)").await?;
+let output = isolate
+    .eval("lam.result(await acme.math.double(21))")
+    .await?;
 ```
 
 OpenAI Responses is stateless by construction: Lam always sends `store: false`,
@@ -75,6 +87,7 @@ let model = Responses::builder("gpt-5-mini")
     .pricing(ModelPricing::new(0.25, 2.0).cached_input(0.025))
     .build()?;
 let mut actor = Lam::builder(model)
+    .annotate_system_prompt("Work only inside the configured project root.")
     .build()
     .actor("main")
     .build()

@@ -120,6 +120,80 @@ async fn model_eval_builtin_result_and_terminal_output_form_one_run() {
     ));
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn default_system_prompt_describes_the_installed_manifest() {
+    let provider = ScriptedProvider::new([output("done")]);
+    let math = Namespace::new("acme.math", "Fixture arithmetic.").function(
+        "double",
+        "Doubles one integer.\n\nLonger documentation stays discoverable.",
+        |_context, input: i64| async move { Ok::<_, Never>(input * 2) },
+    );
+    let mut actor = build_actor(provider.clone(), [math]).await;
+
+    actor.call("hello").await.expect("scripted call completes");
+    let requests = provider.requests();
+    let prompt = requests[0].value["systemPrompt"]
+        .as_str()
+        .expect("scripted codec records the system prompt");
+    assert!(prompt.starts_with("You are a coding agent with one tool, `eval`"));
+    assert!(prompt.contains("`lam.dir(query?: { path?: string })"));
+    assert!(prompt.contains("`lam.result<T extends JsonValue>(value: T): T`"));
+    assert!(
+        prompt
+            .contains("`acme.math.double(input: number): Promise<number>` — Doubles one integer.")
+    );
+    assert!(!prompt.contains("Longer documentation"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn actor_builder_can_discard_console_logs_without_changing_eval_results() {
+    let provider = ScriptedProvider::new([
+        eval("console.log('discarded', { value: 42 }); lam.result(42)"),
+        output("done"),
+    ]);
+    let mut actor = Lam::builder(Model::new(provider.clone(), ScriptedCodec))
+        .capture_console(false)
+        .build()
+        .actor("main")
+        .build()
+        .await
+        .expect("fixture actor should build");
+
+    actor
+        .call("compute")
+        .await
+        .expect("scripted call completes");
+
+    let requests = provider.requests();
+    let eval = &requests[1].value["context"][2]["payload"]["value"];
+    assert_eq!(
+        eval["output"]["result"],
+        json!({ "kind": "json", "value": 42 })
+    );
+    assert_eq!(eval["output"]["logs"], json!([]));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn custom_system_prompt_replaces_the_default_before_annotations() {
+    let provider = ScriptedProvider::new([output("done")]);
+    let mut actor = Lam::builder(Model::new(provider.clone(), ScriptedCodec))
+        .annotate_system_prompt("first annotation")
+        .system_prompt("custom instructions")
+        .annotate_system_prompt("second annotation")
+        .build()
+        .actor("main")
+        .build()
+        .await
+        .expect("fixture actor should build");
+
+    actor.call("hello").await.expect("scripted call completes");
+    let requests = provider.requests();
+    assert_eq!(
+        requests[0].value["systemPrompt"],
+        "custom instructions\n\nfirst annotation\n\nsecond annotation"
+    );
+}
+
 #[derive(Debug, Deserialize, JsonSchema, PartialEq)]
 struct Review {
     score: u32,

@@ -26,6 +26,7 @@ pub(crate) struct ActorRunner<P, C, S> {
     pub(crate) clock: Arc<dyn Clock>,
     pub(crate) ids: Arc<RuntimeIds>,
     pub(crate) isolate: Isolate,
+    pub(crate) system_prompt: String,
     pub(crate) commands: mpsc::UnboundedReceiver<RunnerCommand>,
     pub(crate) abort: watch::Receiver<bool>,
     pub(crate) shutdown: Arc<AtomicBool>,
@@ -152,7 +153,7 @@ where
         loop {
             let request = self
                 .codec
-                .encode_request(state.context(), &output)
+                .encode_request(state.context(), &output, &self.system_prompt)
                 .map_err(|error| ActorError::Codec {
                     message: error.to_string(),
                 })?;

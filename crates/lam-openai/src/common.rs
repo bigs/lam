@@ -9,6 +9,8 @@ use crate::error::{BuildError, CodecError, ProviderError};
 use crate::metadata::ModelPricing;
 use crate::transport::HttpTransport;
 
+pub(crate) const EVAL_TOOL_DESCRIPTION: &str = "Run one TypeScript program with top-level await in a persistent Deno isolate. Top-level state persists across calls. Return a value with the final expression; `lam.result(value)` makes it explicit. Use registered lam APIs for host interaction. Put dependent work in one program and use `Promise.all` for independent work.";
+
 pub(crate) const RESPONSES_REQUEST_CODEC_ID: &str = "openai/responses-request";
 pub(crate) const RESPONSES_RESPONSE_CODEC_ID: &str = "openai/responses";
 pub(crate) const CHAT_REQUEST_CODEC_ID: &str = "openai/chat-completions-request";
@@ -248,7 +250,7 @@ pub(crate) fn eval_parameters() -> Value {
         "properties": {
             "source": {
                 "type": "string",
-                "description": "A TypeScript program to evaluate in the persistent Lam isolate."
+                "description": "A TypeScript program to evaluate in the persistent Deno isolate. Top-level await is supported."
             },
             "timeoutMs": {
                 "type": ["integer", "null"],

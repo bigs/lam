@@ -29,6 +29,7 @@ fn responses_request_is_stateless_and_replays_encrypted_reasoning_unchanged() {
         .extra_body(json!({
             "store": true,
             "parallel_tool_calls": true,
+            "instructions": "ignored",
             "include": ["message.output_text.logprobs"],
             "reasoning": { "effort": "high" }
         }))
@@ -78,13 +79,14 @@ fn responses_request_is_stateless_and_replays_encrypted_reasoning_unchanged() {
         ),
     ];
     let request = codec
-        .encode_request(&context, &OutputContract::Text)
+        .encode_request(&context, &OutputContract::Text, "runtime instructions")
         .expect("context can be replayed");
     assert_eq!(request.codec.id.as_str(), RESPONSES_REQUEST_CODEC_ID);
     let body = &request.value["body"];
     assert_eq!(body["store"], false);
     assert_eq!(body["stream"], true);
     assert_eq!(body["parallel_tool_calls"], false);
+    assert_eq!(body["instructions"], "runtime instructions");
     assert_eq!(body["reasoning"]["effort"], "high");
     assert!(
         body["include"]
@@ -116,6 +118,7 @@ fn responses_structured_output_uses_json_schema_and_decodes_json() {
             &OutputContract::Structured {
                 schema: schema.clone(),
             },
+            "runtime instructions",
         )
         .expect("valid request");
     assert_eq!(request.value["body"]["text"]["format"]["schema"], schema);
@@ -215,6 +218,7 @@ fn chat_replays_reasoning_extensions_and_tool_calls_from_native_chunks() {
                 ),
             ],
             &OutputContract::Text,
+            "",
         )
         .expect("context can be replayed");
     assert_eq!(request.codec.id.as_str(), CHAT_REQUEST_CODEC_ID);
@@ -249,6 +253,7 @@ fn chat_structured_output_uses_json_schema_and_decodes_json() {
             &OutputContract::Structured {
                 schema: schema.clone(),
             },
+            "runtime instructions",
         )
         .expect("valid request");
     assert_eq!(
@@ -257,6 +262,12 @@ fn chat_structured_output_uses_json_schema_and_decodes_json() {
     );
     assert!(request.value["body"].get("stream_options").is_none());
     assert_eq!(request.value["body"]["messages"][0]["role"], "system");
+    assert!(
+        request.value["body"]["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("runtime instructions\n\n")
+    );
     assert!(
         request.value["body"]["messages"][0]["content"]
             .as_str()
@@ -320,6 +331,7 @@ fn resumption_notice_closes_pending_eval_in_both_native_protocols() {
                 projected(2, recovery_transition(), notice.clone()),
             ],
             &OutputContract::Text,
+            "",
         )
         .expect("notice closes Responses call");
     assert_eq!(
@@ -367,6 +379,7 @@ fn resumption_notice_closes_pending_eval_in_both_native_protocols() {
                 projected(2, recovery_transition(), notice),
             ],
             &OutputContract::Text,
+            "",
         )
         .expect("notice closes Chat call");
     assert_eq!(request.value["body"]["messages"][1]["role"], "tool");
@@ -416,7 +429,11 @@ async fn responses_provider_sends_store_false_and_returns_completed_native_respo
         .build_parts()
         .expect("valid adapter");
     let request = codec
-        .encode_request(&[user_message("hello")], &OutputContract::Text)
+        .encode_request(
+            &[user_message("hello")],
+            &OutputContract::Text,
+            "runtime instructions",
+        )
         .expect("valid request");
     let deltas = Arc::new(Mutex::new(Vec::new()));
     let captured_deltas = Arc::clone(&deltas);
@@ -430,6 +447,7 @@ async fn responses_provider_sends_store_false_and_returns_completed_native_respo
     let captured = server.finish();
     assert_eq!(captured.path, "/v1/responses");
     assert_eq!(captured.body["store"], false);
+    assert_eq!(captured.body["instructions"], "runtime instructions");
     assert_eq!(captured.body["include"][0], "reasoning.encrypted_content");
     assert_eq!(response.value["response"], completed);
     let metadata = codec.response_metadata(&response);
@@ -483,7 +501,11 @@ async fn chat_provider_preserves_every_chunk_and_streams_reasoning() {
         .build_parts()
         .expect("valid adapter");
     let request = codec
-        .encode_request(&[user_message("hello")], &OutputContract::Text)
+        .encode_request(
+            &[user_message("hello")],
+            &OutputContract::Text,
+            "runtime instructions",
+        )
         .expect("valid request");
     let deltas = Arc::new(Mutex::new(Vec::new()));
     let captured_deltas = Arc::clone(&deltas);
@@ -497,6 +519,11 @@ async fn chat_provider_preserves_every_chunk_and_streams_reasoning() {
     let captured = server.finish();
     assert_eq!(captured.path, "/inference/v1/chat/completions");
     assert_eq!(captured.body["stream"], true);
+    assert_eq!(captured.body["messages"][0]["role"], "system");
+    assert_eq!(
+        captured.body["messages"][0]["content"],
+        "runtime instructions"
+    );
     assert_eq!(captured.body["stream_options"]["include_usage"], true);
     assert_eq!(response.value["chunks"], json!([first, second]));
     let metadata = codec.response_metadata(&response);
@@ -613,11 +640,29 @@ async fn responses_adapter_drives_a_complete_lam_eval_loop() {
 
     let requests = server.finish_all();
     assert_eq!(requests.len(), 2);
+    assert!(
+        requests[0].body["instructions"]
+            .as_str()
+            .unwrap()
+            .starts_with("You are a coding agent with one tool, `eval`")
+    );
     let replay = requests[1].body["input"].as_array().unwrap();
     assert_eq!(replay[1]["encrypted_content"], "opaque-reasoning");
     assert_eq!(replay[2]["call_id"], "call_eval");
     assert_eq!(replay[3]["type"], "function_call_output");
     assert_eq!(replay[3]["call_id"], "call_eval");
+    let eval_output: Value = serde_json::from_str(replay[3]["output"].as_str().unwrap())
+        .expect("Responses eval output should be JSON");
+    assert_eq!(
+        eval_output,
+        json!({
+            "status": "success",
+            "output": {
+                "result": { "kind": "json", "value": 42 },
+                "logs": [],
+            },
+        })
+    );
 }
 
 #[tokio::test]
@@ -688,10 +733,28 @@ async fn chat_adapter_drives_a_complete_lam_eval_loop() {
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[1].body["reasoning_history"], "preserved");
     let messages = requests[1].body["messages"].as_array().unwrap();
-    assert_eq!(messages[1]["reasoning_content"], "I should calculate this.");
-    assert_eq!(messages[1]["tool_calls"][0]["id"], "call_eval");
-    assert_eq!(messages[2]["role"], "tool");
-    assert_eq!(messages[2]["tool_call_id"], "call_eval");
+    assert!(
+        messages[0]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("You are a coding agent with one tool, `eval`")
+    );
+    assert_eq!(messages[2]["reasoning_content"], "I should calculate this.");
+    assert_eq!(messages[2]["tool_calls"][0]["id"], "call_eval");
+    assert_eq!(messages[3]["role"], "tool");
+    assert_eq!(messages[3]["tool_call_id"], "call_eval");
+    let eval_output: Value = serde_json::from_str(messages[3]["content"].as_str().unwrap())
+        .expect("Chat Completions eval output should be JSON");
+    assert_eq!(
+        eval_output,
+        json!({
+            "status": "success",
+            "output": {
+                "result": { "kind": "json", "value": 42 },
+                "logs": [],
+            },
+        })
+    );
 }
 
 fn user_message(text: &str) -> ProjectedContextEntry {
