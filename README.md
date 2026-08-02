@@ -25,6 +25,9 @@ adapter crates. They provide:
 - ordered, structured `console` capture which can be disabled by the builder;
 - host-bounded timeouts that discard and replace a poisoned isolate;
 - no ambient filesystem, process, network, or `Deno` authority;
+- an optional `lam-code` capability pack with numbered filesystem reads,
+  direct-child listing, validated patch/write operations, and an explicitly
+  injected command runner with bounded, spillable output;
 - one append-only, actor-local journal containing model selection, admitted
   messages, and model-visible context;
 - a pluggable typed `JournalStore` contract and pure-Rust `MemStore`;
@@ -84,6 +87,24 @@ let math = Namespace::new("acme.math", "Application arithmetic.").function(
 let mut isolate = Isolate::builder().namespace(math).build().await?;
 let output = isolate
     .eval("lam.result(await acme.math.double(21))")
+    .await?;
+```
+
+Coding authority remains an explicit add-on. The supplied local command runner
+uses the embedding process's host authority; applications can omit it or inject
+a sandboxed runner through the same interface:
+
+```rust,ignore
+use lam::Isolate;
+use lam_code::{CodingPack, FilesystemAccess, LocalCommandRunner};
+
+let coding = CodingPack::builder(".")
+    .filesystem_access(FilesystemAccess::ReadWrite)
+    .shell(LocalCommandRunner::default())
+    .build()?;
+let mut isolate = Isolate::builder().namespaces(&coding).build().await?;
+let output = isolate
+    .eval("await lam.fs.read({ path: 'Cargo.toml' })")
     .await?;
 ```
 
@@ -220,6 +241,7 @@ follow-up work.
 
 - `lam`: public facade and single-actor model runner
 - `lam-agents`: bounded multi-actor scheduler and subagent capability pack
+- `lam-code`: optional filesystem, editing, and command-runner capability pack
 - `lam-core`: actor journal, mailbox, context, and storage contracts
 - `lam-deno`: embedded Deno isolate and typed builtin bridge
 - `lam-openai`: Responses and compatible Chat Completions providers/codecs

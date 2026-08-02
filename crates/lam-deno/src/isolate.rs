@@ -89,6 +89,13 @@ impl IsolateBuilder {
         self
     }
 
+    /// Registers several typed namespaces in the isolate.
+    #[must_use]
+    pub fn namespaces(mut self, namespaces: impl IntoIterator<Item = Namespace>) -> Self {
+        self.namespaces.extend(namespaces);
+        self
+    }
+
     /// Sets the timeout used by cells without an explicit override.
     #[must_use]
     pub const fn default_timeout(mut self, timeout: Duration) -> Self {

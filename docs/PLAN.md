@@ -1101,6 +1101,7 @@ The workspace currently contains:
 └── crates/
     ├── lam/
     ├── lam-agents/
+    ├── lam-code/
     ├── lam-core/
     ├── lam-deno/
     ├── lam-openai/
@@ -1128,6 +1129,12 @@ public `lam` facade, hosts `ActorTask`s on local worker executors, owns resident
 actor handles, and generates the manifest-driven `lam.agents` namespace from an
 explicit `SubagentConfig`. `lam` does not depend on it.
 
+### `lam-code`
+
+The optional coding capability pack. It depends on the public `lam` facade and
+materializes typed `lam.fs`, `lam.edit`, and optionally `lam.shell` namespaces
+from explicit host configuration. The core `lam` crate does not depend on it.
+
 ### `lam-deno`
 
 The embedded TypeScript runtime: isolate lifecycle, transpilation, eval,
@@ -1151,9 +1158,9 @@ facade so its builders can return a ready-to-use `Model`.
 
 ### Later crates
 
-Additional provider families, standard-library capability packs, and the TUI
-may become separate crates when their boundaries are demonstrated. We will not
-create empty crates for speculative boundaries.
+Additional provider families, richer capability packs, and the TUI may become
+separate crates when their boundaries are demonstrated. We will not create
+empty crates for speculative boundaries.
 
 ### TUI package and executable naming
 
@@ -1586,8 +1593,41 @@ so a parent suspends without blocking a sibling isolate on the same worker.
 
 ### Slice 8: coding-agent capability pack
 
-Build the initial filesystem/edit/shell namespaces with explicit policies and
-prompt inventory. Approval mechanisms live at these capability boundaries.
+**Implemented.** The optional `lam-code` crate adds explicit coding authority
+rather than ambient authority to `lam`. Its manifest-generated surface is
+deliberately small:
+
+- `lam.fs.read` returns numbered, paginated text chunks; `lam.fs.list` returns
+  sorted, paginated direct children;
+- `lam.edit.apply` accepts the model-oriented `*** Begin Patch` file grammar,
+  validates every path and hunk before its first mutation, and
+  `lam.edit.write` creates or completely rewrites UTF-8 text files;
+- `lam.shell.run` delegates to an injected `CommandRunner`. The supplied local
+  runner accepts a shell string, optional working directory and bounded
+  timeout, kills its process tree on timeout or cancellation, and returns exit
+  status plus independently captured stdout and stderr;
+- bounded shell output keeps its tail in the eval result and spills complete
+  raw streams to pack-owned temporary files. `lam.fs.read` is the one
+  pagination mechanism for UTF-8 spills; paths are intentionally ephemeral and
+  live only as long as the capability pack.
+
+`CodingPack` owns filesystem access, read/list/output limits, scratch storage,
+and the optional runner. Filesystem access can be disabled, read-only, or
+read-write; shell is absent unless explicitly supplied. These are API-level
+guardrails, not process containment: the local runner has the host process's
+authority. Established external sandboxes can implement the same runner
+boundary later.
+
+Interactive approval is deferred until the TUI supplies a real consumer and
+the builtin operation context carries actor/run identity. Shell execution and
+parsed file mutations remain centralized interception points for that work.
+
+End-to-end isolate tests cover namespace gating, manifest-generated calls,
+numbered pagination, lexical directory cursors, multi-file patch actions and
+prevalidation, complete writes, symlink escape rejection, nonzero exits,
+independent output capture and spill reads, process-tree timeout, and
+cancellation cleanup. All provider and actor crates remain unaware of the
+optional pack.
 
 ### Follow-up: TUI
 

@@ -223,6 +223,13 @@ impl<S> LamBuilder<S> {
         self
     }
 
+    /// Registers several Rust-backed TypeScript namespaces.
+    #[must_use]
+    pub fn namespaces(mut self, namespaces: impl IntoIterator<Item = Namespace>) -> Self {
+        self.namespaces.extend(namespaces);
+        self
+    }
+
     /// Replaces the complete model system prompt.
     ///
     /// This removes the default prompt and generated API inventory. Later or
@@ -390,6 +397,13 @@ where
     #[must_use]
     pub fn namespace(mut self, namespace: Namespace) -> Self {
         self.namespaces.push(namespace);
+        self
+    }
+
+    /// Registers several Rust-backed TypeScript namespaces.
+    #[must_use]
+    pub fn namespaces(mut self, namespaces: impl IntoIterator<Item = Namespace>) -> Self {
+        self.namespaces.extend(namespaces);
         self
     }
 

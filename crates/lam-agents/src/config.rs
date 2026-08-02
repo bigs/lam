@@ -217,6 +217,13 @@ where
         self
     }
 
+    /// Adds several namespaces to the maximum child capability set.
+    #[must_use]
+    pub fn namespaces(mut self, namespaces: impl IntoIterator<Item = Namespace>) -> Self {
+        self.namespaces.extend(namespaces);
+        self
+    }
+
     /// Appends host-required instructions to every child prompt.
     #[must_use]
     pub fn required_instructions(mut self, instructions: impl Into<String>) -> Self {

@@ -1,0 +1,22 @@
+[package]
+name = "lam-code"
+version.workspace = true
+edition.workspace = true
+description = "Optional filesystem, editing, and shell capabilities for lam"
+
+[dependencies]
+lam = { path = "../lam" }
+schemars.workspace = true
+serde.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["fs", "process"] }
+
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true
