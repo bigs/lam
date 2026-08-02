@@ -316,6 +316,7 @@ where
             });
         if let Some(run_id) = run_id {
             emit(
+                &self.run_events,
                 events,
                 RunEvent::CompactionStarted {
                     run_id: run_id.clone(),
@@ -343,6 +344,7 @@ where
             });
         if let Some(run_id) = run_id {
             emit(
+                &self.run_events,
                 events,
                 RunEvent::CompactionCompleted {
                     run_id: run_id.clone(),
@@ -370,6 +372,7 @@ where
             });
         if let Some(run_id) = run_id {
             emit(
+                &self.run_events,
                 events,
                 RunEvent::CompactionFailed {
                     run_id: run_id.clone(),

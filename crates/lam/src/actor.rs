@@ -19,9 +19,10 @@ use crate::compaction::{CompactionReceipt, SummaryTailCompactor};
 use crate::model::RegisteredModel;
 use crate::prompt::SystemPrompt;
 use crate::recovery::recover_actor;
+use crate::run::RUN_EVENT_BUFFER;
 use crate::runner::ActorRunner;
 use crate::runtime_journal::{admit_message, ensure_model_selection, load_state};
-use crate::{ActorBuildError, ActorError, ActorTask, Model, Run, RuntimeEvents};
+use crate::{ActorBuildError, ActorError, ActorTask, Model, Run, RunEvents, RuntimeEvents};
 
 const RUNTIME_EVENT_BUFFER: usize = 256;
 const ACTOR_EXISTENCE_PROBE: NonZeroUsize = NonZeroUsize::new(1).expect("one is nonzero");
@@ -559,6 +560,7 @@ where
         let call_active = Arc::new(AtomicBool::new(false));
         let shutdown = Arc::new(AtomicBool::new(false));
         let (commands, receiver) = mpsc::unbounded_channel();
+        let (run_event_sender, run_event_receiver) = mpsc::channel(RUN_EVENT_BUFFER);
         let (runtime_event_sender, runtime_event_receiver) = mpsc::channel(RUNTIME_EVENT_BUFFER);
         let (abort, abort_receiver) = watch::channel(false);
         let (stopped_sender, stopped) = oneshot::channel();
@@ -641,6 +643,7 @@ where
             commands: receiver,
             abort: abort_receiver,
             shutdown: Arc::clone(&shutdown),
+            run_events: run_event_sender,
             runtime_events: runtime_event_sender,
         };
         let actor_ref = ActorRef {
@@ -657,6 +660,7 @@ where
             thread: None,
             stopped: Some(stopped),
             abort_handle: AbortHandle { interrupt, abort },
+            run_events: Some(RunEvents::new(run_event_receiver)),
             runtime_events: Some(RuntimeEvents::new(runtime_event_receiver)),
         };
         let task = ActorTask::new(async move {
@@ -684,6 +688,7 @@ where
     thread: Option<JoinHandle<()>>,
     stopped: Option<oneshot::Receiver<()>>,
     abort_handle: AbortHandle,
+    run_events: Option<RunEvents>,
     runtime_events: Option<RuntimeEvents>,
 }
 
@@ -701,6 +706,14 @@ where
     #[must_use]
     pub fn abort_handle(&self) -> AbortHandle {
         self.abort_handle.clone()
+    }
+
+    /// Takes the single-consumer stream covering every run on this actor.
+    ///
+    /// Unlike the event stream attached to a correlated [`Run`], this stream
+    /// also includes work started by ordinary mailbox wakes.
+    pub fn take_run_events(&mut self) -> Option<RunEvents> {
+        self.run_events.take()
     }
 
     /// Takes the single-consumer actor-wide runtime event stream.
@@ -785,6 +798,31 @@ where
         let message = self
             .actor_ref
             .user_message(message_id.clone(), input, DeliveryMode::Steer);
+        Run::new(
+            self.actor_ref.commands.clone(),
+            Arc::clone(&self.call_active),
+            message_id,
+            message,
+        )
+    }
+
+    /// Starts a linear text call with authenticated actor provenance.
+    ///
+    /// Multi-actor runtimes use this correlated counterpart to
+    /// [`ActorRef::send_from_actor`] when the sender must await an outcome.
+    pub fn call_from_actor<T>(&mut self, sender: &ActorRef<S>, input: T) -> Run<'_, String>
+    where
+        T: Serialize,
+    {
+        let message_id = self.actor_ref.ids.message_id();
+        let message = self.actor_ref.message(
+            message_id.clone(),
+            MessageSource::Actor {
+                actor_id: sender.actor_id.clone(),
+            },
+            input,
+            DeliveryMode::Steer,
+        );
         Run::new(
             self.actor_ref.commands.clone(),
             Arc::clone(&self.call_active),

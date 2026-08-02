@@ -60,6 +60,10 @@ pub struct SpawnReceipt {
     pub namespaces: Vec<String>,
     /// Child depth relative to the actor which owns this subagent policy.
     pub depth: usize,
+    /// Stable identity of the admitted initial task.
+    pub message_id: String,
+    /// Child-local journal revision containing the task admission.
+    pub revision: u64,
 }
 
 /// Structured failure returned to TypeScript by `lam.agents.spawn`.
@@ -178,6 +182,51 @@ pub enum ListError {
     Unavailable,
 }
 
+/// Input accepted by `lam.agents.stop`.
+#[derive(Clone, Debug, JsonSchema, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StopRequest {
+    /// Direct child whose complete descendant subtree should be retired.
+    pub address: ActorAddress,
+}
+
+/// Confirmation that a direct child subtree is no longer resident.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StopReceipt {
+    /// Direct child requested by the caller.
+    pub address: ActorAddress,
+}
+
+/// Structured failure returned to TypeScript by `lam.agents.stop`.
+#[derive(Clone, Debug, JsonSchema, Serialize, thiserror::Error)]
+#[serde(tag = "code", rename_all = "camelCase")]
+pub enum StopError {
+    /// Actors may stop only their own direct children.
+    #[error("actor `{requester}` cannot stop non-child `{address}`")]
+    NotDirectChild {
+        /// Actor requesting the stop.
+        requester: ActorAddress,
+        /// Rejected target.
+        address: ActorAddress,
+    },
+    /// The addressed child is no longer resident.
+    #[error("actor `{address}` is unavailable")]
+    AddressUnavailable {
+        /// Unknown or stopped child.
+        address: ActorAddress,
+    },
+    /// The owning agent system is no longer available.
+    #[error("the agent system is unavailable")]
+    Unavailable,
+    /// The child subtree could not be fully retired.
+    #[error("the child could not be stopped: {message}")]
+    StopFailed {
+        /// Host diagnostic.
+        message: String,
+    },
+}
+
 pub(crate) fn agents_namespace<S>(
     system: Weak<SystemInner<S>>,
     address: ActorAddress,
@@ -195,7 +244,13 @@ where
     let namespace_docs = config.namespaces().collect::<Vec<_>>().join(", ");
     let docs = format!("Create and communicate with addressed actors. Current actor: {address}.");
     let spawn_docs = format!(
-        "Create a direct child at {address}/<name> and return after its task is durably queued. Child addresses are create-only and cannot be reused once durable. Omit model for `{}`; allowed models: [{}]. Omit namespaces for the complete configured set; allowed namespaces: [{}]. Kernel lam.dir and lam.result are always present.",
+        "Create a persistent direct child at {address}/<name> and return after its task is durably queued. Its eventual AgentOutcome is delivered as a steering actor message. Child addresses are create-only and cannot be reused once durable. Omit model for `{}`; allowed models: [{}]. Omit namespaces for the complete configured set; allowed namespaces: [{}]. Kernel lam.dir and lam.result are always present.",
+        config.default_model(),
+        model_docs,
+        namespace_docs,
+    );
+    let call_docs = format!(
+        "Create a persistent direct child at {address}/<name>, wait asynchronously for its initial task, and return AgentOutcome. Cancellation stops the child subtree. Omit model for `{}`; allowed models: [{}]. Omit namespaces for the complete configured set; allowed namespaces: [{}].",
         config.default_model(),
         model_docs,
         namespace_docs,
@@ -257,7 +312,39 @@ where
             }
         },
     );
+    namespace = namespace.function(
+        "stop",
+        "Stop one direct child and its descendants, cancelling active work and releasing their residency slots.",
+        {
+            let system = system.clone();
+            let address = address.clone();
+            move |_context, request: StopRequest| {
+                let system = system.clone();
+                let requester = address.clone();
+                async move {
+                    let system = system.upgrade().ok_or(StopError::Unavailable)?;
+                    let target = request.address;
+                    system.stop_child(&requester, &target).await?;
+                    Ok::<_, StopError>(StopReceipt { address: target })
+                }
+            }
+        },
+    );
     if depth < config.max_depth {
+        namespace = namespace.function("call", call_docs, {
+            let system = system.clone();
+            let address = address.clone();
+            let config = config.clone();
+            move |_context, request: SpawnRequest| {
+                let system = system.clone();
+                let address = address.clone();
+                let config = config.clone();
+                async move {
+                    let system = system.upgrade().ok_or(SpawnError::Unavailable)?;
+                    system.call_child(address, depth, config, request).await
+                }
+            }
+        });
         namespace = namespace.function("spawn", spawn_docs, {
             let system = system.clone();
             let address = address.clone();

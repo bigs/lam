@@ -34,6 +34,7 @@ pub(crate) struct ActorRunner<S> {
     pub(crate) commands: mpsc::UnboundedReceiver<RunnerCommand>,
     pub(crate) abort: watch::Receiver<bool>,
     pub(crate) shutdown: Arc<AtomicBool>,
+    pub(crate) run_events: mpsc::Sender<RunEvent>,
     pub(crate) runtime_events: mpsc::Sender<RuntimeEvent>,
 }
 
@@ -134,8 +135,8 @@ where
         }
     }
 
-    async fn handle_call(&mut self, call: CallRequest) -> bool {
-        let result = self.prepare_call(&call).await;
+    async fn handle_call(&mut self, mut call: CallRequest) -> bool {
+        let result = self.prepare_call(&mut call).await;
         let aborted = matches!(result, Err(ActorError::Aborted));
         match result {
             Ok(value) => {
@@ -146,7 +147,10 @@ where
         aborted
     }
 
-    async fn prepare_call(&mut self, call: &CallRequest) -> Result<serde_json::Value, ActorError> {
+    async fn prepare_call(
+        &mut self,
+        call: &mut CallRequest,
+    ) -> Result<serde_json::Value, ActorError> {
         loop {
             let state = load_state(self.store.as_ref(), &self.actor_id).await?;
             if !has_recoverable_work(&state) {
@@ -155,7 +159,15 @@ where
             self.drive_one(OutputContract::Text, None).await?;
         }
 
-        admit_message(self.store.as_ref(), &self.actor_id, call.message.clone()).await?;
+        let mut abort = self.abort.clone();
+        let receipt = tokio::select! {
+            biased;
+            _ = wait_for_abort(&mut abort) => return Err(ActorError::Aborted),
+            receipt = admit_message(self.store.as_ref(), &self.actor_id, call.message.clone()) => {
+                receipt?
+            }
+        };
+        call.admitted(receipt);
         self.drive_one(call.output.clone(), Some(&call.events))
             .await?
             .ok_or(ActorError::State {
@@ -180,6 +192,7 @@ where
             }
         };
         emit(
+            &self.run_events,
             events,
             RunEvent::Started {
                 run_id: run_id.clone(),
@@ -197,15 +210,18 @@ where
                     .encode_request(&context, &config)
                     .map_err(|message| ActorError::Codec { message })?;
                 emit(
+                    &self.run_events,
                     events,
                     RunEvent::ModelStarted {
                         run_id: run_id.clone(),
                     },
                 );
                 let event_sender = events.cloned();
+                let run_events = self.run_events.clone();
                 let delta_run_id = run_id.clone();
                 let sink = ModelEventSink::new(move |delta| {
                     emit(
+                        &run_events,
                         event_sender.as_ref(),
                         RunEvent::ModelDelta {
                             run_id: delta_run_id.clone(),
@@ -260,6 +276,7 @@ where
             let metadata = model.response_metadata(&response);
             trace_model_completed(&self.actor_id, &run_id, &metadata);
             emit(
+                &self.run_events,
                 events,
                 RunEvent::ModelCompleted {
                     run_id: run_id.clone(),
@@ -277,6 +294,7 @@ where
                     state =
                         append_context(self.store.as_ref(), &self.actor_id, state, entry).await?;
                     emit(
+                        &self.run_events,
                         events,
                         RunEvent::EvalStarted {
                             run_id: run_id.clone(),
@@ -305,6 +323,7 @@ where
                         Err(error) => EvalOutcome::Failure { error },
                     };
                     emit(
+                        &self.run_events,
                         events,
                         RunEvent::EvalCompleted {
                             run_id: run_id.clone(),
@@ -321,12 +340,13 @@ where
                         .await?
                     {
                         OutputAppend::Completed => {
-                            emit(events, RunEvent::Completed { run_id });
+                            emit(&self.run_events, events, RunEvent::Completed { run_id });
                             return Ok(Some(value));
                         }
                         OutputAppend::Continued(next, delivered) => {
                             state = next;
                             emit(
+                                &self.run_events,
                                 events,
                                 RunEvent::MessagesDelivered {
                                     run_id: run_id.clone(),
@@ -351,6 +371,7 @@ where
         }
         let (state, delivered) = self.append_messages(state, run_id).await?;
         emit(
+            &self.run_events,
             events,
             RunEvent::MessagesDelivered {
                 run_id: run_id.clone(),
@@ -528,7 +549,12 @@ fn codec(id: &str) -> CodecRef {
     )
 }
 
-pub(crate) fn emit(events: Option<&mpsc::Sender<RunEvent>>, event: RunEvent) {
+pub(crate) fn emit(
+    actor_events: &mpsc::Sender<RunEvent>,
+    events: Option<&mpsc::Sender<RunEvent>>,
+    event: RunEvent,
+) {
+    let _ = actor_events.try_send(event.clone());
     if let Some(events) = events {
         let _ = events.try_send(event);
     }

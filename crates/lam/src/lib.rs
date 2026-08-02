@@ -34,7 +34,7 @@ pub use notice::{
     InterruptedEvalOutcome, IsolateState, RUNTIME_COMPONENT_ID, SYSTEM_NOTICE_CODEC_ID,
     SYSTEM_NOTICE_CODEC_VERSION, SystemNotice,
 };
-pub use run::{Run, RunEvent};
+pub use run::{Run, RunEvent, RunEvents};
 pub use runtime_event::{RuntimeEvent, RuntimeEvents};
 
 pub use lam_core::{

@@ -63,6 +63,12 @@ impl ActorAddress {
     pub(crate) fn is_direct_child_of(&self, parent: &Self) -> bool {
         self.parent().as_ref() == Some(parent)
     }
+
+    pub(crate) fn is_descendant_of(&self, ancestor: &Self) -> bool {
+        self.0
+            .strip_prefix(ancestor.as_str())
+            .is_some_and(|suffix| suffix.starts_with('/'))
+    }
 }
 
 impl fmt::Display for ActorAddress {

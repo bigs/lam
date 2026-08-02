@@ -14,7 +14,10 @@ use lam::{
     ModelCodec, ModelDescriptor, ModelDirective, ModelEventSink, ModelProvider, ModelRequestConfig,
     OutputContract, Revision,
 };
-use lam_agents::{AgentSystem, AgentSystemError, SubagentConfig, SubagentConfigError};
+use lam_agents::{
+    ActorAddress, AgentOutcome, AgentSystem, AgentSystemError, AgentSystemEvent, StopReason,
+    SubagentConfig, SubagentConfigError,
+};
 use serde_json::{Value, json};
 use tokio::sync::Notify;
 
@@ -23,6 +26,17 @@ use support::RoundTripGate;
 #[derive(Clone)]
 struct RoutingProvider {
     shared: Arc<ProviderState>,
+    scenario: RoutingScenario,
+}
+
+#[derive(Clone, Copy)]
+enum RoutingScenario {
+    General,
+    ChildCall,
+    BackgroundOutcome,
+    DirectStop,
+    CancelCall,
+    UnauthorizedStop,
 }
 
 struct ProviderState {
@@ -111,6 +125,10 @@ impl JournalStore for AdmissionGateStore {
 
 impl RoutingProvider {
     fn new() -> Self {
+        Self::for_scenario(RoutingScenario::General)
+    }
+
+    fn for_scenario(scenario: RoutingScenario) -> Self {
         Self {
             shared: Arc::new(ProviderState {
                 requests: Mutex::new(Vec::new()),
@@ -119,6 +137,7 @@ impl RoutingProvider {
                 child_seen: AtomicBool::new(false),
                 child_notify: Notify::new(),
             }),
+            scenario,
         }
     }
 
@@ -170,6 +189,9 @@ impl ModelProvider for RoutingProvider {
         );
         lock(&self.shared.requests).push(request.clone());
         self.shared.request_notify.notify_waiters();
+        if let Some(response) = scenario_response(self.scenario, &request.value) {
+            return Ok(native(response));
+        }
         let rendered = request.value.to_string();
         if has_message(&request.value, "cancel spawn task", Some("user")) {
             if has_transition(&request.value, "eval") {
@@ -281,6 +303,137 @@ lam.result(child)"#
             json!({ "kind": "output", "value": "plain complete" }),
         ))
     }
+}
+
+fn scenario_response(scenario: RoutingScenario, request: &Value) -> Option<Value> {
+    match scenario {
+        RoutingScenario::General => None,
+        RoutingScenario::ChildCall => Some(child_call_response(request)),
+        RoutingScenario::BackgroundOutcome => Some(background_outcome_response(request)),
+        RoutingScenario::DirectStop => Some(direct_stop_response(request)),
+        RoutingScenario::CancelCall => Some(cancel_call_response(request)),
+        RoutingScenario::UnauthorizedStop => Some(unauthorized_stop_response(request)),
+    }
+}
+
+fn child_call_response(request: &Value) -> Value {
+    if has_message(request, "sync child task", Some("actor")) {
+        return json!({ "kind": "output", "value": "sync child complete" });
+    }
+    if transition_payload_contains(request, "eval", "sync child complete") {
+        return json!({ "kind": "output", "value": "SYNC_OK" });
+    }
+    if has_message(request, "sync call root", Some("user")) {
+        return json!({
+            "kind": "eval",
+            "source": r#"const outcome = await lam.agents.call({
+  name: "sync",
+  task: "sync child task",
+  namespaces: []
+});
+lam.result(outcome)"#
+        });
+    }
+    json!({ "kind": "output", "value": "plain complete" })
+}
+
+fn background_outcome_response(request: &Value) -> Value {
+    if has_message(request, "background child task", Some("actor")) {
+        return json!({ "kind": "output", "value": "background child complete" });
+    }
+    if has_message(request, "background child complete", Some("actor")) {
+        return json!({ "kind": "output", "value": "BACKGROUND_OK" });
+    }
+    if has_message(request, "background outcome root", Some("user")) {
+        if has_transition(request, "eval") {
+            return json!({ "kind": "output", "value": "SPAWN_RETURNED" });
+        }
+        return json!({
+            "kind": "eval",
+            "source": r#"await lam.agents.spawn({
+  name: "background",
+  task: "background child task",
+  namespaces: []
+});
+lam.result("spawned")"#
+        });
+    }
+    json!({ "kind": "output", "value": "plain complete" })
+}
+
+fn direct_stop_response(request: &Value) -> Value {
+    if has_message(request, "stop child background", Some("actor")) {
+        return json!({ "kind": "eval", "source": "await new Promise(() => {})" });
+    }
+    if has_message(request, "cancelled", Some("actor"))
+        || transition_payload_contains(request, "eval", "stopped")
+    {
+        return json!({ "kind": "output", "value": "STOP_OK" });
+    }
+    if has_message(request, "stop child root", Some("user")) {
+        if transition_payload_contains(request, "eval", "/stop-root/worker") {
+            return json!({
+                "kind": "eval",
+                "source": r#"await lam.agents.stop({ address: "/stop-root/worker" });
+            lam.result("stopped")"#
+            });
+        }
+        return json!({
+            "kind": "eval",
+            "source": r#"await lam.agents.spawn({
+  name: "worker",
+  task: "stop child background",
+  namespaces: []
+});
+lam.result("spawned")"#
+        });
+    }
+    json!({ "kind": "output", "value": "plain complete" })
+}
+
+fn cancel_call_response(request: &Value) -> Value {
+    if has_message(request, "blocking call child", Some("actor")) {
+        return json!({ "kind": "eval", "source": "await new Promise(() => {})" });
+    }
+    if has_message(request, "cancelled", Some("actor"))
+        || transition_payload_contains(request, "eval", "stopped")
+    {
+        return json!({ "kind": "output", "value": "STOP_OK" });
+    }
+    if has_message(request, "cancel child call root", Some("user")) {
+        if has_transition(request, "eval") {
+            return json!({ "kind": "output", "value": "CALL_CANCELLED" });
+        }
+        return json!({
+            "kind": "eval",
+            "source": r#"await lam.agents.call({
+  name: "cancelled-call",
+  task: "blocking call child",
+  namespaces: []
+});
+lam.result("unexpected")"#
+        });
+    }
+    json!({ "kind": "output", "value": "plain complete" })
+}
+
+fn unauthorized_stop_response(request: &Value) -> Value {
+    if has_message(request, "reject stop root", Some("user")) {
+        if transition_payload_contains(request, "eval", "notDirectChild") {
+            return json!({ "kind": "output", "value": "STOP_REJECTED" });
+        }
+        return json!({
+            "kind": "eval",
+            "source": r#"let rejected;
+try {
+  await lam.agents.stop({ address: "/someone-else" });
+} catch (error) {
+  rejected = error;
+}
+lam.result(rejected)"#
+        });
+    }
+    json!({ "kind": "output", "value": "plain complete" })
 }
 
 #[derive(Clone, Copy)]
@@ -426,6 +579,290 @@ async fn one_worker_hosts_root_and_manifest_spawned_child() {
         .await
         .expect("the system should stop every resident actor")
         .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn child_call_returns_one_outcome_without_a_parent_mailbox_copy() {
+    let provider = RoutingProvider::for_scenario(RoutingScenario::ChildCall);
+    let model = Model::new(provider, TestCodec)
+        .with_descriptor(ModelDescriptor::new("test", "model-a", "test/messages").unwrap());
+    let system = AgentSystem::builder(MemStore::new())
+        .max_agents(2)
+        .build()
+        .unwrap();
+    let mut events = system.take_events().unwrap();
+    let subagents: SubagentConfig<MemStore> = SubagentConfig::builder(model.clone())
+        .agent_namespace(false)
+        .build()
+        .unwrap();
+    let root = system
+        .host_with_subagents(
+            Lam::builder(model)
+                .state_store(system.state_store())
+                .build()
+                .actor("/call-root"),
+            subagents,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(root.call("sync call root").await.unwrap(), "SYNC_OK");
+
+    let mut saw_child_run = false;
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let mut outcome = None;
+        loop {
+            match events.next().await.unwrap() {
+                AgentSystemEvent::Run { address, .. } if address.as_str() == "/call-root/sync" => {
+                    saw_child_run = true;
+                }
+                AgentSystemEvent::Outcome { outcome: observed } => outcome = Some(observed),
+                _ => {}
+            }
+            if saw_child_run && let Some(outcome) = outcome.take() {
+                break outcome;
+            }
+        }
+    })
+    .await
+    .expect("the child outcome should be observable");
+    assert!(saw_child_run);
+    assert!(matches!(
+        outcome,
+        AgentOutcome::Completed {
+            address,
+            ref output,
+            ..
+        } if address.as_str() == "/call-root/sync" && output == "sync child complete"
+    ));
+
+    let page = system
+        .state_store()
+        .read(
+            root.actor_id(),
+            Revision::ZERO,
+            NonZeroUsize::new(128).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(!page.events.iter().any(|stored| {
+        let ActorEventData::MessageAdmitted { message } = stored.event.data() else {
+            return false;
+        };
+        matches!(
+            message.source(),
+            MessageSource::Actor { actor_id } if actor_id.as_str() == "/call-root/sync"
+        )
+    }));
+
+    system
+        .stop(&ActorAddress::new("/call-root/sync").unwrap())
+        .await
+        .unwrap();
+    system.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn background_outcome_steers_the_parent_and_system_waits_for_quiescence() {
+    let provider = RoutingProvider::for_scenario(RoutingScenario::BackgroundOutcome);
+    let model = Model::new(provider.clone(), TestCodec)
+        .with_descriptor(ModelDescriptor::new("test", "model-a", "test/messages").unwrap());
+    let system = AgentSystem::builder(MemStore::new())
+        .max_agents(2)
+        .build()
+        .unwrap();
+    let subagents: SubagentConfig<MemStore> = SubagentConfig::builder(model.clone())
+        .agent_namespace(false)
+        .build()
+        .unwrap();
+    let root = system
+        .host_with_subagents(
+            Lam::builder(model)
+                .state_store(system.state_store())
+                .build()
+                .actor("/background-root"),
+            subagents,
+        )
+        .await
+        .unwrap();
+
+    let output = root.call("background outcome root").await.unwrap();
+    assert!(output == "SPAWN_RETURNED" || output == "BACKGROUND_OK");
+    tokio::time::timeout(std::time::Duration::from_secs(2), system.wait())
+        .await
+        .expect("background work should reach quiescence")
+        .unwrap();
+    assert!(provider.requests().iter().any(|request| {
+        has_message(&request.value, "background child complete", Some("actor"))
+    }));
+
+    system.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn direct_child_stop_cancels_work_and_releases_the_subtree_capacity() {
+    let provider = RoutingProvider::for_scenario(RoutingScenario::DirectStop);
+    let model = Model::new(provider, TestCodec)
+        .with_descriptor(ModelDescriptor::new("test", "model-a", "test/messages").unwrap());
+    let system = AgentSystem::builder(MemStore::new())
+        .max_agents(2)
+        .build()
+        .unwrap();
+    let subagents: SubagentConfig<MemStore> = SubagentConfig::builder(model.clone())
+        .agent_namespace(false)
+        .build()
+        .unwrap();
+    let root = system
+        .host_with_subagents(
+            Lam::builder(model.clone())
+                .state_store(system.state_store())
+                .build()
+                .actor("/stop-root"),
+            subagents,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(root.call("stop child root").await.unwrap(), "STOP_OK");
+    let replacement = system
+        .host(
+            Lam::builder(model)
+                .state_store(system.state_store())
+                .build()
+                .actor("/replacement"),
+        )
+        .await
+        .expect("stopping the child should release its residency slot");
+    assert_eq!(replacement.address().as_str(), "/replacement");
+    system.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cancelling_child_call_retires_the_owned_subtree() {
+    let provider = RoutingProvider::for_scenario(RoutingScenario::CancelCall);
+    let model = Model::new(provider, TestCodec)
+        .with_descriptor(ModelDescriptor::new("test", "model-a", "test/messages").unwrap());
+    let system = AgentSystem::builder(MemStore::new())
+        .max_agents(2)
+        .build()
+        .unwrap();
+    let mut events = system.take_events().unwrap();
+    let subagents: SubagentConfig<MemStore> = SubagentConfig::builder(model.clone())
+        .agent_namespace(false)
+        .build()
+        .unwrap();
+    let root = system
+        .host_with_subagents(
+            Lam::builder(model.clone())
+                .state_store(system.state_store())
+                .default_eval_timeout(std::time::Duration::from_millis(50))
+                .build()
+                .actor("/cancel-call-root"),
+            subagents,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        root.call("cancel child call root").await.unwrap(),
+        "CALL_CANCELLED"
+    );
+    let reason = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if let AgentSystemEvent::Retired { address, reason } = events.next().await.unwrap()
+                && address.as_str() == "/cancel-call-root/cancelled-call"
+            {
+                break reason;
+            }
+        }
+    })
+    .await
+    .expect("call cancellation should retire its child");
+    assert_eq!(reason, StopReason::Cancelled);
+    tokio::time::timeout(std::time::Duration::from_secs(2), system.wait())
+        .await
+        .unwrap()
+        .unwrap();
+
+    let replacement = system
+        .host(
+            Lam::builder(model)
+                .state_store(system.state_store())
+                .build()
+                .actor("/replacement"),
+        )
+        .await
+        .expect("cancelled call should release child capacity");
+    assert_eq!(replacement.address().as_str(), "/replacement");
+    system.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn ordinary_mailbox_wakes_are_visible_and_wait_reaches_quiescence() {
+    let provider = RoutingProvider::new();
+    let model = Model::new(provider, TestCodec)
+        .with_descriptor(ModelDescriptor::new("test", "model-a", "test/messages").unwrap());
+    let system = AgentSystem::builder(MemStore::new()).build().unwrap();
+    let mut events = system.take_events().unwrap();
+    let root = system
+        .host(
+            Lam::builder(model)
+                .state_store(system.state_store())
+                .build()
+                .actor("/wake-root"),
+        )
+        .await
+        .unwrap();
+
+    root.send("ordinary wake", lam::DeliveryMode::Steer)
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), system.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if matches!(
+                events.next().await,
+                Some(AgentSystemEvent::Run { address, .. })
+                    if address.as_str() == "/wake-root"
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("ordinary wakes should emit addressed run progress");
+    system.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn agents_cannot_stop_actors_outside_their_direct_children() {
+    let provider = RoutingProvider::for_scenario(RoutingScenario::UnauthorizedStop);
+    let model = Model::new(provider, TestCodec)
+        .with_descriptor(ModelDescriptor::new("test", "model-a", "test/messages").unwrap());
+    let system = AgentSystem::builder(MemStore::new()).build().unwrap();
+    let subagents: SubagentConfig<MemStore> = SubagentConfig::builder(model.clone())
+        .agent_namespace(false)
+        .build()
+        .unwrap();
+    let root = system
+        .host_with_subagents(
+            Lam::builder(model)
+                .state_store(system.state_store())
+                .build()
+                .actor("/stop-policy-root"),
+            subagents,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        root.call("reject stop root").await.unwrap(),
+        "STOP_REJECTED"
+    );
+    system.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -631,15 +1068,25 @@ async fn cancelled_spawn_retires_the_child_before_releasing_capacity() {
     };
     assert_eq!(output, "spawn cancelled");
 
-    let replacement = system
-        .host(
-            Lam::builder(model)
-                .state_store(system.state_store())
-                .build()
-                .actor("/replacement"),
-        )
-        .await
-        .expect("cancelled child must release its resident capacity");
+    let replacement = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            match system
+                .host(
+                    Lam::builder(model.clone())
+                        .state_store(system.state_store())
+                        .build()
+                        .actor("/replacement"),
+                )
+                .await
+            {
+                Ok(actor) => break actor,
+                Err(AgentSystemError::Capacity { .. }) => tokio::task::yield_now().await,
+                Err(error) => panic!("replacement actor failed: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("cancelled child must release capacity after its runner exits");
     assert_eq!(replacement.address().as_str(), "/replacement");
     system.shutdown().await.unwrap();
 }

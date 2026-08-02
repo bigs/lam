@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use lam_core::{MessageEnvelope, ModelId, OutputContract};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::{ActorError, RunEvent};
+use crate::{ActorError, MessageReceipt, RunEvent};
 use crate::{CompactionReceipt, ModelSwitchPolicy, ModelSwitchReceipt};
 
 pub(crate) enum RunnerCommand {
@@ -23,6 +23,7 @@ pub(crate) struct CallRequest {
     pub(crate) message: MessageEnvelope,
     pub(crate) output: OutputContract,
     pub(crate) events: mpsc::Sender<RunEvent>,
+    admission: Option<oneshot::Sender<Result<MessageReceipt, ActorError>>>,
     pub(crate) completion: oneshot::Sender<Result<serde_json::Value, ActorError>>,
     _lease: CallLease,
 }
@@ -32,6 +33,7 @@ impl CallRequest {
         message: MessageEnvelope,
         output: OutputContract,
         events: mpsc::Sender<RunEvent>,
+        admission: oneshot::Sender<Result<MessageReceipt, ActorError>>,
         completion: oneshot::Sender<Result<serde_json::Value, ActorError>>,
         lease: CallLease,
     ) -> Self {
@@ -39,6 +41,7 @@ impl CallRequest {
             message,
             output,
             events,
+            admission: Some(admission),
             completion,
             _lease: lease,
         }
@@ -48,7 +51,16 @@ impl CallRequest {
         let _ = self.events.try_send(event);
     }
 
-    pub(crate) fn fail(self, error: ActorError) {
+    pub(crate) fn admitted(&mut self, receipt: MessageReceipt) {
+        if let Some(admission) = self.admission.take() {
+            let _ = admission.send(Ok(receipt));
+        }
+    }
+
+    pub(crate) fn fail(mut self, error: ActorError) {
+        if let Some(admission) = self.admission.take() {
+            let _ = admission.send(Err(error.clone()));
+        }
         self.emit(RunEvent::Failed {
             message: error.to_string(),
         });

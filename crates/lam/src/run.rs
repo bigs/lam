@@ -16,9 +16,9 @@ use serde::de::DeserializeOwned;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::command::{CallLease, CallRequest, RunnerCommand};
-use crate::{ActorError, EvalOutcome};
+use crate::{ActorError, EvalOutcome, MessageReceipt};
 
-const RUN_EVENT_BUFFER: usize = 256;
+pub(crate) const RUN_EVENT_BUFFER: usize = 256;
 
 /// Ephemeral progress emitted while one actor run executes.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -112,6 +112,7 @@ struct RunStart {
     message: Result<MessageEnvelope, ActorError>,
     output: OutputContract,
     events: mpsc::Sender<RunEvent>,
+    admission: oneshot::Sender<Result<MessageReceipt, ActorError>>,
     completion: oneshot::Sender<Result<serde_json::Value, ActorError>>,
 }
 
@@ -120,6 +121,7 @@ pub struct Run<'actor, T> {
     message_id: MessageId,
     start: Option<RunStart>,
     events: mpsc::Receiver<RunEvent>,
+    admission: Option<oneshot::Receiver<Result<MessageReceipt, ActorError>>>,
     completion: oneshot::Receiver<Result<serde_json::Value, ActorError>>,
     marker: PhantomData<(&'actor mut (), T)>,
 }
@@ -149,6 +151,7 @@ impl<'actor> Run<'actor, String> {
             message_id: self.message_id,
             start,
             events: self.events,
+            admission: self.admission,
             completion: self.completion,
             marker: PhantomData,
         }
@@ -163,6 +166,7 @@ impl<'actor, T> Run<'actor, T> {
         message: Result<MessageEnvelope, ActorError>,
     ) -> Self {
         let (event_sender, events) = mpsc::channel(RUN_EVENT_BUFFER);
+        let (admission_sender, admission) = oneshot::channel();
         let (completion_sender, completion) = oneshot::channel();
         Self {
             message_id,
@@ -172,9 +176,11 @@ impl<'actor, T> Run<'actor, T> {
                 message,
                 output: OutputContract::Text,
                 events: event_sender,
+                admission: admission_sender,
                 completion: completion_sender,
             }),
             events,
+            admission: Some(admission),
             completion,
             marker: PhantomData,
         }
@@ -191,6 +197,19 @@ impl<'actor, T> Run<'actor, T> {
         poll_fn(|context| Pin::new(&mut *self).poll_next(context)).await
     }
 
+    /// Waits until this call's input is durably admitted to the actor mailbox.
+    ///
+    /// The returned receipt precedes the terminal call result. This is useful
+    /// for background orchestration which must acknowledge durable admission
+    /// without losing the correlated completion.
+    pub async fn wait_admitted(&mut self) -> Result<MessageReceipt, ActorError> {
+        self.ensure_started();
+        let admission = self.admission.take().ok_or_else(|| ActorError::State {
+            message: "call admission was already observed".to_owned(),
+        })?;
+        admission.await.map_err(|_| ActorError::Unavailable)?
+    }
+
     fn ensure_started(&mut self) {
         let Some(start) = self.start.take() else {
             return;
@@ -201,12 +220,14 @@ impl<'actor, T> Run<'actor, T> {
             message,
             output,
             events,
+            admission,
             completion,
         } = start;
 
         let message = match message {
             Ok(message) => message,
             Err(error) => {
+                let _ = admission.send(Err(error.clone()));
                 let _ = events.try_send(RunEvent::Failed {
                     message: error.to_string(),
                 });
@@ -217,6 +238,7 @@ impl<'actor, T> Run<'actor, T> {
         let lease = match CallLease::acquire(active) {
             Ok(lease) => lease,
             Err(error) => {
+                let _ = admission.send(Err(error.clone()));
                 let _ = events.try_send(RunEvent::Failed {
                     message: error.to_string(),
                 });
@@ -224,13 +246,37 @@ impl<'actor, T> Run<'actor, T> {
                 return;
             }
         };
-        let call = CallRequest::new(message, output, events, completion, lease);
+        let call = CallRequest::new(message, output, events, admission, completion, lease);
         if let Err(error) = commands.send(RunnerCommand::Call(Box::new(call))) {
             let RunnerCommand::Call(call) = error.0 else {
                 unreachable!("only a call command was sent")
             };
             call.fail(ActorError::Unavailable);
         }
+    }
+}
+
+/// Single-consumer stream of progress across every run performed by one actor.
+pub struct RunEvents {
+    receiver: mpsc::Receiver<RunEvent>,
+}
+
+impl RunEvents {
+    pub(crate) const fn new(receiver: mpsc::Receiver<RunEvent>) -> Self {
+        Self { receiver }
+    }
+
+    /// Waits for the next actor run event.
+    pub async fn next(&mut self) -> Option<RunEvent> {
+        self.receiver.recv().await
+    }
+}
+
+impl Stream for RunEvents {
+    type Item = RunEvent;
+
+    fn poll_next(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.get_mut().receiver).poll_recv(context)
     }
 }
 

@@ -1020,7 +1020,7 @@ restart behavior, and durability need a focused design before implementation.
 
 ### Subagents
 
-**Initial vertical slice implemented.** A subagent is constructed through the
+**Implemented through completion and lifecycle semantics.** A subagent is constructed through the
 same public actor machinery, gets its own journal and isolate, and receives its
 initial task as an always-steering `MessageSource::Actor` message.
 `SubagentConfig` is an explicit value rather than a named-profile registry. It
@@ -1030,20 +1030,38 @@ console capture. Omitting `namespaces` grants that configured set; an explicit
 array grants the exact validated subset. `lam.dir` and `lam.result` are always
 implicit, while selecting `lam.agents` grants the generated interaction
 surface. At the configured depth limit that surface retains identity, listing,
-and addressed messaging but omits recursive spawning.
+addressed messaging, and direct-child stopping but omits recursive creation.
 
-The generated capability includes `identity`, `list`, `spawn`, and `send`.
+The generated capability includes `identity`, `list`, `spawn`, `call`, `send`,
+and `stop`.
 Actors use canonical Unix-style addresses: `spawn` accepts one required name
 segment and derives a direct child path, while `identity` returns the current
 address and its derived parent. `list()` returns direct resident children of
 the current address; an explicit `path` lists another namespace. Spawn is
 create-only and returns after the initial task is durably queued, so an address
 which is resident, launching, or already durable is never silently reused.
-Send requires an explicit recipient address, admits one structured value with
-authenticated actor provenance, and always steers an active recipient. Any
-resident actor in the same `AgentSystem` is addressable. Completion protocols,
-wait semantics, and durable reconstruction of the live topology remain later
-design boundaries rather than being guessed in this pass.
+`call` accepts the same child specification, waits through an async builtin
+boundary, and returns one typed completed/failed/cancelled `AgentOutcome` once
+the initial task is durable. Dropping that call cancels the child subtree;
+`spawn` is the explicit detached form and delivers its eventual outcome as a
+durable, steering message from the child to its parent. Send requires an
+explicit recipient address, admits one structured value with authenticated
+actor provenance, and always steers an active recipient. Any resident actor in
+the same `AgentSystem` is addressable. Stop is restricted to a direct child and
+recursively cancels its resident descendants before releasing capacity.
+
+The Rust host surface distinguishes root completion, quiescence, and
+termination: `root.call(value).await` waits for one root run,
+`system.wait().await` waits until no managed run, eligible mailbox message,
+launch, or completion delivery remains, and `system.shutdown().await` retires
+the actors and workers. `AgentSystemEvents` multiplexes existing addressed
+`RunEvent` and actor-wide `RuntimeEvent` values with hosted, outcome, and
+retired events for embeddings and the TUI. These events remain ephemeral;
+journals and mailboxes are authoritative.
+
+Durable reconstruction of live topology, overload queues, rebalancing,
+migration, and a model-visible join of an already-backgrounded task remain
+future design boundaries.
 
 ## Provider abstraction
 
@@ -1285,7 +1303,7 @@ Explicitly out of scope:
 
 ### Slice 2: append-only state model
 
-**Implemented; pending API review.**
+**Implemented.**
 
 Implement one authoritative journal per actor with the two initial event kinds
 `MessageAdmitted` and `ContextAppended`. Define the message envelope, context
@@ -1551,7 +1569,7 @@ composition.
 
 ### Slice 7: scheduler and multiple actors
 
-**First vertical slice implemented.** `lam-agents` now provides:
+**Implemented.** `lam-agents` now provides:
 
 - a configurable fixed-size pool of current-thread executors, with one worker
   and a 64-actor bound as lightweight defaults;
@@ -1568,8 +1586,9 @@ composition.
 - explicit `SubagentConfig` values with direct `{ provider, model }` identity,
   namespace subset enforcement, replacement `systemPrompt`, appended
   `instructions`, host-required annotations, nesting depth, and eval limits;
-- manifest-generated `lam.agents.identity`, `list`, `spawn`, and addressed
-  `send` functions whose docs reflect the actual configured capabilities;
+- manifest-generated `lam.agents.identity`, `list`, `spawn`, `call`, addressed
+  `send`, and direct-child `stop` functions whose docs reflect the actual
+  configured capabilities;
 - hierarchical, arbitrary-depth paths; collision-safe launch reservations;
   create-only child startup which refuses durable path reuse; and direct-child
   resident listing with the current namespace as the no-argument default;
@@ -1578,18 +1597,26 @@ composition.
   their receipt returns and steer the parent's active run;
 - arbitrary resident actor routing and cancellation handles outside the linear
   call-owner lock, cancellation-safe initial task admission, stopped-task
-  retirement, and serialized shutdown waiters with abort escalation.
+  retirement, serialized shutdown waiters with abort escalation, explicit
+  system quiescence, and addressed host event aggregation.
 
 The implementation reuses two small general primitives rather than introducing
 a second runtime: `Namespace` definitions are cheaply cloneable, and
 `JournalStore` delegates through `Arc<S>`. The existing single-actor API and its
 dedicated-thread behavior remain unchanged.
 
-**Deferred to Slice 7B.** Child completion and wait/wake semantics, child
-lifecycle controls exposed to TypeScript, durable reconstruction of which
-actors are resident, overload queues, rebalancing, and migration are not part
-of this vertical slice. Agent waits must eventually be async builtin boundaries
-so a parent suspends without blocking a sibling isolate on the same worker.
+**Slice 7B implemented.** `call` and background `spawn` share one correlated
+actor-sourced run path and one `AgentOutcome` vocabulary. Calls park the parent
+isolate while sibling work continues on the same worker; cancellation retires
+the owned subtree. Background outcomes enter the parent's ordinary durable
+mailbox and wake or steer it. Direct-child `stop`, host-side `wait`, actor-wide
+run streams, and one addressed system event stream complete the lifecycle
+surface needed by an embedding TUI.
+
+There is intentionally no model-visible `wait`: synchronous work uses `call`,
+while `spawn` is detached and pushes completion without polling or duplicate
+consumption semantics. Durable topology reconstruction, overload queues,
+rebalancing, and migration remain independent future slices.
 
 ### Slice 8: coding-agent capability pack
 
@@ -1675,11 +1702,18 @@ contract tests requiring credentials or network access remain opt-in.
 
 ## Open decisions index
 
-These questions are intentionally unresolved and assigned to slices:
+The initial kernel slices have no remaining blocking decisions. These concrete
+questions stay assigned to later slices rather than leaking into the core:
 
-- default stdlib capability profile — coding capability slice;
-- scheduler sizing, actor residency, wake, shutdown, and overload policy —
-  multi-agent scheduler slice.
+- webhook listener ownership, authentication, public addressing, and delivery
+  policy — HTTP capability slice;
+- monitor cancellation, backpressure, and recovery — monitor slice;
+- interactive approval request/response and timeout semantics — approval/TUI
+  slice;
+- durable topology reconstruction, overload queues, rebalancing, and actor
+  migration — multi-agent scheduler follow-up;
+- the default interactive capability profile and session/config layout — TUI
+  slice.
 
 ## Working agreement
 

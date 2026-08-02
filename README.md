@@ -223,6 +223,7 @@ let root = system
     )
     .await?;
 let answer = root.call("Delegate a read-only investigation").await?;
+system.wait().await?;
 system.shutdown().await?;
 ```
 
@@ -234,8 +235,17 @@ returns only after the child's initial, always-steering task is durable.
 `lam.agents.list()` lists direct resident children of the current actor (or of
 an explicit `path`). `lam.agents.send({ to, message })` routes to any resident
 address in the same system, durably records authenticated actor provenance,
-and steers an active recipient run. Completion and wait APIs remain separate
-follow-up work.
+and steers an active recipient run. `lam.agents.call` creates a persistent
+child but awaits its initial task directly, while `spawn` delivers the same
+typed completed/failed/cancelled outcome through the parent's durable mailbox
+and wakes an idle parent. `lam.agents.stop` lets an actor retire only its own
+direct child subtree.
+
+For embedding control flow, `AgentSystem::wait()` observes system-wide
+quiescence without terminating idle actors. A single-consumer system event
+stream tags existing `RunEvent` and actor-wide `RuntimeEvent` values with their
+actor address, adds hosted/retired lifecycle transitions and child outcomes,
+and keeps token deltas ephemeral for responsive consumers.
 
 ## Workspace
 
