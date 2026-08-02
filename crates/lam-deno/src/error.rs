@@ -127,10 +127,6 @@ pub enum IsolateBuildError {
     /// The default or maximum timeout was zero.
     #[error("isolate timeouts must be greater than zero")]
     InvalidTimeout,
-    /// `rusty_v8` keeps an isolate entered for its full lifetime, so another
-    /// Lam isolate cannot safely be interleaved on the same system thread.
-    #[error("this system thread already owns a live Lam isolate")]
-    ThreadAlreadyOwnsIsolate,
     /// V8, the Lam bootstrap, or the local inspector failed to initialize.
     #[error("failed to initialize the JavaScript runtime: {message}")]
     RuntimeInitialization {

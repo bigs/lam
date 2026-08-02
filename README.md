@@ -165,9 +165,11 @@ price catalog that can silently become stale. Chat Completions requests
 `stream_options.include_usage` by default and can disable it for a compatible
 server that rejects the option.
 
-For now, a system thread may own only one live Lam isolate. The builder rejects
-a second isolate on the same thread; the scheduler design will revisit
-residency after we establish a safe lifecycle contract with `rusty_v8`.
+Lam isolates are thread-affine and deliberately not `Send`, but a local runtime
+may host more than one. Each V8 isolate is parked between future polls and
+entered only while Lam polls or tears down its kernel. Asynchronous evals can
+therefore interleave on one system thread; synchronous CPU-bound JavaScript
+occupies that thread until it returns or its watchdog interrupts it.
 
 ## Workspace
 

@@ -293,8 +293,9 @@ speculative fields in Slice 1.
 - its enabled namespace/capability set.
 
 A subagent is a full actor. It does not share its parent's isolate. This makes
-message passing and durable recovery explicit and permits actors to move
-between scheduler threads when they are not resident.
+message passing and durable recovery explicit. A live isolate remains pinned
+to its owner thread; an actor can move only after that isolate is torn down and
+its durable state is resumed with a fresh generation elsewhere.
 
 ### Push, not polling
 
@@ -871,28 +872,29 @@ model; workflows needing coordination use messages and explicit protocols.
 
 ### Isolate residency
 
-**Settled current safety constraint.** A system thread may own at most one live
-Lam isolate. `rusty_v8::OwnedIsolate` remains entered for its lifetime, so
-constructing another resident isolate and interleaving the two on one thread is
-not a supported safe lifecycle. Slice 1 enforces this with a thread-local
-builder permit instead of allowing misuse to become a native crash.
+**Settled runtime primitive.** An isolate is local to its construction thread
+and is not `Send`. Lam parks its V8 isolate between future polls, then activates
+it around each eval poll and around cancellation or destruction. Multiple live
+isolates can therefore share one current-thread executor without sharing heaps
+or depending on V8's entered-isolate stack order. Timeout replacement occurs
+on that same owner thread.
 
-An isolate is also local to its construction thread and is not `Send`. Timeout
-replacement occurs on that same thread and retains the residency permit.
+Async JavaScript and Promise-native builtins yield naturally between polls.
+Synchronous CPU-bound JavaScript cannot be preempted cooperatively and may
+delay sibling isolates until it returns or the watchdog interrupts it. Agent
+waits must therefore cross an async builtin boundary rather than block inside
+JavaScript.
 
 **Settled for Slice 3.** The initial single-actor runner owns one dedicated
 system thread with a current-thread async runtime, actor projection, model loop,
 and persistent isolate. Callers interact through `Actor` and `ActorRef`; the
 thread assignment is not part of their public semantics.
 
-**Deferred to the scheduler slice.** The original fixed-size design assumed one
-single-threaded executor could host multiple resident isolates. Implementation
-invalidated that assumption. The simplest safe scheduler is a bounded set of
-threads with one resident isolate per thread. Before choosing it, we should
-evaluate its resource and actor-residency behavior and determine whether
-`deno_core` exposes a reviewed activation mechanism that safely permits
-multiple isolates per thread. Actor isolation and message passing do not depend
-on either scheduling choice.
+**Deferred to the scheduler slice.** A separate multi-agent layer can build a
+bounded pool of local executor threads atop this primitive, with several parked
+isolates assigned to each thread. Pool sizing, residency limits, wake semantics,
+and overload policy do not belong in the minimal single-agent library. Actor
+isolation and message passing remain independent of those policy choices.
 
 ### Actor serialization
 
@@ -1226,8 +1228,9 @@ Acceptance coverage proves TypeScript persistence and top-level await, absence
 of ambient authority, Promise composition, typed error catch and propagation,
 schema discovery, automatic materialization of a deeply nested application
 namespace registered only in Rust, isolation across generations, timeout
-restart, cancellation of a pending Rust builtin, namespace validation, and the
-one-live-isolate-per-thread guard.
+restart, cancellation of a pending Rust builtin, namespace validation, and
+multiple independent isolates interleaving, cancelling, replacing, and tearing
+down out of construction order on one thread.
 
 Explicitly out of scope:
 
@@ -1506,10 +1509,12 @@ composition.
 
 ### Slice 7: scheduler and multiple actors
 
-Introduce bounded actor residency, cross-actor steering, and scheduler limits.
-The slice must first settle whether safe residency means one isolate thread per
-slot or whether an upstream-supported activation mechanism permits multiple
-independent isolates per thread. Only then add subagent construction.
+Add a separate multi-agent crate for bounded actor residency, cross-actor
+steering, subagent construction, and scheduler limits. It should use a bounded
+set of local executor threads, assign several parked isolates to each, and make
+async actor waits suspend the caller rather than block its worker. The slice
+must settle pool sizing, residency, wake, shutdown, and overload semantics; the
+low-level same-thread isolate lifecycle is already established in `lam-deno`.
 
 ### Slice 8: coding-agent capability pack
 
@@ -1565,12 +1570,8 @@ contract tests requiring credentials or network access remain opt-in.
 These questions are intentionally unresolved and assigned to slices:
 
 - default stdlib capability profile — coding capability slice;
-- `JournalStore` async and object-erasure mechanics — Slice 2;
-- context and inbox serialization format/versioning — Slice 2;
-- first real model provider — Slice 5;
-- model-switch and provider-native compaction semantics — Slice 6B;
-- safe isolate activation, scheduler sizing, and actor residency policy —
-  Slice 7.
+- scheduler sizing, actor residency, wake, shutdown, and overload policy —
+  multi-agent scheduler slice.
 
 ## Working agreement
 

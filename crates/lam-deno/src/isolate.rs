@@ -1,4 +1,3 @@
-use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -20,12 +19,13 @@ use crate::transpile;
 
 pub use crate::bridge::{ConsoleEntry, ConsoleLevel};
 
+#[allow(unsafe_code)]
+mod parked;
+
+use parked::Kernel;
+
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_MAX_TIMEOUT: Duration = Duration::from_secs(30);
-
-thread_local! {
-    static THREAD_HAS_ISOLATE: Cell<bool> = const { Cell::new(false) };
-}
 
 /// The JSON-only value returned by a successful evaluation.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -120,15 +120,13 @@ impl IsolateBuilder {
         }
 
         let registry = Arc::new(Registry::build(self.namespaces)?);
-        let thread_permit = ThreadPermit::acquire()?;
         let console = ConsoleBuffer::new(self.capture_console);
         let generation = 1;
-        let mut kernel = Kernel::new(Arc::clone(&registry), console.clone(), generation).await?;
+        let mut kernel = Kernel::new(Arc::clone(&registry), console.clone(), generation)?;
         let interrupt = IsolateInterrupt::new(kernel.isolate_handle());
 
         Ok(Isolate {
             kernel: Some(kernel),
-            _thread_permit: thread_permit,
             registry,
             console,
             generation,
@@ -190,8 +188,6 @@ impl IsolateInterrupt {
 /// actor state between scheduler slots.
 pub struct Isolate {
     kernel: Option<Kernel>,
-    // Declared after `kernel` so V8 is dropped before the thread is released.
-    _thread_permit: ThreadPermit,
     registry: Arc<Registry>,
     console: ConsoleBuffer,
     generation: u64,
@@ -199,30 +195,6 @@ pub struct Isolate {
     default_timeout: Duration,
     max_timeout: Duration,
     interrupt: IsolateInterrupt,
-}
-
-struct ThreadPermit;
-
-impl ThreadPermit {
-    fn acquire() -> Result<Self, IsolateBuildError> {
-        THREAD_HAS_ISOLATE.with(|occupied| {
-            if occupied.get() {
-                Err(IsolateBuildError::ThreadAlreadyOwnsIsolate)
-            } else {
-                occupied.set(true);
-                Ok(Self)
-            }
-        })
-    }
-}
-
-impl Drop for ThreadPermit {
-    fn drop(&mut self) {
-        THREAD_HAS_ISOLATE.with(|occupied| {
-            debug_assert!(occupied.get(), "Lam isolate thread permit was not held");
-            occupied.set(false);
-        });
-    }
 }
 
 impl Isolate {
@@ -299,7 +271,7 @@ impl Isolate {
         };
 
         if timed_out {
-            return self.restart_after_timeout(timeout_ms).await;
+            return self.restart_after_timeout(timeout_ms);
         }
 
         let result = result
@@ -310,7 +282,7 @@ impl Isolate {
         })
     }
 
-    async fn restart_after_timeout(&mut self, timeout_ms: u64) -> Result<EvalOutput, EvalError> {
+    fn restart_after_timeout(&mut self, timeout_ms: u64) -> Result<EvalOutput, EvalError> {
         let previous_generation = self.generation;
         let new_generation = previous_generation.saturating_add(1);
 
@@ -324,9 +296,7 @@ impl Isolate {
             Arc::clone(&self.registry),
             self.console.clone(),
             new_generation,
-        )
-        .await
-        {
+        ) {
             Ok(mut kernel) => {
                 self.interrupt.replace(kernel.isolate_handle());
                 self.kernel = Some(kernel);
@@ -353,14 +323,25 @@ impl Drop for Isolate {
     }
 }
 
-struct Kernel {
+struct KernelInner {
     // The inspector owns handles into V8 and must be dropped before the runtime.
     inspector: InspectorClient,
     runtime: JsRuntime,
 }
 
 impl Kernel {
-    async fn new(
+    fn new(
+        registry: Arc<Registry>,
+        console: ConsoleBuffer,
+        generation: u64,
+    ) -> Result<Self, IsolateBuildError> {
+        let inner = KernelInner::new(registry, console, generation)?;
+        Ok(Self::park(inner))
+    }
+}
+
+impl KernelInner {
+    fn new(
         registry: Arc<Registry>,
         console: ConsoleBuffer,
         generation: u64,
@@ -375,11 +356,11 @@ impl Kernel {
             message: error.to_string(),
         })?;
 
-        let inspector = InspectorClient::attach(&mut runtime)
-            .await
-            .map_err(|error| IsolateBuildError::RuntimeInitialization {
+        let inspector = InspectorClient::attach(&mut runtime).map_err(|error| {
+            IsolateBuildError::RuntimeInitialization {
                 message: error.to_string(),
-            })?;
+            }
+        })?;
 
         Ok(Self { inspector, runtime })
     }

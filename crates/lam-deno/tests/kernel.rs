@@ -1,9 +1,11 @@
 //! Acceptance tests for the first persistent-isolate kernel slice.
 
+use std::future::poll_fn;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+use std::task::Poll;
 use std::time::Duration;
 
 use lam_deno::{
@@ -358,22 +360,50 @@ async fn model_api_inventory_is_a_compact_view_of_the_manifest() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn isolates_do_not_share_javascript_state() {
-    let mut first = test_isolate().await;
+async fn multiple_isolates_share_one_thread_without_sharing_state() {
+    let (mut first, mut second) = tokio::join!(test_isolate(), test_isolate());
 
     first
-        .eval("globalThis.onlyInFirst = 42")
+        .eval("globalThis.identity = 'first'; globalThis.turns = 0")
         .await
         .expect("first isolate should accept state");
-    drop(first);
-
-    let mut second = test_isolate().await;
-    let value = second
-        .eval("typeof globalThis.onlyInFirst")
+    second
+        .eval("globalThis.identity = 'second'; globalThis.turns = 40")
         .await
-        .expect("second isolate should remain independent");
+        .expect("second isolate should accept independent state");
 
-    assert_eq!(json_result(value.result), json!("undefined"));
+    let first_eval = first.eval(
+        "const added = await lam.math.add({ left: 1, right: 1 });\
+         globalThis.turns += added.sum;\
+         lam.result({ identity, turns: globalThis.turns })",
+    );
+    let second_eval = second.eval(
+        "const added = await lam.math.add({ left: 1, right: 2 });\
+         globalThis.turns += added.sum;\
+         lam.result({ identity, turns: globalThis.turns })",
+    );
+    let (first_output, second_output) = tokio::join!(first_eval, second_eval);
+
+    assert_eq!(
+        json_result(first_output.expect("first eval should complete").result),
+        json!({ "identity": "first", "turns": 2 })
+    );
+    assert_eq!(
+        json_result(second_output.expect("second eval should complete").result),
+        json!({ "identity": "second", "turns": 43 })
+    );
+
+    // Isolates can be destroyed out of construction order because neither one
+    // remains entered while parked.
+    drop(first);
+    let surviving = second
+        .eval("lam.result({ identity, turns: globalThis.turns })")
+        .await
+        .expect("the second isolate should survive first-isolate teardown");
+    assert_eq!(
+        json_result(surviving.result),
+        json!({ "identity": "second", "turns": 43 })
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -385,6 +415,11 @@ async fn timeout_discards_and_replaces_the_isolate() {
         .build()
         .await
         .expect("test isolate should initialize");
+    let mut sibling = test_isolate().await;
+    sibling
+        .eval("globalThis.siblingState = 42")
+        .await
+        .expect("sibling state should initialize");
 
     isolate
         .eval("const survivor: number = 42;")
@@ -420,6 +455,45 @@ async fn timeout_discards_and_replaces_the_isolate() {
         .await
         .expect("registered capabilities should be restored");
     assert_eq!(json_result(builtin.result), json!({ "sum": 42 }));
+
+    let sibling_state = sibling
+        .eval("siblingState")
+        .await
+        .expect("replacing one isolate must not disturb its sibling");
+    assert_eq!(json_result(sibling_state.result), json!(42));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cancelling_and_dropping_an_eval_preserves_a_sibling_isolate() {
+    let pending_namespace = Namespace::new("lam.wait", "Cancellation probe.").function(
+        "forever",
+        "Never resolves.",
+        |_context, (): ()| async move {
+            std::future::pending::<()>().await;
+            Ok::<(), Never>(())
+        },
+    );
+    let mut pending = Isolate::builder()
+        .namespace(pending_namespace)
+        .build()
+        .await
+        .expect("pending isolate should initialize");
+    let mut sibling = test_isolate().await;
+
+    let mut evaluation = Box::pin(pending.eval("lam.wait.forever()"));
+    poll_fn(|cx| match evaluation.as_mut().poll(cx) {
+        Poll::Pending => Poll::Ready(()),
+        Poll::Ready(result) => panic!("pending eval completed unexpectedly: {result:?}"),
+    })
+    .await;
+    drop(evaluation);
+    drop(pending);
+
+    let result = sibling
+        .eval("6 * 7")
+        .await
+        .expect("cancelling a parked sibling must not damage this isolate");
+    assert_eq!(json_result(result.result), json!(42));
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -545,15 +619,4 @@ async fn builder_rejects_ambiguous_or_invalid_names() {
         global_collision,
         IsolateBuildError::RuntimeInitialization { .. }
     ));
-
-    let first = test_isolate().await;
-    let occupied = match Isolate::builder().build().await {
-        Ok(_) => panic!("a second live isolate on one system thread is unsafe"),
-        Err(error) => error,
-    };
-    assert!(matches!(
-        occupied,
-        IsolateBuildError::ThreadAlreadyOwnsIsolate
-    ));
-    drop(first);
 }

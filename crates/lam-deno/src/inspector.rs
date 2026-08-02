@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
 
+use deno_core::futures::FutureExt;
 use deno_core::futures::channel::{mpsc, oneshot};
-use deno_core::futures::{FutureExt, StreamExt};
 use deno_core::parking_lot::Mutex;
 use deno_core::{
     InspectorMsg, InspectorMsgKind, InspectorSessionKind, JsRuntime, JsRuntimeInspector,
@@ -111,7 +111,7 @@ pub(crate) struct InspectorClient {
 }
 
 impl InspectorClient {
-    pub(crate) async fn attach(runtime: &mut JsRuntime) -> Result<Self, InspectorError> {
+    pub(crate) fn attach(runtime: &mut JsRuntime) -> Result<Self, InspectorError> {
         let (notification_sender, mut notification_receiver) = mpsc::unbounded();
         let state = InspectorState::new(notification_sender);
         let callback_state = state.clone();
@@ -124,11 +124,17 @@ impl InspectorClient {
 
         session.post_message::<()>(next_message_id(), "Runtime.enable", None);
 
+        // Local inspector dispatch invokes its callback synchronously. Requiring
+        // the context notification here ensures a new runtime is parked before
+        // its builder can ever yield to another isolate on the same thread.
         let context_id = loop {
             let notification = notification_receiver
-                .next()
-                .await
-                .ok_or(InspectorError::Disconnected)?;
+                .try_recv()
+                .map_err(|error| InspectorError::Protocol {
+                    message: format!(
+                        "Runtime.enable did not synchronously announce the default execution context: {error}"
+                    ),
+                })?;
             if notification["method"] != "Runtime.executionContextCreated" {
                 continue;
             }
