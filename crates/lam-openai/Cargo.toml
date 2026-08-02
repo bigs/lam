@@ -2,7 +2,8 @@
 name = "lam-openai"
 version.workspace = true
 edition.workspace = true
-description = "Lossless OpenAI Responses and compatible Chat Completions adapters for Lam"
+description = "Lossless OpenAI Responses and compatible Chat Completions adapters for lam"
+readme = "README.md"
 
 [dependencies]
 futures-util.workspace = true

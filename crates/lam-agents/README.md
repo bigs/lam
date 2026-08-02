@@ -1,0 +1,142 @@
+# `lam-agents`
+
+Optional bounded multi-actor scheduling and subagent capabilities for
+[lam](../../README.md).
+
+The public `lam` crate intentionally remains a straightforward single-actor
+library. `lam-agents` adds a fixed pool of current-thread executors, several
+parked thread-affine isolates per worker, canonical actor addressing, and a
+manifest-generated `lam.agents` namespace.
+
+## Hosting a root
+
+```rust,ignore
+use lam::{Lam, MemStore};
+use lam_agents::{AgentSystem, SubagentConfig};
+
+let system = AgentSystem::builder(MemStore::new())
+    .worker_threads(2)
+    .max_agents(16)
+    .build()?;
+
+let children: SubagentConfig<MemStore> = SubagentConfig::builder(model.clone())
+    .namespace(read_only_files)
+    .required_instructions("Stay within the configured project root.")
+    .max_depth(2)
+    .build()?;
+
+let root = system
+    .host_with_subagents(
+        Lam::builder(model)
+            .state_store(system.state_store())
+            .build()
+            .actor("/root"),
+        children,
+    )
+    .await?;
+
+let answer = root.call("Delegate a read-only investigation").await?;
+system.wait().await?;
+system.shutdown().await?;
+```
+
+`host` starts an ordinary root without the subagent namespace.
+`host_with_subagents` derives the authoritative sender identity from the actor
+builder and installs the configured child policy.
+
+## Actor addresses
+
+Every hosted actor has one canonical Unix-style path:
+
+```text
+/root
+/root/researcher
+/root/researcher/parser
+```
+
+Spawn requests supply exactly one child-name segment. A live or previously
+durable address is never silently reused. `list()` without an argument returns
+the current actor's direct resident children; an explicit path lists that
+namespace's direct children.
+
+## Model-visible API
+
+The exact installed functions are manifest-discoverable through `lam.dir()`:
+
+| Function | Semantics |
+| --- | --- |
+| `lam.agents.identity()` | Return the current address and automatic parent |
+| `lam.agents.list(request?)` | List direct resident children |
+| `lam.agents.spawn(request)` | Create a detached persistent child and return after initial task admission |
+| `lam.agents.call(request)` | Create a persistent child and wait directly for its initial task outcome |
+| `lam.agents.send({ to, message })` | Durably send an authenticated steering message to any resident address |
+| `lam.agents.stop({ address })` | Stop one direct child and its descendants, waiting for residency release |
+
+The child request can select an allowed `{ provider, model }`, replacement
+system prompt, appended instructions, and an exact subset of registered
+namespace paths. `SubagentConfig` establishes the allowed models, namespaces,
+host-required instructions, nesting depth, eval limits, and defaults. It is an
+explicit value, not a named-profile registry.
+
+## `call` and `spawn`
+
+Both operations admit an actor-sourced, always-steering initial task and use the
+same tagged `AgentOutcome`:
+
+- `completed` carries the child address, message ID, and terminal text;
+- `failed` carries the address, message ID, and error;
+- `cancelled` carries the address, message ID, and optional reason.
+
+`call` parks the parent's eval promise and resolves the Rust waiter directly;
+it does not insert a duplicate result into the parent mailbox. Dropping the
+call stops its owned child subtree.
+
+`spawn` returns only after the task is durable. The child runs independently,
+then sends one actor-authenticated outcome into the parent's durable mailbox,
+waking or steering the parent. A detached child remains addressable after its
+initial run completes.
+
+## Scheduler model
+
+Each worker is one OS thread with a Tokio current-thread runtime and `LocalSet`.
+Isolates never migrate between workers. Async provider requests and builtins
+yield normally, allowing sibling actors on the same worker to progress.
+Synchronous JavaScript or blocking Rust code occupies the worker until it
+returns or is interrupted.
+
+`max_agents` bounds actors being built plus resident actors. Launch reservations
+prevent duplicate addresses. Capacity is released only after the outer actor
+task retires—not merely when its inner runner observes cancellation.
+
+## Embedded control and events
+
+`Agent` is a cloneable embedded handle with serialized `call`, structured
+`call_structured`, durable `send`, state projection, and out-of-band abort.
+
+`AgentSystem::wait()` waits for quiescence: no active host operations,
+reservations, actor runs, or eligible mailbox work. It does not retire idle
+actors. `shutdown()` stops admission, gracefully retires actors, and joins all
+workers; `abort()` interrupts active work first. Administrative `stop(address)`
+retires an addressed subtree.
+
+`take_events()` yields one single-consumer, addressed, ephemeral stream:
+
+- actors hosted and retired with `StopReason`;
+- existing `RunEvent` and `RuntimeEvent` values tagged by address;
+- child task outcomes.
+
+Runtime and run events may describe the same operation at different scopes;
+both are forwarded unchanged. Journals and mailboxes remain the durable
+authority.
+
+## Deliberately deferred
+
+- Durable reconstruction of the live topology after process restart.
+- Overload queues beyond explicit capacity failure.
+- Dynamic rebalancing or isolate migration.
+- Model-visible polling/wait primitives; synchronous work uses `call`, while
+  detached work pushes its outcome.
+
+See the public [`lam`](../lam/README.md) facade, optional
+[`lam-code`](../lam-code/README.md) capabilities, and repository
+[README](../../README.md).

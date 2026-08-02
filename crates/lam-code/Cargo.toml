@@ -3,6 +3,7 @@ name = "lam-code"
 version.workspace = true
 edition.workspace = true
 description = "Optional filesystem, editing, and shell capabilities for lam"
+readme = "README.md"
 
 [dependencies]
 lam = { path = "../lam" }

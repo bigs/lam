@@ -2,7 +2,8 @@
 name = "lam-redb"
 version.workspace = true
 edition.workspace = true
-description = "Durable redb state-store implementation for Lam"
+description = "Durable redb state-store implementation for lam"
+readme = "README.md"
 
 [dependencies]
 lam-core = { path = "../lam-core" }

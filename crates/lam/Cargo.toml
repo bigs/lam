@@ -2,7 +2,8 @@
 name = "lam"
 version.workspace = true
 edition.workspace = true
-description = "Public facade for the Lam actor-style coding agent runtime"
+description = "Public facade for the lam actor-style coding agent runtime"
+readme = "README.md"
 
 [dependencies]
 futures-core.workspace = true

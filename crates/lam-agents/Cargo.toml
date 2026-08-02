@@ -2,7 +2,8 @@
 name = "lam-agents"
 version.workspace = true
 edition.workspace = true
-description = "Bounded multi-actor scheduling and subagent capabilities for Lam"
+description = "Bounded multi-actor scheduling and subagent capabilities for lam"
+readme = "README.md"
 
 [dependencies]
 futures-util.workspace = true

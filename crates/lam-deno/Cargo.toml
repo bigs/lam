@@ -2,7 +2,8 @@
 name = "lam-deno"
 version.workspace = true
 edition.workspace = true
-description = "Embedded Deno isolate and typed builtin bridge for Lam"
+description = "Embedded Deno isolate and typed builtin bridge for lam"
+readme = "README.md"
 
 [dependencies]
 deno_ast.workspace = true

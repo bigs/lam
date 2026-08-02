@@ -1,79 +1,101 @@
-# Lam
+# lam
 
-Lam is an experimental Rust library for building durable, actor-style coding
-agents around one model-visible primitive: evaluating TypeScript in an embedded,
-persistent Deno isolate.
+`lam` is an experimental Rust library for building durable coding agents around
+one model-visible primitive: evaluate TypeScript in an embedded, persistent
+Deno isolate.
 
-The repository is intentionally library-first. A TUI will eventually be built
-on the same public API, but it is not part of the initial implementation.
+The model gets one tool, `eval`. Everything else—filesystem access, shell
+execution, application APIs, subagents—is a typed Rust capability surfaced to
+that TypeScript environment. This keeps the model interface tiny without
+limiting what an embedding can safely choose to provide.
 
-The architecture, settled decisions, open questions, and incremental
-implementation slices live in [docs/PLAN.md](docs/PLAN.md).
+**Status:** Milestone 1, the embeddable agent engine, is complete. The APIs are
+usable and extensively tested, but the project is still experimental and may
+change before a stable release. The interactive `lam` TUI is the next major
+phase.
 
-## Current kernel
+The complete architecture and decision record lives in
+[`docs/PLAN.md`](docs/PLAN.md).
 
-The implemented slices are usable through the public `lam` crate and its
-adapter crates. They provide:
+## Why one eval tool?
 
-- persistent, serial TypeScript cells with top-level `await`;
-- ordinary JavaScript `Promise` values for asynchronous Rust builtins;
-- typed Rust namespace registration with inferred JSON Schemas;
-- synchronous capability discovery through `lam.dir()`;
-- a compact manifest-derived default system prompt, with builder methods to
-  replace it or append application instructions;
-- JSON-only final results, including the explicit `lam.result(value)` helper;
-- ordered, structured `console` capture which can be disabled by the builder;
-- host-bounded timeouts that discard and replace a poisoned isolate;
-- no ambient filesystem, process, network, or `Deno` authority;
-- an optional `lam-code` capability pack with numbered filesystem reads,
-  direct-child listing, validated patch/write operations, and an explicitly
-  injected command runner with bounded, spillable output;
-- one append-only, actor-local journal containing model selection, admitted
-  messages, and model-visible context;
-- a pluggable typed `JournalStore` contract and pure-Rust `MemStore`;
-- pure projections for pending delivery, context history, run completion, and
-  compaction markers;
-- compare-and-append semantics that deterministically resolve steering against
-  run finalization;
-- provider-neutral model and codec contracts that preserve native response
-  payloads in context before acting on them;
-- a dedicated single-actor runner with durable `send`, linear `call`, steering,
-  and queueing semantics;
-- detachable run-event streams plus text and JSON Schema-derived structured
-  outputs;
-- restart recovery with a durable, model-visible isolate-reset notice;
-- configurable 90%-by-default context compaction with a model-generated
-  summary plus exact tail, deterministic truncation, manual triggering, and a
-  public `Compactor` extension point;
-- append-only compaction records containing the raw source response, an
-  optional neutral artifact, the exact replay checkpoint, and usage/cost
-  metadata;
-- a heterogeneous model registry with durable selection, compact-by-default
-  switching, an explicit context-reuse policy, and atomic checkpoint/selection
-  commits;
-- an optional bounded `lam-agents` executor pool whose manifest-generated
-  `lam.agents` capability creates hierarchically addressed child actors with
-  explicit model, namespace, prompt, and depth policy;
-- a pure-Rust `redb` journal backend; and
-- lossless OpenAI Responses and OpenAI-compatible Chat Completions adapters,
-  including explicitly configured native OpenAI Responses compaction, with
-  token/reasoning streaming, native usage preservation, normalized usage
-  events, and opt-in cost estimates.
+Tool-rich agents ask the model to repeatedly select from a growing catalog of
+small operations. lam instead gives the model a persistent programming
+environment:
 
-The isolate bootstrap is kernel-owned TypeScript installed through Deno's
-extension lifecycle. At startup it reads a Rust-generated builtin manifest,
-materializes every configured namespace and function, and routes calls through
-one generic Rust op. Extension authors only use `Namespace::function`; they do
-not maintain TypeScript shims. The bootstrap is transpiled by the same pinned
-`deno_ast` used for eval cells, so Lam has no npm install, JavaScript bundling
-step, checked-in generated runtime, or dependency on Effect.
+```text
+user input
+    ↓
+model ──eval(TypeScript)──→ persistent Deno isolate
+  ↑                              │
+  └──── structured result ───────┘
+                                 │
+                         typed Rust capabilities
+```
 
-The actor renders its model instructions from the same builtin manifest. The
-default names every installed function with its inferred input/output shape and
-the first paragraph of its Rust-authored documentation; `lam.dir()` retains the
-complete schemas and documentation. Embeddings can append focused instructions
-with `annotate_system_prompt` or replace the generated prompt entirely with
-`system_prompt`.
+A single eval can sequence dependent work, use `Promise.all` for independent
+work, retain variables between calls, catch structured errors, and return JSON
+with `lam.result(value)`. Rust remains authoritative over which capabilities
+exist and what types cross the boundary.
+
+The isolate exposes `lam.dir()` for complete runtime discovery. Its compact
+system-prompt synopsis is generated from the same manifest, including inferred
+input/output schemas and Rust-authored documentation. Adding a Rust builtin does
+not require a TypeScript shim.
+
+## What is implemented
+
+- Persistent TypeScript cells with lexical state and top-level `await`.
+- Typed, Promise-native Rust namespaces using Serde and JSON Schema inference.
+- Explicit JSON results and ordered structured `console` capture.
+- Bounded eval timeouts which interrupt and replace poisoned isolates.
+- Durable actor mailboxes and model-visible context in append-only journals.
+- Linear `call`, durable `send`, steering, queueing, and structured outputs.
+- Provider-native context preservation, including encrypted reasoning traces.
+- OpenAI Responses and OpenAI-compatible Chat Completions adapters.
+- Automatic/manual compaction, model switching, and exact native checkpoints.
+- In-memory and `redb` journal implementations.
+- A bounded multi-actor runtime with hierarchical subagents and message passing.
+- Optional filesystem, patching, and shell capabilities for coding agents.
+- Ephemeral run, token, usage, cost, runtime, and actor-lifecycle events.
+
+## Quick start
+
+The workspace is not yet published as a stable crates.io release. For now,
+consume the crates by path from a cloned checkout or another Cargo workspace.
+
+This example creates a real OpenAI-backed coding actor. The actor gets only the
+capabilities installed by the embedding:
+
+```rust,ignore
+use lam::Lam;
+use lam_code::{CodingPack, FilesystemAccess, LocalCommandRunner};
+use lam_openai::responses::Responses;
+
+let model = Responses::builder("gpt-5.6-luna")
+    .api_key(std::env::var("OPENAI_API_KEY")?)
+    .build()?;
+
+let coding = CodingPack::builder(".")
+    .filesystem_access(FilesystemAccess::ReadWrite)
+    .shell(LocalCommandRunner::default())
+    .build()?;
+
+let mut actor = Lam::builder(model)
+    .namespaces(&coding)
+    .context_window_tokens(128_000)
+    .annotate_system_prompt("Work only inside the configured project root.")
+    .build()
+    .actor("main")
+    .build()
+    .await?;
+
+let answer = actor.call("Find the largest Rust source file.").await?;
+println!("{answer}");
+actor.shutdown().await?;
+```
+
+For the distinctive kernel without a model loop, embed `lam-deno` directly:
 
 ```rust,ignore
 use lam::{Isolate, Namespace, Never};
@@ -90,173 +112,139 @@ let output = isolate
     .await?;
 ```
 
-Coding authority remains an explicit add-on. The supplied local command runner
-uses the embedding process's host authority; applications can omit it or inject
-a sandboxed runner through the same interface:
+## Crates
 
-```rust,ignore
-use lam::Isolate;
-use lam_code::{CodingPack, FilesystemAccess, LocalCommandRunner};
+| Crate | Responsibility | Use it when |
+| --- | --- | --- |
+| [`lam`](crates/lam/README.md) | Public single-actor facade, model loop, recovery, compaction, and events | Embedding an agent |
+| [`lam-core`](crates/lam-core/README.md) | Provider-independent domain types, append-only journal, projections, and SPIs | Implementing storage, providers, codecs, or compactors |
+| [`lam-deno`](crates/lam-deno/README.md) | Persistent Deno isolate and generic typed builtin bridge | Embedding TypeScript without the actor/model layer |
+| [`lam-redb`](crates/lam-redb/README.md) | Durable `JournalStore` backed by `redb` | Persisting actor state in one embedded database file |
+| [`lam-openai`](crates/lam-openai/README.md) | Lossless Responses and compatible Chat Completions adapters | Connecting OpenAI or a compatible inference provider |
+| [`lam-agents`](crates/lam-agents/README.md) | Bounded isolate scheduler, actor addressing, and `lam.agents` capabilities | Hosting roots and subagents together |
+| [`lam-code`](crates/lam-code/README.md) | Optional filesystem, editing, and command execution capabilities | Building a coding-agent application |
 
-let coding = CodingPack::builder(".")
-    .filesystem_access(FilesystemAccess::ReadWrite)
-    .shell(LocalCommandRunner::default())
-    .build()?;
-let mut isolate = Isolate::builder().namespaces(&coding).build().await?;
-let output = isolate
-    .eval("await lam.fs.read({ path: 'Cargo.toml' })")
-    .await?;
+The dependency boundary is intentional: `lam` remains a straightforward
+single-actor library; provider, persistence, coding, and multi-agent features
+are optional crates layered around it.
+
+## Core contracts
+
+### Persistent capability-oriented TypeScript
+
+Successful evals share lexical and global state. Async Rust functions appear as
+ordinary promises. Each namespace function accepts one typed input and returns
+a typed output or typed error. `lam.dir()` exposes the exact installed manifest;
+`lam.result(value)` makes the final JSON value explicit.
+
+A bare isolate has no filesystem, process, network, npm, or ambient `Deno`
+authority. The kernel-owned TypeScript bootstrap is installed through Deno's
+extension lifecycle and transpiled with the same pinned `deno_ast` used for eval
+cells. There is no npm install, bundling step, or generated runtime artifact.
+
+### Durable actors
+
+Each actor owns one append-only journal containing model selection, admitted
+messages, full provider-native context, and compaction records. A
+`JournalStore` needs only ordered reads and compare-and-append batches. Pure
+projections derive pending work and the effective context.
+
+`Actor::call` is linear and waits for one tool-calling loop to finish.
+`ActorRef::send` returns after durable admission. Steering messages join the
+active run at its next boundary; queued messages wait for that run to finish.
+Recovery creates a fresh isolate, preserves the complete journal, and inserts a
+model-visible notice when an interrupted eval may have had partial effects.
+
+### Provider-native history
+
+Provider codecs translate between the journal and a wire API, but the original
+provider payload remains authoritative. This preserves encrypted reasoning,
+signatures, unknown extension fields, and exact tool-call structure. Computed
+views are used for model-visible replay rather than normalizing away native
+data.
+
+OpenAI Responses always uses `store: false` and manually replays complete native
+output items. Chat Completions stores the native SSE chunks because compatible
+servers do not return a second completed response object after streaming.
+
+### Compaction and model switching
+
+Compaction is configurable and enabled by default at 90% of the declared model
+context window. The portable default produces a summary plus an exact recent
+tail; deterministic truncation and custom `Compactor` implementations are also
+available. The raw journal is never discarded.
+
+Model switching compacts by default, then atomically records a target-compatible
+checkpoint and model selection. Explicit context reuse is available when the
+embedding accepts the compatibility risk. OpenAI's native Responses compaction
+is opt-in and can fall back to the portable strategy.
+
+### Multiple actors
+
+`lam-agents` hosts several thread-affine isolates on a fixed pool of
+current-thread executors. Awaiting async work parks one isolate so a sibling on
+the same worker can progress; synchronous CPU-bound JavaScript occupies that
+worker until it returns or is interrupted.
+
+Actors have canonical paths such as `/root/researcher`. `lam.agents.call`
+creates a persistent child and waits directly for its initial task.
+`lam.agents.spawn` returns after durable admission and later steers a typed
+outcome into the parent's mailbox. Addressed sends are always actor-authenticated
+and steering. Direct-child stop recursively retires a subtree.
+
+## Capability and safety model
+
+lam's default is absence of authority. Capabilities are installed explicitly on
+builders and can be omitted or replaced by application-specific namespaces.
+
+`lam-code` applies path validation, limits, and process cleanup, but these are
+API guardrails—not an operating-system sandbox. Its supplied local command
+runner inherits the embedding process's host authority. A production embedding
+should run lam inside an appropriate OS/container sandbox or inject a sandboxed
+`CommandRunner` when executing untrusted programs.
+
+Eval timeout does not roll back host effects which completed before
+interruption. lam reports the isolate replacement and possible partial effects
+rather than pretending execution was transactional.
+
+## Events and observability
+
+Run streams expose model starts/completions, token deltas, eval calls/results,
+message delivery, compaction, and terminal outcomes. Provider completion events
+include normalized token usage, untouched native usage JSON, and optional
+embedding-supplied cost estimates. The same metadata is emitted through Rust
+`tracing`.
+
+Multi-actor embeddings can take one addressed system event stream containing
+hosted/retired actors, existing run/runtime events, and child outcomes. These
+events are ephemeral UI/observability data; journals and mailboxes remain the
+durable authority.
+
+## Development
+
+The workspace uses Rust 2024 and pins the Deno/V8-facing dependency versions.
+The first build can take a while because it compiles the embedded JavaScript
+runtime stack.
+
+```bash
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --offline -- -D warnings
+cargo test --workspace --all-targets --offline
+cargo rustdoc --workspace --offline -- -D warnings
 ```
 
-OpenAI Responses is stateless by construction: Lam always sends `store: false`,
-requests encrypted reasoning, and manually replays complete native output
-items:
+The default suite is deterministic and does not require network access. Ignored
+live tests use `OPENAI_API_KEY` or `FIREWORKS_API_KEY` and make bounded provider
+requests; they must be enabled explicitly.
 
-```rust,ignore
-use lam::Lam;
-use lam_openai::responses::Responses;
+## Roadmap
 
-let model = Responses::builder("gpt-5.6-luna")
-    .api_key(std::env::var("OPENAI_API_KEY")?)
-    .build()?;
-let mut actor = Lam::builder(model)
-    .context_window_tokens(128_000)
-    .annotate_system_prompt("Work only inside the configured project root.")
-    .build()
-    .actor("main")
-    .build()
-    .await?;
-let answer: String = actor.call("Inspect this project").await?;
-```
+Milestone 1 covers the complete embeddable engine. The next phase is a separate
+TUI package which will produce the `lam` executable while depending on the
+library crate of the same name.
 
-Models are registered under stable host-defined identities. Every new actor
-writes its initial `ModelSelected` event before any messages; reopening resolves
-that durable identity against the supplied registry and rejects missing or
-rebound entries. Switching compacts the complete effective history by default,
-then atomically installs the target-compatible checkpoint and selection.
-Compatible histories may opt into a preflighted reuse instead:
-
-```rust,ignore
-use lam::ModelSwitchPolicy;
-
-let receipt = actor.switch_model("fast").await?;
-let receipt = actor
-    .switch_model_with_policy("deep", ModelSwitchPolicy::ReuseContext)
-    .await?;
-```
-
-OpenAI native compaction is opt-in and composes with the universal summary-tail
-fallback without a capability table or model-name heuristic:
-
-```rust,ignore
-use lam::{FallbackCompactor, Lam, SummaryTailCompactor};
-use lam_openai::responses::{OpenAiResponsesCompactor, Responses};
-
-let model = Responses::builder("gpt-5.6-luna")
-    .api_key(std::env::var("OPENAI_API_KEY")?)
-    .build()?;
-let compactor = FallbackCompactor::new(
-    OpenAiResponsesCompactor::new(&model),
-    SummaryTailCompactor::new(model.clone()),
-);
-let runtime = Lam::builder(model).compactor(compactor).build();
-```
-
-The separate Chat Completions builder accepts compatible provider extensions
-without narrowing their response messages. For Fireworks:
-
-```rust,ignore
-use lam_openai::{ModelPricing, chat_completions::ChatCompletions};
-use serde_json::json;
-
-let model = ChatCompletions::builder("accounts/fireworks/models/MODEL_ID")
-    .api_key(std::env::var("FIREWORKS_API_KEY")?)
-    .base_url("https://api.fireworks.ai/inference/v1")
-    .pricing(ModelPricing::new(0.14, 0.28).cached_input(0.028))
-    .extra_body(json!({
-        "reasoning_effort": "high",
-        "reasoning_history": "preserved"
-    }))
-    .build()?;
-```
-
-Every completed model request emits `RunEvent::ModelCompleted` with the model,
-normalized input/cached-input/output/reasoning/total token counts, the untouched
-provider usage object, and an optional cost. The same fields are emitted through
-Rust `tracing`. Costs are marked `estimated` and appear only when the embedding
-supplies current USD-per-million-token rates; Lam deliberately does not ship a
-price catalog that can silently become stale. Chat Completions requests
-`stream_options.include_usage` by default and can disable it for a compatible
-server that rejects the option.
-
-Lam isolates are thread-affine and deliberately not `Send`, but a local runtime
-may host more than one. Each V8 isolate is parked between future polls and
-entered only while Lam polls or tears down its kernel. Asynchronous evals can
-therefore interleave on one system thread; synchronous CPU-bound JavaScript
-occupies that thread until it returns or its watchdog interrupts it.
-
-`lam-agents` keeps that scheduling policy optional. A root and its children can
-share a bounded executor pool while retaining independent isolates, journals,
-and mailboxes. Child models use direct provider/model identity, and requested
-namespace strings are exact manifest paths rather than profile aliases:
-
-```rust,ignore
-use lam::{Lam, MemStore};
-use lam_agents::{AgentSystem, SubagentConfig};
-
-let system = AgentSystem::builder(MemStore::new())
-    .worker_threads(2)
-    .max_agents(16)
-    .build()?;
-let children: SubagentConfig<MemStore> = SubagentConfig::builder(model.clone())
-    .namespace(read_only_files)
-    .required_instructions("Stay within the configured project root.")
-    .max_depth(2)
-    .build()?;
-let root = system
-    .host_with_subagents(
-        Lam::builder(model)
-            .state_store(system.state_store())
-            .build()
-            .actor("/root"),
-        children,
-    )
-    .await?;
-let answer = root.call("Delegate a read-only investigation").await?;
-system.wait().await?;
-system.shutdown().await?;
-```
-
-Every hosted actor has a canonical Unix-style address. `spawn` requires one
-child-name segment and derives an address such as `/root/researcher`; an
-existing or previously durable child address is never silently reused. It
-returns only after the child's initial, always-steering task is durable.
-`lam.agents.identity()` returns the current address and parent, while
-`lam.agents.list()` lists direct resident children of the current actor (or of
-an explicit `path`). `lam.agents.send({ to, message })` routes to any resident
-address in the same system, durably records authenticated actor provenance,
-and steers an active recipient run. `lam.agents.call` creates a persistent
-child but awaits its initial task directly, while `spawn` delivers the same
-typed completed/failed/cancelled outcome through the parent's durable mailbox
-and wakes an idle parent. `lam.agents.stop` lets an actor retire only its own
-direct child subtree.
-
-For embedding control flow, `AgentSystem::wait()` observes system-wide
-quiescence without terminating idle actors. A single-consumer system event
-stream tags existing `RunEvent` and actor-wide `RuntimeEvent` values with their
-actor address, adds hosted/retired lifecycle transitions and child outcomes,
-and keeps token deltas ephemeral for responsive consumers.
-
-## Workspace
-
-- `lam`: public facade and single-actor model runner
-- `lam-agents`: bounded multi-actor scheduler and subagent capability pack
-- `lam-code`: optional filesystem, editing, and command-runner capability pack
-- `lam-core`: actor journal, mailbox, context, and storage contracts
-- `lam-deno`: embedded Deno isolate and typed builtin bridge
-- `lam-openai`: Responses and compatible Chat Completions providers/codecs
-- `lam-redb`: durable `JournalStore` adapter with versioned redb tables
-
-The future TUI will be distributed as an executable named `lam` from a
-separately named workspace package, so it does not displace the `lam` library
-crate.
+Independent follow-ups include HTTP/webhook capabilities, async monitors,
+interactive approvals, agent-writable storage and content-addressed blobs,
+additional providers, durable topology reconstruction, overload queues,
+rebalancing, and isolate snapshots. They remain outside the minimal core until
+a concrete consumer demonstrates the need.
