@@ -285,7 +285,8 @@ speculative fields in Slice 1.
 
 **Settled.** Each actor owns:
 
-- a stable actor identifier;
+- a stable actor identifier; `lam-agents` constrains this to a canonical,
+  hierarchical absolute address such as `/root/researcher`;
 - a durable inbox;
 - an append-only model-context stream;
 - one resident Deno isolate while scheduled;
@@ -890,11 +891,17 @@ system thread with a current-thread async runtime, actor projection, model loop,
 and persistent isolate. Callers interact through `Actor` and `ActorRef`; the
 thread assignment is not part of their public semantics.
 
-**Deferred to the scheduler slice.** A separate multi-agent layer can build a
-bounded pool of local executor threads atop this primitive, with several parked
-isolates assigned to each thread. Pool sizing, residency limits, wake semantics,
-and overload policy do not belong in the minimal single-agent library. Actor
-isolation and message passing remain independent of those policy choices.
+**Implemented as an optional layer.** `ActorBuilder::build_task` exposes the
+same actor runner as a non-`Send` task for an external local executor. The
+ordinary `ActorBuilder::build` remains a thin dedicated-thread wrapper around
+that lifecycle. `lam-agents` uses the lower-level form to host multiple parked
+isolates on each member of a bounded current-thread executor pool; none of this
+policy enters the minimal single-agent dependency graph.
+
+The initial pool assigns new actors round-robin, bounds building plus resident
+actors, and leaves a resident isolate pinned to its assigned worker. Async model
+calls and builtins yield normally. CPU-bound JavaScript retains the already
+settled watchdog limitation.
 
 ### Actor serialization
 
@@ -1013,10 +1020,30 @@ restart behavior, and durability need a focused design before implementation.
 
 ### Subagents
 
-**Deferred until the base actor works.** A subagent is constructed through the
-same public actor machinery, gets its own store records and isolate, and
-communicates through always-steering messages. The subagent standard library
-can be disabled by the builder.
+**Initial vertical slice implemented.** A subagent is constructed through the
+same public actor machinery, gets its own journal and isolate, and receives its
+initial task as an always-steering `MessageSource::Actor` message.
+`SubagentConfig` is an explicit value rather than a named-profile registry. It
+defines directly selectable provider/model pairs, the maximum extension
+namespace set, required prompt annotations, nesting depth, eval limits, and
+console capture. Omitting `namespaces` grants that configured set; an explicit
+array grants the exact validated subset. `lam.dir` and `lam.result` are always
+implicit, while selecting `lam.agents` grants the generated interaction
+surface. At the configured depth limit that surface retains identity, listing,
+and addressed messaging but omits recursive spawning.
+
+The generated capability includes `identity`, `list`, `spawn`, and `send`.
+Actors use canonical Unix-style addresses: `spawn` accepts one required name
+segment and derives a direct child path, while `identity` returns the current
+address and its derived parent. `list()` returns direct resident children of
+the current address; an explicit `path` lists another namespace. Spawn is
+create-only and returns after the initial task is durably queued, so an address
+which is resident, launching, or already durable is never silently reused.
+Send requires an explicit recipient address, admits one structured value with
+authenticated actor provenance, and always steers an active recipient. Any
+resident actor in the same `AgentSystem` is addressable. Completion protocols,
+wait semantics, and durable reconstruction of the live topology remain later
+design boundaries rather than being guessed in this pass.
 
 ## Provider abstraction
 
@@ -1073,6 +1100,7 @@ The workspace currently contains:
 │   └── PLAN.md
 └── crates/
     ├── lam/
+    ├── lam-agents/
     ├── lam-core/
     ├── lam-deno/
     ├── lam-openai/
@@ -1092,6 +1120,13 @@ delivery semantics, provider/codec/store traits, projections, `MemStore`, actor
 state machine, scheduler-facing contracts, and deterministic tests.
 
 It must not depend on V8 or `deno_core`.
+
+### `lam-agents`
+
+The optional bounded scheduler and subagent capability pack. It depends on the
+public `lam` facade, hosts `ActorTask`s on local worker executors, owns resident
+actor handles, and generates the manifest-driven `lam.agents` namespace from an
+explicit `SubagentConfig`. `lam` does not depend on it.
 
 ### `lam-deno`
 
@@ -1118,7 +1153,7 @@ facade so its builders can return a ready-to-use `Model`.
 
 Additional provider families, standard-library capability packs, and the TUI
 may become separate crates when their boundaries are demonstrated. We will not
-create empty crates for speculative boundaries now.
+create empty crates for speculative boundaries.
 
 ### TUI package and executable naming
 
@@ -1509,12 +1544,45 @@ composition.
 
 ### Slice 7: scheduler and multiple actors
 
-Add a separate multi-agent crate for bounded actor residency, cross-actor
-steering, subagent construction, and scheduler limits. It should use a bounded
-set of local executor threads, assign several parked isolates to each, and make
-async actor waits suspend the caller rather than block its worker. The slice
-must settle pool sizing, residency, wake, shutdown, and overload semantics; the
-low-level same-thread isolate lifecycle is already established in `lam-deno`.
+**First vertical slice implemented.** `lam-agents` now provides:
+
+- a configurable fixed-size pool of current-thread executors, with one worker
+  and a 64-actor bound as lightweight defaults;
+- round-robin actor assignment and multiple parked isolates per worker;
+- a shared `JournalStore` handle, a hard bound over building plus resident
+  actors, and explicit capacity failure before construction;
+- `AgentSystem::host` for ordinary roots, `host_with_subagents` for roots whose
+  identity-bound capability pack is derived without duplicate caller input,
+  canonical `ActorAddress` validation, and a cloneable embedded `Agent` handle
+  with serialized text and structured calls;
+- deterministic `shutdown` and `abort`, both of which wait for actor tasks and
+  join the workers; dropping the final system or agent owner signals graceful
+  shutdown without blocking;
+- explicit `SubagentConfig` values with direct `{ provider, model }` identity,
+  namespace subset enforcement, replacement `systemPrompt`, appended
+  `instructions`, host-required annotations, nesting depth, and eval limits;
+- manifest-generated `lam.agents.identity`, `list`, `spawn`, and addressed
+  `send` functions whose docs reflect the actual configured capabilities;
+- hierarchical, arbitrary-depth paths; collision-safe launch reservations;
+  create-only child startup which refuses durable path reuse; and direct-child
+  resident listing with the current namespace as the no-argument default;
+- immediate spawn receipts only after the actor-sourced, always-steering task
+  is present in the child's journal, plus child sends that are durable before
+  their receipt returns and steer the parent's active run;
+- arbitrary resident actor routing and cancellation handles outside the linear
+  call-owner lock, cancellation-safe initial task admission, stopped-task
+  retirement, and serialized shutdown waiters with abort escalation.
+
+The implementation reuses two small general primitives rather than introducing
+a second runtime: `Namespace` definitions are cheaply cloneable, and
+`JournalStore` delegates through `Arc<S>`. The existing single-actor API and its
+dedicated-thread behavior remain unchanged.
+
+**Deferred to Slice 7B.** Child completion and wait/wake semantics, child
+lifecycle controls exposed to TypeScript, durable reconstruction of which
+actors are resident, overload queues, rebalancing, and migration are not part
+of this vertical slice. Agent waits must eventually be async builtin boundaries
+so a parent suspends without blocking a sibling isolate on the same worker.
 
 ### Slice 8: coding-agent capability pack
 

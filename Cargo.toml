@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/lam",
+    "crates/lam-agents",
     "crates/lam-core",
     "crates/lam-deno",
     "crates/lam-openai",

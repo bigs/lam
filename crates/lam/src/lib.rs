@@ -4,6 +4,7 @@
 //! state, and provider-neutral model loop behind one embeddable facade.
 
 mod actor;
+mod actor_task;
 mod command;
 mod compaction;
 mod compaction_engine;
@@ -22,6 +23,7 @@ pub use actor::{
     AbortHandle, Actor, ActorBuilder, ActorRef, Clock, Lam, LamBuilder, LamRuntime, MessageReceipt,
     ModelSwitchPolicy, ModelSwitchReceipt, SystemClock,
 };
+pub use actor_task::ActorTask;
 pub use compaction::{
     CompactionReceipt, FallbackCompactor, SummaryTailCompactor, TruncateOldestCompactor,
 };

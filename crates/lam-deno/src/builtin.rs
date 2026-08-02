@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use schemars::{JsonSchema, schema_for};
 use serde::de::DeserializeOwned;
@@ -70,10 +71,11 @@ pub(crate) struct NamespaceDescriptor {
 }
 
 /// A typed namespace which can be installed into an isolate.
+#[derive(Clone)]
 pub struct Namespace {
     path: String,
     docs: String,
-    functions: Vec<Box<dyn ErasedBuiltin>>,
+    functions: Vec<Arc<dyn ErasedBuiltin>>,
 }
 
 impl Namespace {
@@ -85,6 +87,12 @@ impl Namespace {
             docs: docs.into(),
             functions: Vec::new(),
         }
+    }
+
+    /// Returns the fully-qualified JavaScript path for capability selection.
+    #[must_use]
+    pub fn path(&self) -> &str {
+        &self.path
     }
 
     /// Adds a typed async Rust function to this namespace.
@@ -106,7 +114,7 @@ impl Namespace {
         F: Fn(OperationContext, I) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<O, E>> + Send + 'static,
     {
-        self.functions.push(Box::new(TypedBuiltin {
+        self.functions.push(Arc::new(TypedBuiltin {
             descriptor: FunctionDescriptor {
                 name: name.into(),
                 docs: docs.into(),
@@ -213,7 +221,7 @@ pub(crate) enum InvocationError {
 
 pub(crate) struct Registry {
     namespaces: Vec<NamespaceDescriptor>,
-    functions: BTreeMap<(String, String), Box<dyn ErasedBuiltin>>,
+    functions: BTreeMap<(String, String), Arc<dyn ErasedBuiltin>>,
 }
 
 impl Registry {

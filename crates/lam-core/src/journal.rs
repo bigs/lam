@@ -1,6 +1,7 @@
 use std::error::Error;
 use std::future::Future;
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 
 use crate::{ActorEvent, ActorId, Revision};
 
@@ -120,4 +121,29 @@ pub trait JournalStore: Send + Sync {
         expected: Revision,
         events: EventBatch,
     ) -> impl Future<Output = Result<AppendOutcome, JournalError<Self::Error>>> + Send;
+}
+
+impl<S> JournalStore for Arc<S>
+where
+    S: JournalStore + ?Sized,
+{
+    type Error = S::Error;
+
+    fn read(
+        &self,
+        actor: &ActorId,
+        after: Revision,
+        limit: NonZeroUsize,
+    ) -> impl Future<Output = Result<JournalPage, JournalError<Self::Error>>> + Send {
+        (**self).read(actor, after, limit)
+    }
+
+    fn append(
+        &self,
+        actor: &ActorId,
+        expected: Revision,
+        events: EventBatch,
+    ) -> impl Future<Output = Result<AppendOutcome, JournalError<Self::Error>>> + Send {
+        (**self).append(actor, expected, events)
+    }
 }

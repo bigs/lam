@@ -4,6 +4,12 @@ pub enum ActorBuildError {
     /// The actor identifier was empty.
     #[error(transparent)]
     InvalidActorId(#[from] lam_core::InvalidIdentifier),
+    /// Create-only startup found durable state at the requested identity.
+    #[error("actor `{actor_id}` already exists")]
+    ActorAlreadyExists {
+        /// Identity whose journal is already nonempty.
+        actor_id: lam_core::ActorId,
+    },
     /// A configured model registry identity was empty.
     #[error("invalid model id: {0}")]
     InvalidModelId(#[source] lam_core::InvalidIdentifier),

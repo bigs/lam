@@ -48,6 +48,9 @@ adapter crates. They provide:
 - a heterogeneous model registry with durable selection, compact-by-default
   switching, an explicit context-reuse policy, and atomic checkpoint/selection
   commits;
+- an optional bounded `lam-agents` executor pool whose manifest-generated
+  `lam.agents` capability creates hierarchically addressed child actors with
+  explicit model, namespace, prompt, and depth policy;
 - a pure-Rust `redb` journal backend; and
 - lossless OpenAI Responses and OpenAI-compatible Chat Completions adapters,
   including explicitly configured native OpenAI Responses compaction, with
@@ -171,9 +174,52 @@ entered only while Lam polls or tears down its kernel. Asynchronous evals can
 therefore interleave on one system thread; synchronous CPU-bound JavaScript
 occupies that thread until it returns or its watchdog interrupts it.
 
+`lam-agents` keeps that scheduling policy optional. A root and its children can
+share a bounded executor pool while retaining independent isolates, journals,
+and mailboxes. Child models use direct provider/model identity, and requested
+namespace strings are exact manifest paths rather than profile aliases:
+
+```rust,ignore
+use lam::{Lam, MemStore};
+use lam_agents::{AgentSystem, SubagentConfig};
+
+let system = AgentSystem::builder(MemStore::new())
+    .worker_threads(2)
+    .max_agents(16)
+    .build()?;
+let children: SubagentConfig<MemStore> = SubagentConfig::builder(model.clone())
+    .namespace(read_only_files)
+    .required_instructions("Stay within the configured project root.")
+    .max_depth(2)
+    .build()?;
+let root = system
+    .host_with_subagents(
+        Lam::builder(model)
+            .state_store(system.state_store())
+            .build()
+            .actor("/root"),
+        children,
+    )
+    .await?;
+let answer = root.call("Delegate a read-only investigation").await?;
+system.shutdown().await?;
+```
+
+Every hosted actor has a canonical Unix-style address. `spawn` requires one
+child-name segment and derives an address such as `/root/researcher`; an
+existing or previously durable child address is never silently reused. It
+returns only after the child's initial, always-steering task is durable.
+`lam.agents.identity()` returns the current address and parent, while
+`lam.agents.list()` lists direct resident children of the current actor (or of
+an explicit `path`). `lam.agents.send({ to, message })` routes to any resident
+address in the same system, durably records authenticated actor provenance,
+and steers an active recipient run. Completion and wait APIs remain separate
+follow-up work.
+
 ## Workspace
 
 - `lam`: public facade and single-actor model runner
+- `lam-agents`: bounded multi-actor scheduler and subagent capability pack
 - `lam-core`: actor journal, mailbox, context, and storage contracts
 - `lam-deno`: embedded Deno isolate and typed builtin bridge
 - `lam-openai`: Responses and compatible Chat Completions providers/codecs

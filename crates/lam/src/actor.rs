@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::JoinHandle;
@@ -20,9 +21,10 @@ use crate::prompt::SystemPrompt;
 use crate::recovery::recover_actor;
 use crate::runner::ActorRunner;
 use crate::runtime_journal::{admit_message, ensure_model_selection, load_state};
-use crate::{ActorBuildError, ActorError, Model, Run, RuntimeEvents};
+use crate::{ActorBuildError, ActorError, ActorTask, Model, Run, RuntimeEvents};
 
 const RUNTIME_EVENT_BUFFER: usize = 256;
+const ACTOR_EXISTENCE_PROBE: NonZeroUsize = NonZeroUsize::new(1).expect("one is nonzero");
 
 /// How an explicit model switch treats existing model-visible context.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -355,7 +357,7 @@ impl<S> LamRuntime<S> {
     }
 }
 
-/// Starts the dedicated runner for one actor.
+/// Starts one actor on a dedicated thread or an external local executor.
 pub struct ActorBuilder<S> {
     actor_id: Result<ActorId, lam_core::InvalidIdentifier>,
     initial_model_id: Result<ModelId, lam_core::InvalidIdentifier>,
@@ -376,44 +378,33 @@ impl<S> ActorBuilder<S>
 where
     S: JournalStore + 'static,
 {
+    /// Returns the actor identity selected for this builder.
+    ///
+    /// Multi-actor hosts use this before startup to bind actor-local
+    /// capabilities without asking callers to repeat the identity.
+    pub fn actor_id(&self) -> Result<&ActorId, &lam_core::InvalidIdentifier> {
+        self.actor_id.as_ref()
+    }
+
+    /// Registers one Rust-backed TypeScript namespace after actor selection.
+    #[must_use]
+    pub fn namespace(mut self, namespace: Namespace) -> Self {
+        self.namespaces.push(namespace);
+        self
+    }
+
+    /// Appends actor-specific instructions after actor selection.
+    #[must_use]
+    pub fn annotate_system_prompt(mut self, instructions: impl Into<String>) -> Self {
+        self.system_prompt.annotate(instructions);
+        self
+    }
+
     /// Builds the persistent isolate on its dedicated actor thread.
     pub async fn build(self) -> Result<Actor<S>, ActorBuildError> {
-        let actor_id = self.actor_id?;
-        let initial_model_id = self
-            .initial_model_id
-            .map_err(ActorBuildError::InvalidModelId)?;
-        let mut models = BTreeMap::new();
-        models.insert(initial_model_id.clone(), self.initial_model);
-        for pending in self.additional_models {
-            let model_id = pending.id.map_err(ActorBuildError::InvalidModelId)?;
-            if models.insert(model_id.clone(), pending.model).is_some() {
-                return Err(ActorBuildError::DuplicateModelId { model_id });
-            }
-        }
-        if !self.compaction_enabled {
-            for model in models.values_mut() {
-                model.compactor = None;
-            }
-        }
-        self.compaction_config
-            .validate()
-            .map_err(ActorBuildError::InvalidCompactionConfig)?;
-        let actor_name = actor_id.to_string();
-        let store = Arc::new(self.store);
-        let ids = Arc::new(RuntimeIds::new());
-        let call_active = Arc::new(AtomicBool::new(false));
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let (commands, receiver) = mpsc::unbounded_channel();
-        let (runtime_event_sender, runtime_event_receiver) = mpsc::channel(RUNTIME_EVENT_BUFFER);
-        let (abort, abort_receiver) = watch::channel(false);
+        let prepared = PreparedActor::from_builder(self)?;
+        let actor_name = prepared.actor_id.to_string();
         let (initialized, initialization) = oneshot::channel();
-        let (stopped_sender, stopped) = oneshot::channel();
-
-        let runner_actor_id = actor_id.clone();
-        let runner_store = Arc::clone(&store);
-        let runner_ids = Arc::clone(&ids);
-        let runner_clock = Arc::clone(&self.clock);
-        let runner_shutdown = Arc::clone(&shutdown);
         let join = std::thread::Builder::new()
             .name(format!("lam-{actor_name}"))
             .spawn(move || {
@@ -423,114 +414,32 @@ where
                 {
                     Ok(runtime) => runtime,
                     Err(error) => {
-                        let _ = initialized.send(Err(error.to_string()));
-                        let _ = stopped_sender.send(());
+                        let _ = initialized.send(Err(ActorBuildError::Initialization {
+                            message: error.to_string(),
+                        }));
                         return;
                     }
                 };
                 runtime.block_on(async move {
-                    let mut isolate_builder = Isolate::builder();
-                    for namespace in self.namespaces {
-                        isolate_builder = isolate_builder.namespace(namespace);
-                    }
-                    if let Some(timeout) = self.default_timeout {
-                        isolate_builder = isolate_builder.default_timeout(timeout);
-                    }
-                    if let Some(timeout) = self.max_timeout {
-                        isolate_builder = isolate_builder.max_timeout(timeout);
-                    }
-                    isolate_builder = isolate_builder.capture_console(self.capture_console);
-                    let isolate = match isolate_builder.build().await {
-                        Ok(isolate) => isolate,
-                        Err(error) => {
-                            let _ = initialized.send(Err(error.to_string()));
-                            return;
+                    match prepared.start(false).await {
+                        Ok((actor, task)) => {
+                            if initialized.send(Ok(actor)).is_ok() {
+                                task.await;
+                            }
                         }
-                    };
-                    let system_prompt = self.system_prompt.render(&isolate.api_inventory());
-                    let interrupt = isolate.interrupt_handle();
-                    let initial_descriptor = models
-                        .get(&initial_model_id)
-                        .expect("the initial model was inserted")
-                        .descriptor()
-                        .clone();
-                    let initial_selection =
-                        ModelSelection::new(initial_model_id, initial_descriptor);
-                    let (state, created) = match ensure_model_selection(
-                        runner_store.as_ref(),
-                        &runner_actor_id,
-                        initial_selection,
-                    )
-                    .await
-                    {
-                        Ok(result) => result,
                         Err(error) => {
-                            let _ = initialized.send(Err(error.to_string()));
-                            return;
+                            let _ = initialized.send(Err(error));
                         }
-                    };
-                    let selection = state
-                        .selected_model()
-                        .expect("model initialization establishes a selection");
-                    let Some(selected_model) = models.get(&selection.model_id) else {
-                        let _ = initialized.send(Err(format!(
-                            "durable model `{}` is not present in the runtime registry",
-                            selection.model_id
-                        )));
-                        return;
-                    };
-                    if selected_model.descriptor() != &selection.descriptor {
-                        let _ = initialized.send(Err(format!(
-                            "durable model `{}` descriptor does not match the runtime registry",
-                            selection.model_id
-                        )));
-                        return;
                     }
-                    let recovery = match recover_actor(
-                        &runner_actor_id,
-                        runner_store.as_ref(),
-                        selected_model,
-                        runner_clock.as_ref(),
-                        runner_ids.as_ref(),
-                        !created,
-                    )
-                    .await
-                    {
-                        Ok(recovery) => recovery,
-                        Err(error) => {
-                            let _ = initialized.send(Err(error.to_string()));
-                            return;
-                        }
-                    };
-                    if let Some(event) = recovery.event {
-                        let _ = runtime_event_sender.try_send(event);
-                    }
-                    let runner = ActorRunner {
-                        actor_id: runner_actor_id,
-                        store: runner_store,
-                        models,
-                        clock: runner_clock,
-                        ids: runner_ids,
-                        isolate,
-                        system_prompt,
-                        compaction_config: self.compaction_config,
-                        commands: receiver,
-                        abort: abort_receiver,
-                        shutdown: runner_shutdown,
-                        runtime_events: runtime_event_sender,
-                    };
-                    let _ = initialized.send(Ok(interrupt));
-                    runner.run(recovery.wake).await;
                 });
-                let _ = stopped_sender.send(());
             })
             .map_err(ActorBuildError::ThreadSpawn)?;
 
-        let interrupt = match initialization.await {
-            Ok(Ok(interrupt)) => interrupt,
-            Ok(Err(message)) => {
+        let mut actor = match initialization.await {
+            Ok(Ok(actor)) => actor,
+            Ok(Err(error)) => {
                 let _ = join.join();
-                return Err(ActorBuildError::Initialization { message });
+                return Err(error);
             }
             Err(_closed) => {
                 let _ = join.join();
@@ -539,23 +448,214 @@ where
                 });
             }
         };
+        actor.thread = Some(join);
+        Ok(actor)
+    }
 
-        let actor_ref = ActorRef {
+    /// Builds the persistent isolate for an external current-thread executor.
+    ///
+    /// The returned non-`Send` task must be polled on the same local executor
+    /// where this method is awaited. This is the lower-level lifecycle used by
+    /// multi-actor schedulers; most embeddings should use [`Self::build`].
+    pub async fn build_task(self) -> Result<(Actor<S>, ActorTask), ActorBuildError> {
+        PreparedActor::from_builder(self)?.start(false).await
+    }
+
+    /// Builds a new actor for an external current-thread executor.
+    ///
+    /// Unlike [`Self::build_task`], this rejects an identity with any durable
+    /// history. Multi-actor schedulers use it to make spawning create-only
+    /// while keeping ordinary actor startup resumable.
+    pub async fn build_new_task(self) -> Result<(Actor<S>, ActorTask), ActorBuildError> {
+        PreparedActor::from_builder(self)?.start(true).await
+    }
+}
+
+struct PreparedActor<S> {
+    actor_id: ActorId,
+    initial_model_id: ModelId,
+    models: BTreeMap<ModelId, RegisteredModel>,
+    store: S,
+    namespaces: Vec<Namespace>,
+    default_timeout: Option<Duration>,
+    max_timeout: Option<Duration>,
+    capture_console: bool,
+    clock: Arc<dyn Clock>,
+    system_prompt: SystemPrompt,
+    compaction_config: CompactionConfig,
+}
+
+impl<S> PreparedActor<S>
+where
+    S: JournalStore + 'static,
+{
+    fn from_builder(builder: ActorBuilder<S>) -> Result<Self, ActorBuildError> {
+        let actor_id = builder.actor_id?;
+        let initial_model_id = builder
+            .initial_model_id
+            .map_err(ActorBuildError::InvalidModelId)?;
+        let mut models = BTreeMap::new();
+        models.insert(initial_model_id.clone(), builder.initial_model);
+        for pending in builder.additional_models {
+            let model_id = pending.id.map_err(ActorBuildError::InvalidModelId)?;
+            if models.insert(model_id.clone(), pending.model).is_some() {
+                return Err(ActorBuildError::DuplicateModelId { model_id });
+            }
+        }
+        if !builder.compaction_enabled {
+            for model in models.values_mut() {
+                model.compactor = None;
+            }
+        }
+        builder
+            .compaction_config
+            .validate()
+            .map_err(ActorBuildError::InvalidCompactionConfig)?;
+
+        Ok(Self {
             actor_id,
+            initial_model_id,
+            models,
+            store: builder.store,
+            namespaces: builder.namespaces,
+            default_timeout: builder.default_timeout,
+            max_timeout: builder.max_timeout,
+            capture_console: builder.capture_console,
+            clock: builder.clock,
+            system_prompt: builder.system_prompt,
+            compaction_config: builder.compaction_config,
+        })
+    }
+
+    async fn start(self, create_only: bool) -> Result<(Actor<S>, ActorTask), ActorBuildError> {
+        let store = Arc::new(self.store);
+        if create_only
+            && store
+                .read(&self.actor_id, Revision::ZERO, ACTOR_EXISTENCE_PROBE)
+                .await
+                .map_err(initialization_error)?
+                .head
+                != Revision::ZERO
+        {
+            return Err(ActorBuildError::ActorAlreadyExists {
+                actor_id: self.actor_id,
+            });
+        }
+        let ids = Arc::new(RuntimeIds::new());
+        let call_active = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (commands, receiver) = mpsc::unbounded_channel();
+        let (runtime_event_sender, runtime_event_receiver) = mpsc::channel(RUNTIME_EVENT_BUFFER);
+        let (abort, abort_receiver) = watch::channel(false);
+        let (stopped_sender, stopped) = oneshot::channel();
+
+        let mut isolate_builder = Isolate::builder();
+        for namespace in self.namespaces {
+            isolate_builder = isolate_builder.namespace(namespace);
+        }
+        if let Some(timeout) = self.default_timeout {
+            isolate_builder = isolate_builder.default_timeout(timeout);
+        }
+        if let Some(timeout) = self.max_timeout {
+            isolate_builder = isolate_builder.max_timeout(timeout);
+        }
+        isolate_builder = isolate_builder.capture_console(self.capture_console);
+        let isolate = isolate_builder
+            .build()
+            .await
+            .map_err(initialization_error)?;
+        let system_prompt = self.system_prompt.render(&isolate.api_inventory());
+        let interrupt = isolate.interrupt_handle();
+        let initial_descriptor = self
+            .models
+            .get(&self.initial_model_id)
+            .expect("the initial model was inserted")
+            .descriptor()
+            .clone();
+        let initial_selection = ModelSelection::new(self.initial_model_id, initial_descriptor);
+        let (state, created) =
+            ensure_model_selection(store.as_ref(), &self.actor_id, initial_selection)
+                .await
+                .map_err(initialization_error)?;
+        if create_only && !created {
+            return Err(ActorBuildError::ActorAlreadyExists {
+                actor_id: self.actor_id,
+            });
+        }
+        let selection = state
+            .selected_model()
+            .expect("model initialization establishes a selection");
+        let selected_model = self.models.get(&selection.model_id).ok_or_else(|| {
+            ActorBuildError::Initialization {
+                message: format!(
+                    "durable model `{}` is not present in the runtime registry",
+                    selection.model_id
+                ),
+            }
+        })?;
+        if selected_model.descriptor() != &selection.descriptor {
+            return Err(ActorBuildError::Initialization {
+                message: format!(
+                    "durable model `{}` descriptor does not match the runtime registry",
+                    selection.model_id
+                ),
+            });
+        }
+        let recovery = recover_actor(
+            &self.actor_id,
+            store.as_ref(),
+            selected_model,
+            self.clock.as_ref(),
+            ids.as_ref(),
+            !created,
+        )
+        .await
+        .map_err(initialization_error)?;
+        if let Some(event) = recovery.event {
+            let _ = runtime_event_sender.try_send(event);
+        }
+
+        let runner = ActorRunner {
+            actor_id: self.actor_id.clone(),
+            store: Arc::clone(&store),
+            models: self.models,
+            clock: Arc::clone(&self.clock),
+            ids: Arc::clone(&ids),
+            isolate,
+            system_prompt,
+            compaction_config: self.compaction_config,
+            commands: receiver,
+            abort: abort_receiver,
+            shutdown: Arc::clone(&shutdown),
+            runtime_events: runtime_event_sender,
+        };
+        let actor_ref = ActorRef {
+            actor_id: self.actor_id,
             store,
             commands: commands.clone(),
             clock: self.clock,
             ids,
         };
-        Ok(Actor {
+        let actor = Actor {
             actor_ref,
             call_active,
             shutdown,
-            thread: Some(join),
+            thread: None,
             stopped: Some(stopped),
             abort_handle: AbortHandle { interrupt, abort },
             runtime_events: Some(RuntimeEvents::new(runtime_event_receiver)),
-        })
+        };
+        let task = ActorTask::new(async move {
+            runner.run(recovery.wake).await;
+            let _ = stopped_sender.send(());
+        });
+        Ok((actor, task))
+    }
+}
+
+fn initialization_error(error: impl std::fmt::Display) -> ActorBuildError {
+    ActorBuildError::Initialization {
+        message: error.to_string(),
     }
 }
 
@@ -679,42 +779,42 @@ where
         )
     }
 
-    /// Gracefully stops this actor and waits for its dedicated thread to exit.
+    /// Gracefully stops this actor and waits for its runner to exit.
     ///
     /// The currently executing command is allowed to finish. Pending durable
     /// mailbox messages are not discarded.
     pub async fn shutdown(mut self) -> Result<(), ActorError> {
         self.shutdown.store(true, Ordering::Release);
         let _ = self.actor_ref.commands.send(RunnerCommand::Shutdown);
-        self.join_thread().await
+        self.join_runner().await
     }
 
-    /// Forcefully aborts current work and waits for the actor thread to exit.
+    /// Forcefully aborts current work and waits for the actor runner to exit.
     ///
     /// Provider futures are dropped and active JavaScript is interrupted. Host
     /// effects which completed before interruption are not rolled back.
     pub async fn abort(mut self) -> Result<(), ActorError> {
         self.abort_handle.abort();
-        self.join_thread().await
+        self.join_runner().await
     }
 
-    async fn join_thread(&mut self) -> Result<(), ActorError> {
-        let Some(thread) = self.thread.take() else {
-            return Ok(());
-        };
+    async fn join_runner(&mut self) -> Result<(), ActorError> {
         if let Some(stopped) = self.stopped.take() {
             let _ = stopped.await;
         }
-        thread.join().map_err(|panic| ActorError::RunnerJoin {
-            message: panic_message(panic),
-        })
+        if let Some(thread) = self.thread.take() {
+            thread.join().map_err(|panic| ActorError::RunnerJoin {
+                message: panic_message(panic),
+            })?;
+        }
+        Ok(())
     }
 }
 
 /// Cloneable, explicit authority to forcefully stop an actor runtime.
 ///
 /// Signalling is synchronous. Use [`Actor::abort`] on the linear owner when
-/// the caller must also wait for the dedicated thread to exit.
+/// the caller must also wait for the actor runner to exit.
 #[derive(Clone)]
 pub struct AbortHandle {
     interrupt: IsolateInterrupt,
@@ -734,7 +834,7 @@ where
     S: JournalStore + 'static,
 {
     fn drop(&mut self) {
-        if self.thread.is_some() {
+        if self.stopped.is_some() {
             self.shutdown.store(true, Ordering::Release);
             let _ = self.actor_ref.commands.send(RunnerCommand::Shutdown);
         }
@@ -802,8 +902,43 @@ where
     where
         T: Serialize,
     {
+        self.send_with_source(input, MessageSource::User { principal: None }, delivery)
+            .await
+    }
+
+    /// Durably admits a value sent by another actor, then wakes this runner.
+    ///
+    /// Multi-actor routers use this entry point so durable provenance remains
+    /// distinct from user and host input. Delivery is always steering.
+    pub async fn send_from_actor<T>(
+        &self,
+        sender: &ActorRef<S>,
+        input: T,
+    ) -> Result<MessageReceipt, ActorError>
+    where
+        T: Serialize,
+    {
+        self.send_with_source(
+            input,
+            MessageSource::Actor {
+                actor_id: sender.actor_id.clone(),
+            },
+            DeliveryMode::Steer,
+        )
+        .await
+    }
+
+    async fn send_with_source<T>(
+        &self,
+        input: T,
+        source: MessageSource,
+        delivery: DeliveryMode,
+    ) -> Result<MessageReceipt, ActorError>
+    where
+        T: Serialize,
+    {
         let message_id = self.ids.message_id();
-        let message = self.user_message(message_id, input, delivery)?;
+        let message = self.message(message_id, source, input, delivery)?;
         let receipt = admit_message(self.store.as_ref(), &self.actor_id, message).await?;
         let _ = self.commands.send(RunnerCommand::Wake);
         Ok(receipt)
@@ -818,20 +953,33 @@ where
     where
         T: Serialize,
     {
+        self.message(
+            message_id,
+            MessageSource::User { principal: None },
+            input,
+            delivery,
+        )
+    }
+
+    fn message<T>(
+        &self,
+        message_id: MessageId,
+        source: MessageSource,
+        input: T,
+        delivery: DeliveryMode,
+    ) -> Result<MessageEnvelope, ActorError>
+    where
+        T: Serialize,
+    {
         let payload =
             EncodedPayload::lam_json(input).map_err(|error| ActorError::InputSerialization {
                 message: error.to_string(),
             })?;
-        MessageEnvelope::new(
-            message_id,
-            MessageSource::User { principal: None },
-            delivery,
-            payload,
-            self.clock.now(),
+        MessageEnvelope::new(message_id, source, delivery, payload, self.clock.now()).map_err(
+            |error| ActorError::State {
+                message: error.to_string(),
+            },
         )
-        .map_err(|error| ActorError::State {
-            message: error.to_string(),
-        })
     }
 }
 
