@@ -9,10 +9,9 @@ execution, application APIs, subagents—is a typed Rust capability surfaced to
 that TypeScript environment. This keeps the model interface tiny without
 limiting what an embedding can safely choose to provide.
 
-**Status:** Milestone 1, the embeddable agent engine, is complete. The APIs are
-usable and extensively tested, but the project is still experimental and may
-change before a stable release. The interactive `lam` TUI is the next major
-phase.
+**Status:** Milestone 1, the embeddable agent engine, is complete. The first
+interactive `lam` TUI milestone is also available. The project is still
+experimental and may change before a stable release.
 
 The complete architecture and decision record lives in
 [`docs/PLAN.md`](docs/PLAN.md).
@@ -123,6 +122,7 @@ let output = isolate
 | [`lam-openai`](crates/lam-openai/README.md) | Lossless Responses and compatible Chat Completions adapters | Connecting OpenAI or a compatible inference provider |
 | [`lam-agents`](crates/lam-agents/README.md) | Bounded isolate scheduler, actor addressing, and `lam.agents` capabilities | Hosting roots and subagents together |
 | [`lam-code`](crates/lam-code/README.md) | Optional filesystem, editing, and command execution capabilities | Building a coding-agent application |
+| [`lam-tui`](crates/lam-tui/README.md) | Ratatui executable, provider configuration, and interactive transcript | Running Lam as a coding agent |
 
 The dependency boundary is intentional: `lam` remains a straightforward
 single-actor library; provider, persistence, coding, and multi-agent features
@@ -237,11 +237,16 @@ The default suite is deterministic and does not require network access. Ignored
 live tests use `OPENAI_API_KEY` or `FIREWORKS_API_KEY` and make bounded provider
 requests; they must be enabled explicitly.
 
-## Roadmap
+## Interactive TUI
 
-Milestone 1 covers the complete embeddable engine. The next phase is a separate
-TUI package which will produce the `lam` executable while depending on the
-library crate of the same name.
+The separate `lam-tui` package produces the `lam` executable while depending
+on the library crate of the same name. It loads `~/.lam/providers.toml`, starts
+the coding and multi-agent capability packs in the current directory, and
+renders a responsive conversation with expandable eval and lifecycle rows.
+See [`crates/lam-tui/README.md`](crates/lam-tui/README.md) for configuration and
+key bindings.
+
+## Roadmap
 
 Independent follow-ups include HTTP/webhook capabilities, async monitors,
 interactive approvals, agent-writable storage and content-addressed blobs,

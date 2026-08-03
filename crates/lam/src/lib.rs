@@ -49,7 +49,8 @@ pub use lam_core::{
     ModelCostSource, ModelDelta, ModelDescriptor, ModelDirective, ModelEventSink, ModelId,
     ModelProvider, ModelRequestConfig, ModelResponseMetadata, ModelSelection, OutputContract,
     PrincipalId, ProjectedContextEntry, Revision, RunId, RunProgress, StateError, StoredEvent,
-    Timestamp, TokenUsage, atomic_compaction_units, compaction_prefix_len, estimate_entry_tokens,
+    Timestamp, TokenUsage, ToolCallDelta, atomic_compaction_units, compaction_prefix_len,
+    estimate_entry_tokens,
 };
 pub use lam_deno::{
     ConsoleEntry, ConsoleLevel, EvalError, EvalOptions, EvalOutput, EvalValue, Isolate,

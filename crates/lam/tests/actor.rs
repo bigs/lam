@@ -845,6 +845,8 @@ async fn default_system_prompt_describes_the_installed_manifest() {
         .as_str()
         .expect("scripted codec records the system prompt");
     assert!(prompt.starts_with("You are a coding agent with one tool, `eval`"));
+    assert!(prompt.contains("not a general Node.js or Deno runtime"));
+    assert!(prompt.contains("Do not import modules or call unlisted platform globals."));
     assert!(prompt.contains("`lam.dir(query?: { path?: string })"));
     assert!(prompt.contains("`lam.result<T extends JsonValue>(value: T): T`"));
     assert!(

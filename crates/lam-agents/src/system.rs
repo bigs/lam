@@ -7,8 +7,9 @@ use std::thread::JoinHandle;
 use futures_util::future::join_all;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use lam::{
-    AbortHandle, Actor, ActorBuilder, ActorId, ActorRef, ActorState, DeliveryMode, JournalStore,
-    MessageReceipt, RunEvents, RuntimeEvents,
+    AbortHandle, Actor, ActorBuilder, ActorId, ActorRef, ActorState, CompactionReceipt,
+    DeliveryMode, JournalStore, MessageReceipt, ModelSwitchPolicy, ModelSwitchReceipt, RunEvents,
+    RuntimeEvents,
 };
 use schemars::JsonSchema;
 use serde::Serialize;
@@ -386,6 +387,40 @@ where
         let mut actor = self.resident.owner.lock().await;
         let actor = actor.as_mut().ok_or(AgentSystemError::ShuttingDown)?;
         actor.call(input).output::<O>().await.map_err(Into::into)
+    }
+
+    /// Explicitly compacts this actor's current model-visible context.
+    pub async fn compact(&self) -> Result<Option<CompactionReceipt>, AgentSystemError> {
+        self.resident.ensure_running()?;
+        let _activity = self._system.begin_activity()?;
+        let mut actor = self.resident.owner.lock().await;
+        let actor = actor.as_mut().ok_or(AgentSystemError::ShuttingDown)?;
+        actor.compact().await.map_err(Into::into)
+    }
+
+    /// Compacts existing history and selects another registered root model.
+    pub async fn switch_model(
+        &self,
+        model_id: impl Into<String>,
+    ) -> Result<ModelSwitchReceipt, AgentSystemError> {
+        self.switch_model_with_policy(model_id, ModelSwitchPolicy::Compact)
+            .await
+    }
+
+    /// Selects another registered root model using an explicit context policy.
+    pub async fn switch_model_with_policy(
+        &self,
+        model_id: impl Into<String>,
+        policy: ModelSwitchPolicy,
+    ) -> Result<ModelSwitchReceipt, AgentSystemError> {
+        self.resident.ensure_running()?;
+        let _activity = self._system.begin_activity()?;
+        let mut actor = self.resident.owner.lock().await;
+        let actor = actor.as_mut().ok_or(AgentSystemError::ShuttingDown)?;
+        actor
+            .switch_model_with_policy(model_id, policy)
+            .await
+            .map_err(Into::into)
     }
 
     /// Rebuilds this actor's current projection from its journal.

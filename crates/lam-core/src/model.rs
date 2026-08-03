@@ -58,7 +58,8 @@ impl<'a> ModelRequestConfig<'a> {
 }
 
 /// One eval request computed from a provider-native response.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct EvalRequest {
     /// TypeScript program to evaluate in the actor's persistent isolate.
     pub source: String,
@@ -83,6 +84,27 @@ pub enum ModelDelta {
     Text(String),
     /// Visible reasoning or thinking text when a provider exposes it.
     Reasoning(String),
+    /// One streamed fragment of a native tool call.
+    ToolCall(ToolCallDelta),
+}
+
+/// Provider-neutral display view of an incrementally constructed tool call.
+///
+/// The index is stable only within one model response. Names and arguments are
+/// fragments and must be appended in arrival order.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolCallDelta {
+    /// Provider-native position of this call within the model response.
+    pub index: usize,
+    /// Provider-native call identity when the current fragment carries it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
+    /// Function-name fragment when the current fragment carries it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// JSON argument fragment, possibly empty while the call is introduced.
+    pub arguments: String,
 }
 
 /// Best-effort metadata computed from one completed provider response.

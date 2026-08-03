@@ -7,7 +7,7 @@ use std::task::{Context, Poll};
 
 use futures_core::Stream;
 use lam_core::{
-    CompactionReason, ContextSequence, MessageEnvelope, MessageId, ModelDelta,
+    CompactionReason, ContextSequence, EvalRequest, MessageEnvelope, MessageId, ModelDelta,
     ModelResponseMetadata, OutputContract, RunId,
 };
 use schemars::{JsonSchema, schema_for};
@@ -86,6 +86,8 @@ pub enum RunEvent {
     EvalStarted {
         /// Activation requesting eval.
         run_id: RunId,
+        /// TypeScript source and optional requested timeout.
+        request: EvalRequest,
     },
     /// One complete eval outcome became available.
     EvalCompleted {

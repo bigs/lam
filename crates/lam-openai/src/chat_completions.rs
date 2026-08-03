@@ -3,7 +3,7 @@
 use lam::{
     CodecId, CodecRef, CompactionArtifact, ContextTransition, EncodedPayload, Model, ModelCodec,
     ModelDelta, ModelDescriptor, ModelDirective, ModelEventSink, ModelProvider, ModelRequestConfig,
-    ModelResponseMetadata, OutputContract, ProjectedContextEntry,
+    ModelResponseMetadata, OutputContract, ProjectedContextEntry, ToolCallDelta,
 };
 use serde_json::{Map, Value, json};
 
@@ -257,6 +257,29 @@ fn emit_chunk_deltas(events: &ModelEventSink, chunk: &Value) {
         for field in ["reasoning_content", "reasoning", "thinking"] {
             if let Some(text) = delta.get(field).and_then(Value::as_str) {
                 events.emit(ModelDelta::Reasoning(text.to_owned()));
+            }
+        }
+        if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
+            for (position, call) in calls.iter().enumerate() {
+                let index = call
+                    .get("index")
+                    .and_then(Value::as_u64)
+                    .and_then(|index| usize::try_from(index).ok())
+                    .unwrap_or(position);
+                let function = call.get("function");
+                events.emit(ModelDelta::ToolCall(ToolCallDelta {
+                    index,
+                    call_id: call.get("id").and_then(Value::as_str).map(str::to_owned),
+                    name: function
+                        .and_then(|function| function.get("name"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    arguments: function
+                        .and_then(|function| function.get("arguments"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                }));
             }
         }
     }

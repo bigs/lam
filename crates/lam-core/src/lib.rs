@@ -33,7 +33,7 @@ pub use message::{DeliveryMode, MessageEnvelope, MessageError, MessageSource};
 pub use model::{
     EvalRequest, ModelCodec, ModelCost, ModelCostSource, ModelDelta, ModelDirective,
     ModelEventSink, ModelProvider, ModelRequestConfig, ModelResponseMetadata, OutputContract,
-    TokenUsage,
+    TokenUsage, ToolCallDelta,
 };
 pub use projection::{
     ActorState, AdmissionDecision, AdmittedMessage, ProjectedContextEntry, StateError,

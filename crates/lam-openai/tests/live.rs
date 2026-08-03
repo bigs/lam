@@ -573,7 +573,7 @@ async fn observe_call(actor: &mut Actor<MemStore>, prompt: &str) -> Observation 
                     "run {run_id} failed {reason:?} compaction: {message}"
                 ));
             }
-            RunEvent::EvalStarted { ref run_id } => {
+            RunEvent::EvalStarted { ref run_id, .. } => {
                 phase_events.push(format!("run {run_id} started eval {}", eval_count + 1));
             }
             RunEvent::EvalCompleted {

@@ -11,7 +11,7 @@ use lam::{
     CompactionRequest, Compactor, ContextEntry, ContextSequence, ContextTransition, EncodedPayload,
     ModelCodec, ModelCostSource, ModelDelta, ModelDirective, ModelEventSink, ModelProvider,
     ModelRequestConfig, ModelResponseMetadata, OutputContract, ProjectedContextEntry, Revision,
-    RunEvent, RunId, RunProgress, Timestamp,
+    RunEvent, RunId, RunProgress, Timestamp, ToolCallDelta,
 };
 use lam_openai::chat_completions::{
     ChatCompletions, REQUEST_CODEC_ID as CHAT_REQUEST_CODEC_ID,
@@ -724,7 +724,22 @@ async fn responses_provider_sends_store_false_and_returns_completed_native_respo
         }
     });
     let stream = format!(
-        "event: response.output_text.delta\ndata: {}\n\nevent: response.completed\ndata: {}\n\n",
+        "event: response.output_item.added\ndata: {}\n\nevent: response.function_call_arguments.delta\ndata: {}\n\nevent: response.output_text.delta\ndata: {}\n\nevent: response.completed\ndata: {}\n\n",
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 1,
+            "item": {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "eval",
+                "arguments": ""
+            }
+        }),
+        json!({
+            "type": "response.function_call_arguments.delta",
+            "output_index": 1,
+            "delta": "{\"source\":\"1 + 1\"}"
+        }),
         json!({ "type": "response.output_text.delta", "delta": "hello" }),
         json!({ "type": "response.completed", "response": completed })
     );
@@ -767,7 +782,21 @@ async fn responses_provider_sends_store_false_and_returns_completed_native_respo
     assert!((cost.amount_usd - 0.000_051).abs() < f64::EPSILON);
     assert_eq!(
         *deltas.lock().unwrap(),
-        vec![ModelDelta::Text("hello".to_owned())]
+        vec![
+            ModelDelta::ToolCall(ToolCallDelta {
+                index: 1,
+                call_id: Some("call_1".to_owned()),
+                name: Some("eval".to_owned()),
+                arguments: String::new(),
+            }),
+            ModelDelta::ToolCall(ToolCallDelta {
+                index: 1,
+                call_id: None,
+                name: None,
+                arguments: "{\"source\":\"1 + 1\"}".to_owned(),
+            }),
+            ModelDelta::Text("hello".to_owned()),
+        ]
     );
 }
 
@@ -777,7 +806,15 @@ async fn chat_provider_preserves_every_chunk_and_streams_reasoning() {
         "id": "chat_1",
         "choices": [{
             "index": 0,
-            "delta": { "role": "assistant", "reasoning_content": "think" },
+            "delta": {
+                "role": "assistant",
+                "reasoning_content": "think",
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "function": { "name": "eval", "arguments": "{\"source\":" }
+                }]
+            },
             "finish_reason": null
         }]
     });
@@ -786,7 +823,13 @@ async fn chat_provider_preserves_every_chunk_and_streams_reasoning() {
         "model": "accounts/test/resolved-model",
         "choices": [{
             "index": 0,
-            "delta": { "content": "done" },
+            "delta": {
+                "content": "done",
+                "tool_calls": [{
+                    "index": 0,
+                    "function": { "arguments": "\"1 + 1\"}" }
+                }]
+            },
             "finish_reason": "stop"
         }],
         "usage": {
@@ -845,7 +888,19 @@ async fn chat_provider_preserves_every_chunk_and_streams_reasoning() {
         *deltas.lock().unwrap(),
         vec![
             ModelDelta::Reasoning("think".to_owned()),
-            ModelDelta::Text("done".to_owned())
+            ModelDelta::ToolCall(ToolCallDelta {
+                index: 0,
+                call_id: Some("call_1".to_owned()),
+                name: Some("eval".to_owned()),
+                arguments: "{\"source\":".to_owned(),
+            }),
+            ModelDelta::Text("done".to_owned()),
+            ModelDelta::ToolCall(ToolCallDelta {
+                index: 0,
+                call_id: None,
+                name: None,
+                arguments: "\"1 + 1\"}".to_owned(),
+            })
         ]
     );
 }

@@ -6,7 +6,7 @@ use lam::{
     CodecId, CodecRef, CompactionArtifact, CompactionError, CompactionOutput, CompactionPlan,
     CompactionRequest, Compactor, ContextTransition, EncodedPayload, Model, ModelCodec, ModelDelta,
     ModelDescriptor, ModelDirective, ModelEventSink, ModelProvider, ModelRequestConfig,
-    ModelResponseMetadata, OutputContract, ProjectedContextEntry,
+    ModelResponseMetadata, OutputContract, ProjectedContextEntry, ToolCallDelta,
 };
 use serde_json::{Map, Value, json};
 
@@ -168,6 +168,10 @@ impl ModelProvider for ResponsesProvider {
                         | "response.reasoning_summary_text.delta" => {
                             emit_delta(&events, &value, true);
                         }
+                        "response.output_item.added" => emit_tool_item(&events, &value),
+                        "response.function_call_arguments.delta" => {
+                            emit_tool_arguments(&events, &value);
+                        }
                         "response.completed" => {
                             completed = value.get("response").cloned();
                             if completed.is_none() {
@@ -221,6 +225,50 @@ fn emit_delta(events: &ModelEventSink, value: &Value, reasoning: bool) {
         };
         events.emit(delta);
     }
+}
+
+fn emit_tool_item(events: &ModelEventSink, value: &Value) {
+    let Some(item) = value.get("item") else {
+        return;
+    };
+    if item.get("type").and_then(Value::as_str) != Some("function_call") {
+        return;
+    }
+    let index = value
+        .get("output_index")
+        .and_then(Value::as_u64)
+        .and_then(|index| usize::try_from(index).ok())
+        .unwrap_or(0);
+    events.emit(ModelDelta::ToolCall(ToolCallDelta {
+        index,
+        call_id: item
+            .get("call_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        name: item.get("name").and_then(Value::as_str).map(str::to_owned),
+        arguments: item
+            .get("arguments")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+    }));
+}
+
+fn emit_tool_arguments(events: &ModelEventSink, value: &Value) {
+    let Some(arguments) = value.get("delta").and_then(Value::as_str) else {
+        return;
+    };
+    let index = value
+        .get("output_index")
+        .and_then(Value::as_u64)
+        .and_then(|index| usize::try_from(index).ok())
+        .unwrap_or(0);
+    events.emit(ModelDelta::ToolCall(ToolCallDelta {
+        index,
+        call_id: None,
+        name: None,
+        arguments: arguments.to_owned(),
+    }));
 }
 
 /// Pure Responses request/replay codec.

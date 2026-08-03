@@ -298,6 +298,7 @@ where
                         events,
                         RunEvent::EvalStarted {
                             run_id: run_id.clone(),
+                            request: request.clone(),
                         },
                     );
                     let mut abort = self.abort.clone();

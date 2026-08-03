@@ -1,4 +1,4 @@
-const DEFAULT_SYSTEM_PROMPT: &str = "You are a coding agent with one tool, `eval`, which runs TypeScript in a persistent Deno isolate. Use registered APIs for host interaction and `lam.dir()` for their complete documentation and schemas.";
+const DEFAULT_SYSTEM_PROMPT: &str = "You are a coding agent with one tool, `eval`, which runs TypeScript in a persistent, capability-limited isolate. Ordinary JavaScript and TypeScript language primitives are available, but this is not a general Node.js or Deno runtime: imports, exports, dynamic `import()`, npm packages, and ambient filesystem, process, network, Node, or Deno APIs are unavailable. Host interaction is possible only through registered APIs injected into the namespaces listed below. Do not import modules or call unlisted platform globals. Use `lam.dir()` for complete API documentation and schemas.";
 
 #[derive(Default)]
 pub(crate) struct SystemPrompt {
@@ -42,6 +42,8 @@ mod tests {
         let prompt = SystemPrompt::default().render("- `lam.dir(...)`");
 
         assert!(prompt.starts_with(DEFAULT_SYSTEM_PROMPT));
+        assert!(prompt.contains("not a general Node.js or Deno runtime"));
+        assert!(prompt.contains("only through registered APIs injected into the namespaces"));
         assert!(prompt.contains("Available APIs:\n- `lam.dir(...)`"));
     }
 
