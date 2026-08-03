@@ -907,10 +907,15 @@ fn merge_message_delta(target: &mut Value, delta: &Value) -> Result<(), CodecErr
     let target = target
         .as_object_mut()
         .expect("message accumulator is an object");
+    match streamed_tool_calls(delta)? {
+        StreamedToolCalls::Missing => {}
+        StreamedToolCalls::Null => {
+            target.entry("tool_calls".to_owned()).or_insert(Value::Null);
+        }
+        StreamedToolCalls::Array(calls) => merge_tool_call_deltas(target, calls)?,
+    }
     for (key, incoming) in delta {
-        if key == "tool_calls" {
-            merge_tool_call_deltas(target, incoming)?;
-        } else {
+        if key != "tool_calls" {
             merge_value(
                 target.entry(key.clone()).or_insert(Value::Null),
                 incoming,
@@ -921,18 +926,34 @@ fn merge_message_delta(target: &mut Value, delta: &Value) -> Result<(), CodecErr
     Ok(())
 }
 
+enum StreamedToolCalls<'a> {
+    Missing,
+    Null,
+    Array(&'a [Value]),
+}
+
+fn streamed_tool_calls(delta: &Map<String, Value>) -> Result<StreamedToolCalls<'_>, CodecError> {
+    match delta.get("tool_calls") {
+        None => Ok(StreamedToolCalls::Missing),
+        Some(Value::Null) => Ok(StreamedToolCalls::Null),
+        Some(Value::Array(calls)) => Ok(StreamedToolCalls::Array(calls)),
+        Some(_) => Err(CodecError::InvalidPayload {
+            message: "streamed tool_calls is not an array or null".to_owned(),
+        }),
+    }
+}
+
 fn merge_tool_call_deltas(
     message: &mut Map<String, Value>,
-    incoming: &Value,
+    incoming: &[Value],
 ) -> Result<(), CodecError> {
-    let incoming = incoming
-        .as_array()
-        .ok_or_else(|| CodecError::InvalidPayload {
-            message: "streamed tool_calls is not an array".to_owned(),
-        })?;
     let target = message
         .entry("tool_calls".to_owned())
-        .or_insert_with(|| Value::Array(Vec::new()))
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if target.is_null() {
+        *target = Value::Array(Vec::new());
+    }
+    let target = target
         .as_array_mut()
         .ok_or_else(|| CodecError::InvalidPayload {
             message: "accumulated tool_calls is not an array".to_owned(),
@@ -1085,5 +1106,103 @@ mod tests {
             "{\"source\":\"1+1\"}"
         );
         assert!(message["tool_calls"][0].get("index").is_none());
+    }
+
+    #[test]
+    fn distinguishes_missing_null_and_array_tool_call_deltas() {
+        let missing = Map::new();
+        assert!(matches!(
+            streamed_tool_calls(&missing).expect("missing is valid"),
+            StreamedToolCalls::Missing
+        ));
+
+        let null = json!({ "tool_calls": null });
+        assert!(matches!(
+            streamed_tool_calls(null.as_object().expect("object")).expect("null is valid"),
+            StreamedToolCalls::Null
+        ));
+
+        let array = json!({ "tool_calls": [] });
+        assert!(matches!(
+            streamed_tool_calls(array.as_object().expect("object")).expect("array is valid"),
+            StreamedToolCalls::Array([])
+        ));
+    }
+
+    #[test]
+    fn assembles_text_when_streamed_tool_calls_is_null() {
+        let chunks = vec![
+            json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "role": "assistant",
+                        "content": "complete response",
+                        "tool_calls": null
+                    }
+                }]
+            }),
+            json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop"
+                }]
+            }),
+        ];
+
+        let message = assemble_message(&chunks).expect("null tool_calls is valid");
+        assert_eq!(message["content"], "complete response");
+        assert!(message["tool_calls"].is_null());
+    }
+
+    #[test]
+    fn tool_call_array_supersedes_an_explicit_null_without_losing_the_distinction() {
+        let chunks = vec![
+            json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": { "tool_calls": null }
+                }]
+            }),
+            json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "call_1",
+                            "type": "function",
+                            "function": { "name": "eval", "arguments": "{}" }
+                        }]
+                    }
+                }]
+            }),
+            json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": { "tool_calls": null }
+                }]
+            }),
+        ];
+
+        let message = assemble_message(&chunks).expect("array supersedes null");
+        assert_eq!(message["tool_calls"][0]["id"], "call_1");
+    }
+
+    #[test]
+    fn rejects_non_array_non_null_streamed_tool_calls() {
+        let chunks = vec![json!({
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "content": "response",
+                    "tool_calls": {}
+                }
+            }]
+        })];
+
+        let error = assemble_message(&chunks).expect_err("object tool_calls must be rejected");
+        assert!(error.to_string().contains("not an array or null"));
     }
 }
