@@ -3,9 +3,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use lam::{
-    ActorId, ActorState, CompactionArtifact, CompactionRecord, ContextTransition, EncodedPayload,
-    JournalStore, Lam, LamBuilder, MemStore, MessageSource, Model, ModelCodec, ModelDescriptor,
-    ModelDirective, ModelRequestConfig, ModelResponseMetadata, ProjectedContextEntry,
+    ActorEventData, ActorId, ActorState, CompactionArtifact, CompactionRecord, ContextTransition,
+    EncodedPayload, JournalStore, Lam, LamBuilder, MemStore, MessageSource, Model, ModelCodec,
+    ModelDescriptor, ModelDirective, ModelRequestConfig, ModelResponseMetadata,
+    ProjectedContextEntry, Revision,
 };
 use lam_agents::{Agent, AgentSystem, AgentSystemEvents, SubagentConfig, SubagentConfigBuilder};
 use lam_code::{CodingPack, FilesystemAccess, LocalCommandRunner};
@@ -76,6 +77,7 @@ pub(crate) enum Command {
     SwitchModel { index: usize, registry_id: String },
     SetEffort { index: usize, effort: String },
     New,
+    LoadSession(u64),
 }
 
 #[derive(Debug)]
@@ -246,10 +248,36 @@ impl Runtime {
                         result,
                     }
                 }
-                Command::New => return,
+                Command::New | Command::LoadSession(_) => return,
             };
             let _ = output.send(result);
         });
+    }
+}
+
+pub(crate) async fn first_user_message(session: &Session) -> Result<Option<String>, RuntimeError> {
+    const PAGE_SIZE: NonZeroUsize = NonZeroUsize::new(256).expect("256 is nonzero");
+    let store = RedbStore::open(&session.database_path).map_err(RuntimeError::Journal)?;
+    let actor = ActorId::new("/root").expect("the root actor ID is valid");
+    let mut after = Revision::ZERO;
+    loop {
+        let page = store
+            .read(&actor, after, PAGE_SIZE)
+            .await
+            .map_err(|error| RuntimeError::AgentSystem(error.to_string()))?;
+        let head = page.head;
+        for stored in page.events {
+            after = stored.revision;
+            let ActorEventData::MessageAdmitted { message } = stored.event.data() else {
+                continue;
+            };
+            if matches!(message.source(), MessageSource::User { .. }) {
+                return Ok(Some(display_json(&message.payload().value)));
+            }
+        }
+        if after >= head {
+            return Ok(None);
+        }
     }
 }
 
@@ -693,10 +721,57 @@ pub(crate) enum RuntimeError {
 mod tests {
     use std::path::Path;
 
+    use lam::{
+        ActorEvent, ActorId, AppendOutcome, DeliveryMode, EncodedPayload, EventBatch, JournalStore,
+        MessageEnvelope, MessageId, MessageSource, Revision, Timestamp,
+    };
+    use lam_redb::RedbStore;
     use serde_json::json;
 
-    use super::{EffortControl, coding_instruction, insert_json_path};
+    use super::{EffortControl, coding_instruction, first_user_message, insert_json_path};
     use crate::config::ModelChoice;
+    use crate::session::Session;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_preview_reads_the_first_user_message() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("session.redb");
+        let store = RedbStore::create(&database_path).unwrap();
+        let actor = ActorId::new("/root").unwrap();
+        let message = MessageEnvelope::new(
+            MessageId::new("message-1").unwrap(),
+            MessageSource::User { principal: None },
+            DeliveryMode::Steer,
+            EncodedPayload::lam_json(json!("First question\nwith detail")).unwrap(),
+            Timestamp::from_unix_millis(1),
+        )
+        .unwrap();
+        let outcome = store
+            .append(
+                &actor,
+                Revision::ZERO,
+                EventBatch::one(ActorEvent::message_admitted(message)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            AppendOutcome::Appended {
+                head: Revision::new(1)
+            }
+        );
+        drop(store);
+        let session = Session {
+            id: 1,
+            cwd: directory.path().to_path_buf(),
+            database_path,
+        };
+
+        assert_eq!(
+            first_user_message(&session).await.unwrap().as_deref(),
+            Some("First question\nwith detail")
+        );
+    }
 
     #[test]
     fn coding_instruction_exposes_exact_subagent_model_coordinates() {

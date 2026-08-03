@@ -8,7 +8,7 @@ mod ui;
 
 use std::env;
 use std::io::{self, stdout};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use crossterm::event::{
@@ -23,10 +23,10 @@ use ratatui::backend::CrosstermBackend;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
-use crate::app::{App, SessionView};
+use crate::app::{App, SessionChoice, SessionView};
 use crate::config::LoadedConfig;
-use crate::runtime::{CommandResult, Runtime};
-use crate::session::SessionCatalog;
+use crate::runtime::{Command, CommandResult, Runtime};
+use crate::session::{Session, SessionCatalog};
 
 fn main() -> ExitCode {
     match tokio_main() {
@@ -58,21 +58,15 @@ async fn tokio_main() -> Result<(), AppError> {
     let config_path = config.path.display().to_string();
     let sessions = SessionCatalog::open_default().map_err(AppError::Session)?;
     let selection = sessions.resume_or_create(&cwd).map_err(AppError::Session)?;
-    let mut runtime = Runtime::build(&config, cwd.clone(), &selection.session)
-        .await
-        .map_err(AppError::Runtime)?;
-    let mut app = App::new(
-        cwd.display().to_string(),
-        config_path,
-        SessionView {
-            id: selection.session.id,
-            journal_path: selection.session.database_path.display().to_string(),
-            resumed: selection.resumed,
-            agents: runtime.agents.clone(),
-        },
-        runtime.models.clone(),
-        runtime.selected_model,
-    );
+    let (mut runtime, mut app) = open_session(
+        &config,
+        &sessions,
+        &cwd,
+        selection.session,
+        selection.resumed,
+        &config_path,
+    )
+    .await?;
 
     let mut terminal = TerminalSession::start()?;
     let (terminal_events, mut terminal_receiver) = mpsc::unbounded_channel();
@@ -105,30 +99,36 @@ async fn tokio_main() -> Result<(), AppError> {
                 match terminal_event.map_err(AppError::Terminal)? {
                     Event::Key(key) => {
                         if let Some(command) = app.handle_key(key) {
-                            if matches!(command, crate::runtime::Command::New) {
+                            match command {
+                                session_command @ (Command::New | Command::LoadSession(_)) => {
                                 runtime
                                     .system
                                     .shutdown()
                                     .await
                                     .map_err(|error| AppError::Shutdown(error.to_string()))?;
-                                let session = sessions.create(&cwd).map_err(AppError::Session)?;
-                                runtime = Runtime::build(&config, cwd.clone(), &session)
-                                    .await
-                                    .map_err(AppError::Runtime)?;
-                                app = App::new(
-                                    cwd.display().to_string(),
-                                    config.path.display().to_string(),
-                                    SessionView {
-                                        id: session.id,
-                                        journal_path: session.database_path.display().to_string(),
-                                        resumed: false,
-                                        agents: runtime.agents.clone(),
-                                    },
-                                    runtime.models.clone(),
-                                    runtime.selected_model,
-                                );
-                            } else {
-                                runtime.execute(command, command_results.clone());
+                                let (session, resumed) = match session_command {
+                                    Command::New => (
+                                        sessions.create(&cwd).map_err(AppError::Session)?,
+                                        false,
+                                    ),
+                                    Command::LoadSession(id) => (
+                                        sessions.select(id, &cwd).map_err(AppError::Session)?,
+                                        true,
+                                    ),
+                                    _ => unreachable!("session commands were matched above"),
+                                };
+                                drop(runtime);
+                                (runtime, app) = open_session(
+                                    &config,
+                                    &sessions,
+                                    &cwd,
+                                    session,
+                                    resumed,
+                                    &config_path,
+                                )
+                                .await?;
+                                }
+                                command => runtime.execute(command, command_results.clone()),
                             }
                         }
                     }
@@ -159,6 +159,53 @@ async fn tokio_main() -> Result<(), AppError> {
         .map_err(|error| AppError::Shutdown(error.to_string()))?;
     terminal.restore()?;
     Ok(())
+}
+
+async fn open_session(
+    config: &LoadedConfig,
+    catalog: &SessionCatalog,
+    cwd: &Path,
+    session: Session,
+    resumed: bool,
+    config_path: &str,
+) -> Result<(Runtime, App), AppError> {
+    let choices = session_choices(catalog, cwd).await?;
+    let runtime = Runtime::build(config, cwd.to_path_buf(), &session)
+        .await
+        .map_err(AppError::Runtime)?;
+    let app = App::new(
+        cwd.display().to_string(),
+        config_path.to_owned(),
+        SessionView {
+            id: session.id,
+            journal_path: session.database_path.display().to_string(),
+            resumed,
+            agents: runtime.agents.clone(),
+            choices,
+        },
+        runtime.models.clone(),
+        runtime.selected_model,
+    );
+    Ok((runtime, app))
+}
+
+async fn session_choices(
+    catalog: &SessionCatalog,
+    cwd: &Path,
+) -> Result<Vec<SessionChoice>, AppError> {
+    let sessions = catalog.list(cwd).map_err(AppError::Session)?;
+    let mut choices = Vec::with_capacity(sessions.len());
+    for session in sessions {
+        let preview = match runtime::first_user_message(&session).await {
+            Ok(preview) => preview,
+            Err(error) => Some(format!("Preview unavailable: {error}")),
+        };
+        choices.push(SessionChoice {
+            id: session.id,
+            preview,
+        });
+    }
+    Ok(choices)
 }
 
 struct Args {
@@ -262,7 +309,7 @@ impl Drop for TerminalSession {
 
 fn print_help() {
     println!(
-        "lam — a minimal TypeScript coding agent\n\nUSAGE:\n    lam [--config PATH]\n\nOPTIONS:\n    --config PATH  Read providers from PATH instead of ~/.lam/providers.toml\n    -h, --help     Show this help\n    -V, --version  Show the version\n\nLam resumes the latest durable session for the current directory. Inside the TUI,\ntype / for commands, including /new for a fresh session. Tab switches focus\nbetween the input shelf and conversation; arrows select transcript rows; Enter\nexpands the selected row."
+        "lam — a minimal TypeScript coding agent\n\nUSAGE:\n    lam [--config PATH]\n\nOPTIONS:\n    --config PATH  Read providers from PATH instead of ~/.lam/providers.toml\n    -h, --help     Show this help\n    -V, --version  Show the version\n\nLam resumes the latest durable session for the current directory. Inside the TUI,\ntype / for commands, including /new for a fresh session and /session to restore\nan earlier one. Tab switches focus between the input shelf and conversation;\narrows select transcript rows; Enter expands the selected row."
     );
 }
 

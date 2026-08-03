@@ -59,6 +59,13 @@ pub(crate) struct SessionView {
     pub(crate) journal_path: String,
     pub(crate) resumed: bool,
     pub(crate) agents: Vec<AgentHistory>,
+    pub(crate) choices: Vec<SessionChoice>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SessionChoice {
+    pub(crate) id: u64,
+    pub(crate) preview: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -82,6 +89,7 @@ struct InputLayout {
 pub(crate) struct App {
     pub(crate) cwd: String,
     pub(crate) session_id: u64,
+    pub(crate) sessions: Vec<SessionChoice>,
     pub(crate) models: Vec<ModelChoice>,
     pub(crate) selected_model: usize,
     selected_efforts: Vec<usize>,
@@ -146,6 +154,7 @@ impl App {
         };
         let session_id = session.id;
         let session_path = session.journal_path;
+        let sessions = session.choices;
         let ready_message = format!(
             "{action} durable session #{session_id}. Coding and multi-agent capabilities are active. Using {} ({} token context). Journal: {session_path}. Configuration: {config_path}.",
             models[selected_model].display_name, models[selected_model].context_window
@@ -185,6 +194,7 @@ impl App {
         Self {
             cwd,
             session_id,
+            sessions,
             models,
             selected_model,
             selected_efforts,
@@ -295,6 +305,36 @@ impl App {
                 })
                 .collect();
         }
+        if input == "/session" || input.starts_with("/session ") {
+            let query = input
+                .strip_prefix("/session")
+                .unwrap_or_default()
+                .trim()
+                .trim_start_matches('#')
+                .to_lowercase();
+            return self
+                .sessions
+                .iter()
+                .filter(|session| {
+                    query.is_empty()
+                        || session.id.to_string().contains(&query)
+                        || session
+                            .preview
+                            .as_deref()
+                            .is_some_and(|preview| preview.to_lowercase().contains(&query))
+                })
+                .map(|session| Suggestion {
+                    label: format!("#{}", session.id),
+                    detail: session
+                        .preview
+                        .as_deref()
+                        .map(one_line_preview)
+                        .unwrap_or_else(|| "No user message yet".to_owned()),
+                    replacement: format!("/session {}", session.id),
+                    provider: None,
+                })
+                .collect();
+        }
         if !input.starts_with('/') || input.contains(' ') {
             return Vec::new();
         }
@@ -305,6 +345,7 @@ impl App {
             ("effort", "Choose the reasoning effort", "/effort "),
             ("model", "Choose a provider and model", "/model "),
             ("new", "Start a new session in this directory", "/new"),
+            ("session", "Load a session from this directory", "/session "),
             ("exit", "Close Lam", "/exit"),
             ("quit", "Close Lam", "/quit"),
         ]
@@ -526,6 +567,37 @@ impl App {
                 self.input = InputBuffer::at_end("/effort ".to_owned());
                 None
             }
+            "/session" => {
+                self.input = InputBuffer::at_end("/session ".to_owned());
+                None
+            }
+            _ if input.starts_with("/session ") => {
+                let id = input
+                    .trim_start_matches("/session ")
+                    .trim()
+                    .trim_start_matches('#');
+                let Ok(id) = id.parse::<u64>() else {
+                    self.push_error(
+                        "Unknown session",
+                        format!("No session in this directory matches `{id}`."),
+                    );
+                    return None;
+                };
+                if !self.sessions.iter().any(|session| session.id == id) {
+                    self.push_error(
+                        "Unknown session",
+                        format!("No session in this directory matches `#{id}`."),
+                    );
+                    return None;
+                }
+                if id == self.session_id {
+                    self.status = format!("Already using session #{id}");
+                    return None;
+                }
+                self.busy = true;
+                self.status = format!("Loading session #{id}…");
+                Some(Command::LoadSession(id))
+            }
             _ if input.starts_with("/effort ") => {
                 let effort = input.trim_start_matches("/effort ").trim();
                 let model_index = self.selected_model;
@@ -586,6 +658,13 @@ impl App {
                 self.output_fallback = None;
                 self.root_run_completed = false;
                 self.completed_run_id = None;
+                if let Some(session) = self
+                    .sessions
+                    .iter_mut()
+                    .find(|session| session.id == self.session_id && session.preview.is_none())
+                {
+                    session.preview = Some(input.clone());
+                }
                 self.push_expanded_entry(EntryKind::User, "You", input.clone());
                 self.busy = true;
                 self.status = "Thinking…".to_owned();
@@ -1297,6 +1376,10 @@ impl App {
     }
 }
 
+fn one_line_preview(input: &str) -> String {
+    input.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 impl AgentConversation {
     fn empty(parent: Option<String>, status: &str) -> Self {
         Self {
@@ -1690,7 +1773,9 @@ mod tests {
     };
     use lam_agents::{ActorAddress, AgentOutcome, AgentSystemEvent};
 
-    use super::{App, EntryKind, Focus, InputBuffer, SessionView, partial_eval_intent};
+    use super::{
+        App, EntryKind, Focus, InputBuffer, SessionChoice, SessionView, partial_eval_intent,
+    };
     use crate::config::ModelChoice;
     use crate::runtime::{
         AgentHistory, Command, CommandResult, CompletedCall, HistoryEntry, HistoryKind,
@@ -1705,6 +1790,10 @@ mod tests {
                 journal_path: "/tmp/session-00000007.redb".to_owned(),
                 resumed: false,
                 agents: vec![AgentHistory::root(Vec::new())],
+                choices: vec![SessionChoice {
+                    id: 7,
+                    preview: None,
+                }],
             },
             vec![ModelChoice {
                 registry_id: "openai/gpt-5".to_owned(),
@@ -1800,6 +1889,33 @@ mod tests {
             result: Ok("Set reasoning effort to low.".to_owned()),
         });
         assert_eq!(app.current_agent_effort(), Some("low"));
+    }
+
+    #[test]
+    fn session_picker_previews_first_user_messages_and_loads_the_selection() {
+        let mut app = app();
+        app.sessions.push(SessionChoice {
+            id: 4,
+            preview: Some("Inspect the workspace\nand summarize it".to_owned()),
+        });
+        app.input = InputBuffer::at_end("/session ".to_owned());
+
+        let suggestions = app.suggestions();
+
+        assert_eq!(suggestions[0].label, "#7");
+        assert_eq!(suggestions[0].detail, "No user message yet");
+        assert_eq!(suggestions[1].label, "#4");
+        assert_eq!(
+            suggestions[1].detail,
+            "Inspect the workspace and summarize it"
+        );
+        assert_eq!(suggestions[1].replacement, "/session 4");
+
+        app.input = InputBuffer::at_end("/session 4".to_owned());
+        let command = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(matches!(command, Some(Command::LoadSession(4))));
+        assert_eq!(app.status, "Loading session #4…");
     }
 
     #[test]
@@ -1978,6 +2094,13 @@ mod tests {
         assert!(matches!(command, Some(Command::Call(input)) if input == "inspect the workspace"));
         assert!(app.busy);
         assert!(app.entries.last().unwrap().expanded);
+        assert_eq!(
+            app.sessions
+                .iter()
+                .find(|session| session.id == app.session_id)
+                .and_then(|session| session.preview.as_deref()),
+            Some("inspect the workspace")
+        );
     }
 
     #[test]
@@ -2020,6 +2143,10 @@ mod tests {
                         body: "1 + 1".to_owned(),
                     },
                 ])],
+                choices: vec![SessionChoice {
+                    id: 7,
+                    preview: Some("hello".to_owned()),
+                }],
             },
             app.models,
             0,

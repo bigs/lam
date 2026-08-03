@@ -87,7 +87,7 @@ impl SessionCatalog {
         };
 
         if let Some(id) = current {
-            let session = self.load_and_touch(id, &cwd)?;
+            let session = self.load_and_touch(id, &cwd, false)?;
             return Ok(SessionSelection {
                 session,
                 resumed: true,
@@ -102,6 +102,29 @@ impl SessionCatalog {
 
     pub(crate) fn create(&self, cwd: &Path) -> Result<Session, SessionError> {
         self.create_for_key(cwd_key(cwd)?)
+    }
+
+    pub(crate) fn list(&self, cwd: &Path) -> Result<Vec<Session>, SessionError> {
+        let cwd = cwd_key(cwd)?;
+        let read = self.database.begin_read().map_err(database_error)?;
+        let sessions = read.open_table(SESSIONS).map_err(database_error)?;
+        let mut matches = Vec::new();
+        for item in sessions.iter().map_err(database_error)? {
+            let (id, encoded) = item.map_err(database_error)?;
+            let id = id.value();
+            let record = serde_json::from_slice::<SessionRecord>(encoded.value())
+                .map_err(SessionError::Serialize)?;
+            validate_record(&record, id)?;
+            if record.cwd == cwd {
+                matches.push(self.session(id, &cwd));
+            }
+        }
+        matches.sort_unstable_by_key(|session| std::cmp::Reverse(session.id));
+        Ok(matches)
+    }
+
+    pub(crate) fn select(&self, id: u64, cwd: &Path) -> Result<Session, SessionError> {
+        self.load_and_touch(id, &cwd_key(cwd)?, true)
     }
 
     fn create_for_key(&self, cwd: String) -> Result<Session, SessionError> {
@@ -144,7 +167,12 @@ impl SessionCatalog {
         Ok(session)
     }
 
-    fn load_and_touch(&self, id: u64, cwd: &str) -> Result<Session, SessionError> {
+    fn load_and_touch(
+        &self,
+        id: u64,
+        cwd: &str,
+        make_latest: bool,
+    ) -> Result<Session, SessionError> {
         let record = {
             let read = self.database.begin_read().map_err(database_error)?;
             let sessions = read.open_table(SESSIONS).map_err(database_error)?;
@@ -155,8 +183,17 @@ impl SessionCatalog {
             serde_json::from_slice::<SessionRecord>(encoded.value())
                 .map_err(SessionError::Serialize)?
         };
-        if record.schema_version != INDEX_SCHEMA_VERSION || record.id != id || record.cwd != cwd {
-            return Err(SessionError::InvalidRecord { id });
+        validate_record(&record, id)?;
+        if record.cwd != cwd {
+            return Err(SessionError::WrongWorkingDirectory { id });
+        }
+
+        let session = self.session(id, cwd);
+        if !session.database_path.is_file() {
+            return Err(SessionError::MissingJournal {
+                id,
+                path: session.database_path,
+            });
         }
 
         let updated = SessionRecord {
@@ -170,16 +207,12 @@ impl SessionCatalog {
             sessions
                 .insert(id, encoded.as_slice())
                 .map_err(database_error)?;
+            if make_latest {
+                let mut latest = write.open_table(LATEST_BY_CWD).map_err(database_error)?;
+                latest.insert(cwd, id).map_err(database_error)?;
+            }
         }
         write.commit().map_err(database_error)?;
-
-        let session = self.session(id, cwd);
-        if !session.database_path.is_file() {
-            return Err(SessionError::MissingJournal {
-                id,
-                path: session.database_path,
-            });
-        }
         Ok(session)
     }
 
@@ -190,6 +223,13 @@ impl SessionCatalog {
             database_path: self.sessions_dir.join(format!("session-{id:08}.redb")),
         }
     }
+}
+
+fn validate_record(record: &SessionRecord, id: u64) -> Result<(), SessionError> {
+    if record.schema_version != INDEX_SCHEMA_VERSION || record.id != id {
+        return Err(SessionError::InvalidRecord { id });
+    }
+    Ok(())
 }
 
 fn lam_dir() -> Result<PathBuf, SessionError> {
@@ -269,6 +309,8 @@ pub(crate) enum SessionError {
     MissingRecord { id: u64 },
     #[error("session index record {id} is inconsistent")]
     InvalidRecord { id: u64 },
+    #[error("session {id} belongs to a different working directory")]
+    WrongWorkingDirectory { id: u64 },
     #[error("session {id} journal is missing at `{path}`")]
     MissingJournal { id: u64, path: PathBuf },
     #[error("could not create session journal: {0}")]
@@ -325,5 +367,31 @@ mod tests {
         let resumed = catalog.resume_or_create(&cwd).unwrap();
         assert!(resumed.resumed);
         assert_eq!(resumed.session, fresh);
+    }
+
+    #[test]
+    fn lists_newest_first_and_selects_an_older_session_for_the_same_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let first_cwd = temp.path().join("first");
+        let second_cwd = temp.path().join("second");
+        fs::create_dir_all(&first_cwd).unwrap();
+        fs::create_dir_all(&second_cwd).unwrap();
+        let first_cwd = first_cwd.canonicalize().unwrap();
+        let second_cwd = second_cwd.canonicalize().unwrap();
+        let catalog = SessionCatalog::open(temp.path().join("lam-home")).unwrap();
+
+        let oldest = catalog.create(&first_cwd).unwrap();
+        let newest = catalog.create(&first_cwd).unwrap();
+        catalog.create(&second_cwd).unwrap();
+
+        assert_eq!(
+            catalog.list(&first_cwd).unwrap(),
+            vec![newest, oldest.clone()]
+        );
+        assert_eq!(catalog.select(oldest.id, &first_cwd).unwrap(), oldest);
+        assert_eq!(
+            catalog.resume_or_create(&first_cwd).unwrap().session.id,
+            oldest.id
+        );
     }
 }

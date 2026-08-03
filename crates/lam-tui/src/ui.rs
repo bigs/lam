@@ -644,7 +644,8 @@ fn render_palette(frame: &mut Frame<'_>, area: Rect, suggestions: &[Suggestion],
         } else {
             Style::default().fg(Color::White)
         };
-        let available = usize::from(area.width).saturating_sub(6 + suggestion.label.len());
+        let label_width = UnicodeWidthStr::width(suggestion.label.as_str());
+        let available = usize::from(area.width).saturating_sub(6 + label_width);
         lines.push(
             Line::from(vec![
                 Span::styled(if index == selected { " › " } else { "   " }, style),
@@ -779,7 +780,7 @@ mod tests {
         PANEL, elide_end, markdown_lines, markdown_preview, render, renders_markdown,
         viewport_offset, wrap_text,
     };
-    use crate::app::{App, EntryKind, SessionView};
+    use crate::app::{App, EntryKind, SessionChoice, SessionView};
     use crate::config::ModelChoice;
     use crate::runtime::{AgentHistory, HistoryEntry, HistoryKind};
 
@@ -914,6 +915,10 @@ mod tests {
                 journal_path: "/tmp/session.redb".to_owned(),
                 resumed: false,
                 agents: vec![AgentHistory::root(Vec::new())],
+                choices: vec![SessionChoice {
+                    id: 1,
+                    preview: None,
+                }],
             },
             vec![ModelChoice {
                 registry_id: "openai/gpt-5".to_owned(),
@@ -960,6 +965,10 @@ mod tests {
                     title: "/root · Inspect the workspace".to_owned(),
                     body: "const secret_marker = await lam.fs.list({ path: '.' });".to_owned(),
                 }])],
+                choices: vec![SessionChoice {
+                    id: 1,
+                    preview: None,
+                }],
             },
             vec![ModelChoice {
                 registry_id: "openai/gpt-5".to_owned(),

@@ -80,13 +80,18 @@ not removed when a newer session becomes current.
 the same working directory, makes it current in the index, and clears the
 visible conversation for the fresh session.
 
+`/session` lists every session rooted in the current working directory, newest
+first. Each choice previews the first user message on one line. Selecting a
+session gracefully closes the current runtime, restores the selected journal,
+and makes it the directory's default for the next launch.
+
 ## Interaction
 
 - Type a message and press Enter to call the root coding agent.
-- Type `/` to open command completion. `/new`, `/agents`, `/compact`, `/model`,
-  `/effort`, `/exit`, and its `/quit` alias are available. `/model` opens models
-  grouped by provider; `/effort` lists the active model's configured effort
-  values.
+- Type `/` to open command completion. `/new`, `/session`, `/agents`, `/compact`,
+  `/model`, `/effort`, `/exit`, and its `/quit` alias are available. `/model`
+  opens models grouped by provider; `/effort` lists the active model's
+  configured effort values.
 - `/agents` opens the session's actor tree. Selecting an actor switches the
   conversation pane to that actor without interrupting a running root call.
 - Tab completes an open menu. Otherwise it switches focus between the input
