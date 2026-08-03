@@ -199,7 +199,9 @@ Actors have canonical paths such as `/root/researcher`. `lam.agents.call`
 creates a persistent child and waits directly for its initial task.
 `lam.agents.spawn` returns after durable admission and later steers a typed
 outcome into the parent's mailbox. Addressed sends are always actor-authenticated
-and steering. Direct-child stop recursively retires a subtree.
+and steering. Direct-child stop recursively retires a subtree. Host-side tree
+interruption fans out recoverable run boundaries, retires descendants, and
+leaves the addressed root available for later input.
 
 ## Capability and safety model
 

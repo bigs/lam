@@ -51,10 +51,10 @@ impl AgentOutcome {
                 message_id,
                 output,
             },
-            Err(ActorError::Aborted) => Self::Cancelled {
+            Err(error @ (ActorError::Aborted | ActorError::Interrupted)) => Self::Cancelled {
                 address,
                 message_id,
-                reason: Some(ActorError::Aborted.to_string()),
+                reason: Some(error.to_string()),
             },
             Err(error) => Self::Failed {
                 address,

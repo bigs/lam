@@ -121,15 +121,23 @@ task retires—not merely when its inner runner observes cancellation.
 
 `Agent` is a cloneable embedded handle with `call`, structured
 `call_structured`, explicit compaction, model switching, durable `send`, state
-projection, and out-of-band abort. Correlated operations use Lam's shared actor
-operation lease; a conflict returns `ActorError::Busy` rather than waiting
-behind the resident lifecycle owner.
+projection, recoverable tree interruption, and out-of-band abort. Correlated
+operations use Lam's shared actor operation lease; a conflict returns
+`ActorError::Busy` rather than waiting behind the resident lifecycle owner.
 
 `AgentSystem::wait()` waits for quiescence: no active host operations,
 reservations, actor runs, or eligible mailbox work. It does not retire idle
 actors. `shutdown()` stops admission, gracefully retires actors, and joins all
 workers; `abort()` interrupts active work first. Administrative `stop(address)`
 retires an addressed subtree.
+
+`Agent::interrupt()` (or `AgentSystem::interrupt(address)`) fans recoverable
+interruption out across the complete resident subtree before awaiting any one
+actor. Each active run commits its own durable interruption boundary. A model
+or eval completion already committed at that boundary wins normally. Once the
+fan-in completes, descendants retire and release capacity while the addressed
+root remains available for a later call. Interrupted detached outcomes are not
+delivered into the root mailbox; already completed outcomes remain eligible.
 
 `take_events()` yields one single-consumer, addressed, ephemeral stream:
 

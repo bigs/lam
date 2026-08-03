@@ -1432,9 +1432,9 @@ is appended.
 
 The same actor can begin a new run after interruption. Both OpenAI Responses
 and Chat Completions replay the explicit eval failure and runtime notice using
-their native tool-result and system/developer message forms. Tree-wide fan-out,
-descendant retirement, and the embedding's double-Escape interaction are
-separate higher-level slices.
+their native tool-result and system/developer message forms. Tree-wide fan-out
+and descendant retirement are implemented by the higher-level scheduler; the
+embedding's double-Escape interaction remains a separate slice.
 
 ### Slice 5: real provider codec
 
@@ -1639,6 +1639,14 @@ the owned subtree. Background outcomes enter the parent's ordinary durable
 mailbox and wake or steer it. Direct-child `stop`, host-side `wait`, actor-wide
 run streams, and one addressed system event stream complete the lifecycle
 surface needed by an embedding TUI.
+
+**Slice 7C implemented.** Recoverable tree interruption marks an exclusive
+subtree boundary, prevents new descendant launches, and signals all resident
+actors deepest-first before awaiting their durable results. Active runs each
+commit the Slice 4C terminal boundary. Descendants then retire gracefully and
+release residency while the addressed root remains available. Dropped call
+guards cannot escalate recoverable child interruption into abort, and outcomes
+from interrupted detached work are not delivered back into the root mailbox.
 
 There is intentionally no model-visible `wait`: synchronous work uses `call`,
 while `spawn` is detached and pushes completion without polling or duplicate
