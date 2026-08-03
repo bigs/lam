@@ -587,11 +587,28 @@ fn render_shelf(frame: &mut Frame<'_>, area: Rect, app: &mut App, suggestions: &
     let input_width = usize::from(inner.width.saturating_sub(4).max(1));
     app.input_width = input_width;
     let input_rows = app.input.rows(input_width);
-    let palette_height = inner.height.saturating_sub(to_u16(input_rows.len()));
-    let [palette_area, input_area] =
-        Layout::vertical([Constraint::Length(palette_height), Constraint::Min(1)]).areas(inner);
+    let warning_height = u16::from(app.interruption_warning().is_some());
+    let palette_height = inner
+        .height
+        .saturating_sub(to_u16(input_rows.len()))
+        .saturating_sub(warning_height);
+    let [palette_area, warning_area, input_area] = Layout::vertical([
+        Constraint::Length(palette_height),
+        Constraint::Length(warning_height),
+        Constraint::Min(1),
+    ])
+    .areas(inner);
     if !suggestions.is_empty() && palette_area.height > 0 {
         render_palette(frame, palette_area, suggestions, app.suggestion_index);
+    }
+    if let Some(warning) = app.interruption_warning() {
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("   ! ", Style::default().fg(Color::Yellow).bold()),
+                Span::styled(warning, Style::default().fg(Color::Yellow)),
+            ])),
+            warning_area,
+        );
     }
 
     let input_lines = input_rows
@@ -676,7 +693,8 @@ fn shelf_height(area: Rect, app: &App, suggestions: &[Suggestion]) -> u16 {
         })
         .0;
     let palette_rows = suggestions.len() + provider_headers;
-    let desired = 1 + input_rows + palette_rows;
+    let warning_rows = usize::from(app.interruption_warning().is_some());
+    let desired = 1 + input_rows + palette_rows + warning_rows;
     let maximum = usize::from((area.height * 2 / 5).max(3));
     to_u16(desired.clamp(2, maximum))
 }

@@ -103,6 +103,7 @@ async fn tokio_main() -> Result<(), AppError> {
                 .map_err(AppError::Terminal)?;
             redraw = false;
         }
+        let interruption_deadline = app.interruption_deadline();
         tokio::select! {
             terminal_event = terminal_receiver.recv() => {
                 let Some(terminal_event) = terminal_event else {
@@ -166,6 +167,9 @@ async fn tokio_main() -> Result<(), AppError> {
                     redraw = true;
                 }
             }
+            () = wait_for_interruption_deadline(interruption_deadline), if interruption_deadline.is_some() => {
+                redraw |= app.expire_interruption(std::time::Instant::now());
+            }
         }
     }
 
@@ -176,6 +180,12 @@ async fn tokio_main() -> Result<(), AppError> {
         .map_err(|error| AppError::Shutdown(error.to_string()))?;
     terminal.restore()?;
     Ok(())
+}
+
+async fn wait_for_interruption_deadline(deadline: Option<std::time::Instant>) {
+    if let Some(deadline) = deadline {
+        tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+    }
 }
 
 async fn open_session(
@@ -330,7 +340,7 @@ impl Drop for TerminalSession {
 
 fn print_help() {
     println!(
-        "lam — a minimal TypeScript coding agent\n\nUSAGE:\n    lam [--config PATH] [--debug-log]\n\nOPTIONS:\n    --config PATH  Read providers from PATH instead of ~/.lam/providers.toml\n    --debug-log    Append metadata-only diagnostics beside the session journal\n    -h, --help     Show this help\n    -V, --version  Show the version\n\nLam resumes the latest durable session for the current directory. Inside the TUI,\ntype / for commands, including /new for a fresh session and /session to restore\nan earlier one. Tab switches focus between the input shelf and conversation;\narrows select transcript rows; Enter expands the selected row."
+        "lam — a minimal TypeScript coding agent\n\nUSAGE:\n    lam [--config PATH] [--debug-log]\n\nOPTIONS:\n    --config PATH  Read providers from PATH instead of ~/.lam/providers.toml\n    --debug-log    Append metadata-only diagnostics beside the session journal\n    -h, --help     Show this help\n    -V, --version  Show the version\n\nLam resumes the latest durable session for the current directory. Inside the TUI,\ntype / for commands, including /new for a fresh session and /session to restore\nan earlier one. Tab switches focus between the input shelf and conversation;\narrows select transcript rows; Enter expands the selected row. While the root is\nworking, press Escape twice within 1.5 seconds to stop its complete agent tree."
     );
 }
 

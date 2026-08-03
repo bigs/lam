@@ -123,6 +123,10 @@ or raw SSE payloads.
 - Expanded user, agent, and reasoning rows render Markdown as it streams;
   collapsed previews remain compact plain text.
 - Mouse wheel navigation and click-to-expand are supported.
+- While the root is working, press Escape twice within 1.5 seconds to
+  recoverably stop its complete agent tree. The first physical press shows a
+  confirmation above the input; key repeat cannot confirm it, and any other
+  key or timeout dismisses it. Draft input and pane focus are preserved.
 - `Ctrl-C` clears a nonempty input draft; pressed again on an empty input, it
   exits from either pane.
 
@@ -135,6 +139,13 @@ selection or viewport. Each eval row uses the model's brief intent as its stable
 title while collapsed or expanded; the generated TypeScript is shown only in
 its expanded body. The intent title streams as partial eval-argument JSON
 arrives. The eventual eval outcome appears in its own result row.
+
+After interruption, Lam reloads every affected view from its durable journal.
+Incomplete text, reasoning, and tool-call JSON disappear; a committed eval call
+remains paired with its interrupted result, and a model-visible runtime notice
+marks the terminal boundary. Buffered events from the closed runs are ignored,
+descendants remain browseable under `/agents`, and the root is ready for the
+next message.
 
 Run it from the project directory the agent should operate within:
 

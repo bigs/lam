@@ -3,12 +3,16 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use lam::{
-    ActorEventData, ActorId, ActorState, CompactionArtifact, CompactionRecord, ContextTransition,
-    EncodedPayload, JournalStore, Lam, LamBuilder, MemStore, MessageSource, Model, ModelCodec,
-    ModelDescriptor, ModelDirective, ModelRequestConfig, ModelResponseMetadata,
-    ProjectedContextEntry, Revision,
+    ActorError, ActorEventData, ActorId, ActorState, CompactionArtifact, CompactionRecord,
+    ContextTransition, EncodedPayload, InterruptedEvalOutcome, IsolateState, JournalStore, Lam,
+    LamBuilder, MemStore, MessageSource, Model, ModelCodec, ModelDescriptor, ModelDirective,
+    ModelRequestConfig, ModelResponseMetadata, ProjectedContextEntry, Revision,
+    SYSTEM_NOTICE_CODEC_ID, SystemNotice,
 };
-use lam_agents::{Agent, AgentSystem, AgentSystemEvents, SubagentConfig, SubagentConfigBuilder};
+use lam_agents::{
+    Agent, AgentSystem, AgentSystemError, AgentSystemEvents, AgentTreeInterruptionReceipt,
+    SubagentConfig, SubagentConfigBuilder,
+};
 use lam_code::{CodingPack, FilesystemAccess, LocalCommandRunner};
 use lam_openai::chat_completions::{
     ChatCompletions, ChatCompletionsCodec, ChatCompletionsProvider,
@@ -29,6 +33,7 @@ pub(crate) struct Runtime {
     pub(crate) selected_model: usize,
     pub(crate) agents: Vec<AgentHistory>,
     effort_controls: Vec<EffortControl>,
+    history_models: Arc<[ConfiguredModel]>,
 }
 
 #[derive(Clone, Debug)]
@@ -73,6 +78,7 @@ pub(crate) struct HistoryEntry {
 #[derive(Clone, Debug)]
 pub(crate) enum Command {
     Call(String),
+    Interrupt,
     Compact,
     SwitchModel { index: usize, registry_id: String },
     SetEffort { index: usize, effort: String },
@@ -83,6 +89,8 @@ pub(crate) enum Command {
 #[derive(Debug)]
 pub(crate) enum CommandResult {
     Call(Result<CompletedCall, String>),
+    CallInterrupted,
+    Interrupt(Result<Option<InterruptedTree>, String>),
     Compact(Result<String, String>),
     SwitchModel {
         index: usize,
@@ -99,6 +107,18 @@ pub(crate) enum CommandResult {
 pub(crate) struct CompletedCall {
     pub(crate) output: String,
     pub(crate) run_id: Option<String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct InterruptedTree {
+    pub(crate) agents: Vec<AgentHistory>,
+    pub(crate) runs: Vec<InterruptedRun>,
+}
+
+#[derive(Debug)]
+pub(crate) struct InterruptedRun {
+    pub(crate) address: String,
+    pub(crate) run_id: String,
 }
 
 impl Runtime {
@@ -195,12 +215,15 @@ impl Runtime {
             selected_model,
             agents,
             effort_controls,
+            history_models: models.into(),
         })
     }
 
     pub(crate) fn execute(&self, command: Command, output: mpsc::UnboundedSender<CommandResult>) {
         let root = self.root.clone();
         let effort_controls = self.effort_controls.clone();
+        let history_models = Arc::clone(&self.history_models);
+        let store = self.system.state_store();
         tokio::spawn(async move {
             let result = match command {
                 Command::Call(input) => match root.call(input).await {
@@ -222,6 +245,15 @@ impl Runtime {
                         );
                         CommandResult::Call(Ok(CompletedCall { output, run_id }))
                     }
+                    Err(AgentSystemError::Actor(ActorError::Interrupted)) => {
+                        tracing::debug!(
+                            target: "lam_tui::runtime",
+                            event = "tui.call_interrupted",
+                            actor_id = "/root",
+                            "root call was interrupted"
+                        );
+                        CommandResult::CallInterrupted
+                    }
                     Err(error) => {
                         tracing::error!(
                             target: "lam_tui::runtime",
@@ -232,6 +264,18 @@ impl Runtime {
                         CommandResult::Call(Err(error.to_string()))
                     }
                 },
+                Command::Interrupt => {
+                    let result = match root.interrupt().await {
+                        Ok(Some(receipt)) => {
+                            interrupted_tree(store.as_ref(), &history_models, &receipt)
+                                .await
+                                .map(Some)
+                        }
+                        Ok(None) => Ok(None),
+                        Err(error) => Err(error.to_string()),
+                    };
+                    CommandResult::Interrupt(result)
+                }
                 Command::Compact => {
                     let result = root.compact().await.map(|receipt| match receipt {
                         Some(receipt) => format!(
@@ -475,6 +519,12 @@ fn session_history(
                     let Some(message) = state.message(message_id) else {
                         continue;
                     };
+                    if matches!(message.envelope.source(), MessageSource::Host { .. })
+                        && let Some(entry) = runtime_notice(message.envelope.payload())
+                    {
+                        history.push(entry);
+                        continue;
+                    }
                     let (kind, title) = match message.envelope.source() {
                         MessageSource::User { .. } => (HistoryKind::User, "You".to_owned()),
                         MessageSource::Host { component } => {
@@ -545,6 +595,12 @@ fn agent_history(
     restored_child: bool,
 ) -> AgentHistory {
     let active = state.active_run().is_some();
+    let interrupted = state.context().last().is_some_and(|entry| {
+        matches!(
+            entry.entry.transition,
+            ContextTransition::Interrupted { .. }
+        )
+    });
     AgentHistory {
         address: address.to_owned(),
         parent: address
@@ -558,6 +614,8 @@ fn agent_history(
             "Interrupted".to_owned()
         } else if active {
             "Recovering…".to_owned()
+        } else if interrupted && restored_child {
+            "Interrupted".to_owned()
         } else if restored_child {
             "Stored".to_owned()
         } else {
@@ -569,25 +627,107 @@ fn agent_history(
 }
 
 async fn load_stored_actors(store: &RedbStore) -> Result<Vec<(ActorId, ActorState)>, String> {
-    const PAGE_SIZE: NonZeroUsize = NonZeroUsize::new(256).expect("256 is nonzero");
     let actor_ids = store.actor_ids().map_err(|error| error.to_string())?;
     let mut actors = Vec::with_capacity(actor_ids.len());
     for actor in actor_ids {
-        let mut state = ActorState::new();
-        loop {
-            let page = store
-                .read(&actor, state.revision(), PAGE_SIZE)
-                .await
-                .map_err(|error| error.to_string())?;
-            let head = page.head;
-            state = state.fold_page(page).map_err(|error| error.to_string())?;
-            if state.revision() == head {
-                break;
-            }
-        }
+        let state = load_actor_state(store, &actor).await?;
         actors.push((actor, state));
     }
     Ok(actors)
+}
+
+async fn interrupted_tree(
+    store: &RedbStore,
+    models: &[ConfiguredModel],
+    receipt: &AgentTreeInterruptionReceipt,
+) -> Result<InterruptedTree, String> {
+    let mut agents = Vec::with_capacity(receipt.actors.len());
+    let mut runs = Vec::new();
+    for actor in &receipt.actors {
+        let actor_id = ActorId::new(actor.address.as_str()).map_err(|error| error.to_string())?;
+        let state = load_actor_state(store, &actor_id).await?;
+        agents.push(agent_history(
+            actor.address.as_str(),
+            &state,
+            models,
+            actor.address != receipt.root,
+        ));
+        if let Some(interruption) = &actor.interruption {
+            runs.push(InterruptedRun {
+                address: actor.address.to_string(),
+                run_id: interruption.run_id.to_string(),
+            });
+        }
+    }
+    Ok(InterruptedTree { agents, runs })
+}
+
+async fn load_actor_state(store: &RedbStore, actor: &ActorId) -> Result<ActorState, String> {
+    const PAGE_SIZE: NonZeroUsize = NonZeroUsize::new(256).expect("256 is nonzero");
+    let mut state = ActorState::new();
+    loop {
+        let page = store
+            .read(actor, state.revision(), PAGE_SIZE)
+            .await
+            .map_err(|error| error.to_string())?;
+        let head = page.head;
+        state = state.fold_page(page).map_err(|error| error.to_string())?;
+        if state.revision() == head {
+            return Ok(state);
+        }
+    }
+}
+
+fn runtime_notice(payload: &EncodedPayload) -> Option<HistoryEntry> {
+    if payload.codec.id.as_str() != SYSTEM_NOTICE_CODEC_ID {
+        return None;
+    }
+    let notice = payload.decode::<SystemNotice>().ok()?;
+    let (title, body) = match notice {
+        SystemNotice::RunInterrupted {
+            run_id,
+            isolate_state,
+            interrupted_eval_outcome,
+            ..
+        } => {
+            let mut body = format!("Run {run_id} was stopped at the user's request.");
+            match isolate_state {
+                IsolateState::Retained => body.push_str(" TypeScript state was retained."),
+                IsolateState::Reset => body.push_str(
+                    " The TypeScript isolate was reset; external effects may already have completed.",
+                ),
+            }
+            match interrupted_eval_outcome {
+                Some(InterruptedEvalOutcome::FailureRecorded) => {
+                    body.push_str(" A failure result was recorded for the interrupted eval.");
+                }
+                Some(InterruptedEvalOutcome::Unknown) => {
+                    body.push_str(" The interrupted eval has no authoritative result.");
+                }
+                None => {}
+            }
+            ("Run interrupted", body)
+        }
+        SystemNotice::RuntimeResumed {
+            isolate_state,
+            resumed_run_id,
+            interrupted_eval_outcome,
+        } => {
+            let run = resumed_run_id
+                .map(|run_id| format!(" while recovering run {run_id}"))
+                .unwrap_or_default();
+            let mut body = format!("The runtime resumed{run} with {isolate_state:?} state.");
+            if interrupted_eval_outcome.is_some() {
+                body.push_str(" A prior eval did not have an authoritative result.");
+            }
+            ("Runtime resumed", body)
+        }
+    };
+    Some(HistoryEntry {
+        kind: HistoryKind::System,
+        title: title.to_owned(),
+        body,
+    })
 }
 
 fn display_json(value: &serde_json::Value) -> String {
@@ -742,13 +882,17 @@ mod tests {
     use std::path::Path;
 
     use lam::{
-        ActorEvent, ActorId, AppendOutcome, DeliveryMode, EncodedPayload, EventBatch, JournalStore,
-        MessageEnvelope, MessageId, MessageSource, Revision, Timestamp,
+        ActorEvent, ActorId, AppendOutcome, CodecId, CodecRef, DeliveryMode, EncodedPayload,
+        EventBatch, InterruptionReason, IsolateState, JournalStore, MessageEnvelope, MessageId,
+        MessageSource, Revision, RunId, SYSTEM_NOTICE_CODEC_ID, SYSTEM_NOTICE_CODEC_VERSION,
+        SystemNotice, Timestamp,
     };
     use lam_redb::RedbStore;
     use serde_json::json;
 
-    use super::{EffortControl, coding_instruction, first_user_message, insert_json_path};
+    use super::{
+        EffortControl, coding_instruction, first_user_message, insert_json_path, runtime_notice,
+    };
     use crate::config::ModelChoice;
     use crate::session::Session;
 
@@ -791,6 +935,33 @@ mod tests {
             first_user_message(&session).await.unwrap().as_deref(),
             Some("First question\nwith detail")
         );
+    }
+
+    #[test]
+    fn interruption_notice_has_a_stable_human_readable_history_row() {
+        let payload = EncodedPayload::new(
+            CodecRef::new(
+                CodecId::new(SYSTEM_NOTICE_CODEC_ID).unwrap(),
+                SYSTEM_NOTICE_CODEC_VERSION,
+            ),
+            serde_json::to_value(SystemNotice::RunInterrupted {
+                run_id: RunId::new("run-1").unwrap(),
+                reason: InterruptionReason::User,
+                isolate_state: IsolateState::Reset,
+                interrupted_eval_outcome: Some(lam::InterruptedEvalOutcome::FailureRecorded),
+            })
+            .unwrap(),
+        );
+
+        let row = runtime_notice(&payload).unwrap();
+
+        assert_eq!(row.title, "Run interrupted");
+        assert!(row.body.contains("stopped at the user's request"));
+        assert!(
+            row.body
+                .contains("external effects may already have completed")
+        );
+        assert!(row.body.contains("failure result was recorded"));
     }
 
     #[test]

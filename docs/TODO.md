@@ -3,7 +3,7 @@
 ## Agent runtime
 
 - [ ] Implement world state for dynamic agent state.
-- [ ] Esc to recoverably interrupt all running agents. This is tabled core work, not part of the current TUI polish pass.
+- [x] Esc to recoverably interrupt all running agents.
   - Scope is always `/root` and its complete active descendant tree, regardless of the selected `/agents` view or focused pane.
   - Escape has this singular purpose: it never clears draft input or changes pane focus, and it does nothing when no root work is active.
   - Borrow the deliberate double-Escape UX: the first physical key press arms interruption and flashes `Press Esc again to stop the current run` immediately above the input; a second physical press within 1.5 seconds triggers it. Key-repeat events must not count as the second press.

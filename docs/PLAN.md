@@ -1434,7 +1434,7 @@ The same actor can begin a new run after interruption. Both OpenAI Responses
 and Chat Completions replay the explicit eval failure and runtime notice using
 their native tool-result and system/developer message forms. Tree-wide fan-out
 and descendant retirement are implemented by the higher-level scheduler; the
-embedding's double-Escape interaction remains a separate slice.
+TUI exposes the boundary through a deliberate double-Escape interaction.
 
 ### Slice 5: real provider codec
 

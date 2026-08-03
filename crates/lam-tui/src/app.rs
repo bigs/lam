@@ -1,18 +1,21 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::{Duration, Instant};
 
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use lam::{ModelDelta, RunEvent, RunId, RuntimeEvent, ToolCallDelta};
-use lam_agents::{AgentOutcome, AgentSystemEvent};
+use lam_agents::{AgentOutcome, AgentSystemEvent, StopReason};
 use unicode_width::UnicodeWidthChar;
 
 use crate::config::ModelChoice;
 use crate::runtime::{
-    AgentHistory, Command, CommandResult, CompletedCall, HistoryEntry, HistoryKind,
+    AgentHistory, Command, CommandResult, CompletedCall, HistoryEntry, HistoryKind, InterruptedTree,
 };
 
 const MOUSE_SCROLL_LINES: usize = 3;
+const INTERRUPTION_ARM_WINDOW: Duration = Duration::from_millis(1_500);
+const INTERRUPTION_WARNING: &str = "Press Esc again to stop the current run";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Focus {
@@ -117,6 +120,11 @@ pub(crate) struct App {
     output_fallback: Option<OutputFallback>,
     root_run_completed: bool,
     completed_run_id: Option<String>,
+    ignored_run_ids: BTreeSet<String>,
+    root_run_active: bool,
+    call_in_progress: bool,
+    interruption_deadline: Option<Instant>,
+    interruption_in_progress: bool,
 }
 
 struct AgentConversation {
@@ -131,6 +139,7 @@ struct AgentConversation {
     output_fallback: Option<OutputFallback>,
     run_completed: bool,
     completed_run_id: Option<String>,
+    ignored_run_ids: BTreeSet<String>,
 }
 
 struct OutputFallback {
@@ -168,6 +177,7 @@ impl App {
                 agents.len() - 1
             });
         let root = agents.remove(root_index);
+        let root_run_active = !root.run_completed;
         let mut entries = history_entries(root.history);
         entries.push(ConversationEntry {
             kind: EntryKind::System,
@@ -210,7 +220,7 @@ impl App {
             conversation_viewport_height: 1,
             conversation_total_lines: 0,
             suggestion_index: 0,
-            busy: false,
+            busy: root_run_active,
             status: root.status,
             should_exit: false,
             hitboxes: Vec::new(),
@@ -222,6 +232,11 @@ impl App {
             output_fallback: None,
             root_run_completed: root.run_completed,
             completed_run_id: None,
+            ignored_run_ids: BTreeSet::new(),
+            root_run_active,
+            call_in_progress: false,
+            interruption_deadline: None,
+            interruption_in_progress: false,
         }
     }
 
@@ -250,6 +265,25 @@ impl App {
             .efforts
             .get(self.selected_efforts[model_index])
             .map(String::as_str)
+    }
+
+    pub(crate) fn interruption_warning(&self) -> Option<&'static str> {
+        self.interruption_deadline.map(|_| INTERRUPTION_WARNING)
+    }
+
+    pub(crate) const fn interruption_deadline(&self) -> Option<Instant> {
+        self.interruption_deadline
+    }
+
+    pub(crate) fn expire_interruption(&mut self, now: Instant) -> bool {
+        if self
+            .interruption_deadline
+            .is_some_and(|deadline| now >= deadline)
+        {
+            self.interruption_deadline = None;
+            return true;
+        }
+        false
     }
 
     pub(crate) fn suggestions(&self) -> Vec<Suggestion> {
@@ -364,6 +398,12 @@ impl App {
         if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
             return None;
         }
+        if key.code == KeyCode::Esc {
+            return (key.kind == KeyEventKind::Press)
+                .then(|| self.handle_escape(Instant::now()))
+                .flatten();
+        }
+        self.disarm_interruption();
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             if self.input.text.is_empty() {
                 self.should_exit = true;
@@ -388,6 +428,30 @@ impl App {
                 None
             }
         }
+    }
+
+    fn handle_escape(&mut self, now: Instant) -> Option<Command> {
+        if !self.root_run_active || self.interruption_in_progress {
+            self.disarm_interruption();
+            return None;
+        }
+        if self
+            .interruption_deadline
+            .is_some_and(|deadline| now <= deadline)
+        {
+            self.interruption_deadline = None;
+            self.interruption_in_progress = true;
+            self.with_agent("/root", |app| {
+                app.status = "Stopping current run…".to_owned();
+            });
+            return Some(Command::Interrupt);
+        }
+        self.interruption_deadline = Some(now + INTERRUPTION_ARM_WINDOW);
+        None
+    }
+
+    fn disarm_interruption(&mut self) {
+        self.interruption_deadline = None;
     }
 
     fn handle_input_key(&mut self, key: KeyEvent, suggestions: &[Suggestion]) -> Option<Command> {
@@ -478,19 +542,13 @@ impl App {
                 self.suggestion_index = 0;
                 None
             }
-            KeyCode::Esc => {
-                self.input = InputBuffer::default();
-                self.input_history = None;
-                self.suggestion_index = 0;
-                None
-            }
             _ => None,
         }
     }
 
     fn handle_conversation_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Tab | KeyCode::BackTab | KeyCode::Esc => self.focus = Focus::Input,
+            KeyCode::Tab | KeyCode::BackTab => self.focus = Focus::Input,
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
             KeyCode::PageUp => self.move_selection(-8),
@@ -667,6 +725,7 @@ impl App {
                 }
                 self.push_expanded_entry(EntryKind::User, "You", input.clone());
                 self.busy = true;
+                self.call_in_progress = true;
                 self.status = "Thinking…".to_owned();
                 Some(Command::Call(input))
             }
@@ -770,12 +829,16 @@ impl App {
                 let address = address.to_string();
                 self.ensure_agent(&address, parent_address(&address), "Stopped");
                 self.with_agent(&address, |app| {
-                    app.push_entry(
-                        EntryKind::System,
-                        "Agent stopped",
-                        format!("{address}: {reason:?}"),
-                    );
-                    app.status = "Stopped".to_owned();
+                    if reason == StopReason::Interrupted {
+                        app.status = "Interrupted".to_owned();
+                    } else {
+                        app.push_entry(
+                            EntryKind::System,
+                            "Agent stopped",
+                            format!("{address}: {reason:?}"),
+                        );
+                        app.status = "Stopped".to_owned();
+                    }
                 });
                 address
             }
@@ -806,6 +869,10 @@ impl App {
     }
 
     fn apply_run_event(&mut self, address: &str, event: RunEvent) {
+        if run_event_id(&event).is_some_and(|run_id| self.ignored_run_ids.contains(run_id.as_str()))
+        {
+            return;
+        }
         match event {
             RunEvent::Started { run_id } => {
                 if self.is_completed_run(&run_id) {
@@ -815,6 +882,11 @@ impl App {
                 self.root_run_completed = false;
                 self.completed_run_id = None;
                 self.status = format!("{address} is working…");
+                if address == "/root" {
+                    self.root_run_active = true;
+                    self.busy = true;
+                    self.disarm_interruption();
+                }
             }
             RunEvent::MessagesDelivered { run_id, .. } => {
                 if !self.is_completed_run(&run_id) {
@@ -933,6 +1005,13 @@ impl App {
                 } else {
                     "Complete".to_owned()
                 };
+                if address == "/root" {
+                    self.root_run_active = false;
+                    self.disarm_interruption();
+                    if !self.call_in_progress && !self.interruption_in_progress {
+                        self.busy = false;
+                    }
+                }
             }
             RunEvent::Failed { message } => {
                 tracing::error!(
@@ -942,6 +1021,13 @@ impl App {
                     "agent run failed"
                 );
                 self.push_error("Run failed", message);
+                if address == "/root" {
+                    self.root_run_active = false;
+                    self.disarm_interruption();
+                    if !self.call_in_progress && !self.interruption_in_progress {
+                        self.busy = false;
+                    }
+                }
             }
         }
     }
@@ -972,19 +1058,30 @@ impl App {
             }
             AgentOutcome::Cancelled {
                 address, reason, ..
-            } => self.push_error(
-                format!("{address} cancelled"),
-                reason.unwrap_or_else(|| "No reason was reported.".to_owned()),
-            ),
+            } => {
+                if reason.as_deref() == Some("the actor run was interrupted") {
+                    self.status = "Interrupted".to_owned();
+                } else {
+                    self.push_error(
+                        format!("{address} cancelled"),
+                        reason.unwrap_or_else(|| "No reason was reported.".to_owned()),
+                    );
+                }
+            }
         }
     }
 
     pub(crate) fn apply_command_result(&mut self, result: CommandResult) {
-        self.busy = false;
         let current = self.current_agent.clone();
         self.switch_agent("/root");
         match result {
             CommandResult::Call(Ok(CompletedCall { output, run_id })) => {
+                self.call_in_progress = false;
+                self.root_run_active = false;
+                self.disarm_interruption();
+                if !self.interruption_in_progress {
+                    self.busy = false;
+                }
                 self.root_run_completed = true;
                 self.completed_run_id = if output.trim().is_empty() {
                     run_id
@@ -993,16 +1090,55 @@ impl App {
                 };
                 self.status = "Ready".to_owned();
             }
-            CommandResult::Call(Err(error)) => self.push_error("Agent failed", error),
+            CommandResult::Call(Err(error)) => {
+                self.call_in_progress = false;
+                self.root_run_active = false;
+                self.disarm_interruption();
+                if !self.interruption_in_progress {
+                    self.busy = false;
+                }
+                self.push_error("Agent failed", error);
+            }
+            CommandResult::CallInterrupted => {
+                self.call_in_progress = false;
+                self.root_run_active = false;
+                self.disarm_interruption();
+                if !self.interruption_in_progress {
+                    self.busy = false;
+                    self.status = "Ready".to_owned();
+                }
+            }
+            CommandResult::Interrupt(Ok(Some(tree))) => self.apply_interrupted_tree(tree),
+            CommandResult::Interrupt(Ok(None)) => {
+                self.interruption_in_progress = false;
+                self.disarm_interruption();
+                self.busy = self.root_run_active || self.call_in_progress;
+                self.status = if self.root_run_active {
+                    "/root is working…".to_owned()
+                } else {
+                    "Ready".to_owned()
+                };
+            }
+            CommandResult::Interrupt(Err(error)) => {
+                self.interruption_in_progress = false;
+                self.disarm_interruption();
+                self.busy = self.root_run_active || self.call_in_progress;
+                self.push_error("Could not stop run", error);
+            }
             CommandResult::Compact(Ok(message)) => {
+                self.busy = false;
                 self.push_entry(EntryKind::System, "Compact", message);
                 self.status = "Ready".to_owned();
             }
-            CommandResult::Compact(Err(error)) => self.push_error("Compaction failed", error),
+            CommandResult::Compact(Err(error)) => {
+                self.busy = false;
+                self.push_error("Compaction failed", error);
+            }
             CommandResult::SwitchModel {
                 index,
                 result: Ok(message),
             } => {
+                self.busy = false;
                 self.selected_model = index;
                 self.current_model = Some(self.models[index].registry_id.clone());
                 self.push_entry(EntryKind::System, "Model", message);
@@ -1010,12 +1146,16 @@ impl App {
             }
             CommandResult::SwitchModel {
                 result: Err(error), ..
-            } => self.push_error("Model switch failed", error),
+            } => {
+                self.busy = false;
+                self.push_error("Model switch failed", error);
+            }
             CommandResult::SetEffort {
                 index,
                 effort,
                 result: Ok(message),
             } => {
+                self.busy = false;
                 let effort_index = self.models[index]
                     .efforts
                     .iter()
@@ -1027,11 +1167,51 @@ impl App {
             }
             CommandResult::SetEffort {
                 result: Err(error), ..
-            } => self.push_error("Effort switch failed", error),
+            } => {
+                self.busy = false;
+                self.push_error("Effort switch failed", error);
+            }
         }
         if current != "/root" {
             self.switch_agent(&current);
         }
+    }
+
+    fn apply_interrupted_tree(&mut self, tree: InterruptedTree) {
+        let InterruptedTree { agents, runs } = tree;
+        for history in agents {
+            let address = history.address.clone();
+            let interrupted_runs = runs
+                .iter()
+                .filter(|run| run.address == address)
+                .map(|run| run.run_id.clone())
+                .collect::<Vec<_>>();
+            self.ensure_agent(&address, history.parent.clone(), &history.status);
+            self.with_agent(&address, move |app| {
+                let entries = history_entries(history.history);
+                app.selected_entry = if entries.is_empty() {
+                    None
+                } else if app.follow_conversation_tail {
+                    entries.len().checked_sub(1)
+                } else {
+                    app.selected_entry
+                        .map(|selected| selected.min(entries.len() - 1))
+                };
+                app.entries = entries;
+                app.status = history.status;
+                app.current_parent = history.parent;
+                app.current_model = history.model;
+                app.output_fallback = None;
+                app.root_run_completed = history.run_completed;
+                app.completed_run_id = None;
+                app.ignored_run_ids.extend(interrupted_runs);
+            });
+        }
+        self.busy = false;
+        self.root_run_active = false;
+        self.call_in_progress = false;
+        self.interruption_in_progress = false;
+        self.disarm_interruption();
     }
 
     fn append_delta(&mut self, kind: EntryKind, address: &str, run_id: &RunId, delta: String) {
@@ -1350,6 +1530,7 @@ impl App {
             output_fallback: self.output_fallback.take(),
             run_completed: self.root_run_completed,
             completed_run_id: self.completed_run_id.take(),
+            ignored_run_ids: std::mem::take(&mut self.ignored_run_ids),
         };
         let previous_address = std::mem::replace(&mut self.current_agent, address.to_owned());
         self.inactive_agents.insert(previous_address, previous);
@@ -1364,6 +1545,7 @@ impl App {
         self.output_fallback = next.output_fallback;
         self.root_run_completed = next.run_completed;
         self.completed_run_id = next.completed_run_id;
+        self.ignored_run_ids = next.ignored_run_ids;
         true
     }
 
@@ -1402,6 +1584,7 @@ impl AgentConversation {
             output_fallback: None,
             run_completed: false,
             completed_run_id: None,
+            ignored_run_ids: BTreeSet::new(),
         }
     }
 
@@ -1419,6 +1602,7 @@ impl AgentConversation {
             output_fallback: None,
             run_completed: history.run_completed,
             completed_run_id: None,
+            ignored_run_ids: BTreeSet::new(),
         }
     }
 }
@@ -1439,6 +1623,23 @@ fn outcome_address(outcome: &AgentOutcome) -> &str {
         AgentOutcome::Completed { address, .. }
         | AgentOutcome::Failed { address, .. }
         | AgentOutcome::Cancelled { address, .. } => address.as_str(),
+    }
+}
+
+fn run_event_id(event: &RunEvent) -> Option<&RunId> {
+    match event {
+        RunEvent::Started { run_id }
+        | RunEvent::MessagesDelivered { run_id, .. }
+        | RunEvent::ModelStarted { run_id }
+        | RunEvent::ModelDelta { run_id, .. }
+        | RunEvent::ModelCompleted { run_id, .. }
+        | RunEvent::CompactionStarted { run_id, .. }
+        | RunEvent::CompactionCompleted { run_id, .. }
+        | RunEvent::CompactionFailed { run_id, .. }
+        | RunEvent::EvalStarted { run_id, .. }
+        | RunEvent::EvalCompleted { run_id, .. }
+        | RunEvent::Completed { run_id } => Some(run_id),
+        RunEvent::Failed { .. } => None,
     }
 }
 
@@ -1774,7 +1975,7 @@ fn byte_index(text: &str, character: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use crossterm::event::{
-        KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
     use lam::{
         EvalOutcome, EvalOutput, EvalRequest, EvalValue, ModelDelta, RunEvent, RunId, ToolCallDelta,
@@ -1787,6 +1988,7 @@ mod tests {
     use crate::config::ModelChoice;
     use crate::runtime::{
         AgentHistory, Command, CommandResult, CompletedCall, HistoryEntry, HistoryKind,
+        InterruptedRun, InterruptedTree,
     };
 
     fn app() -> App {
@@ -1932,6 +2134,146 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(app.focus, Focus::Conversation);
         assert!(app.follow_conversation_tail);
+    }
+
+    #[test]
+    fn escape_requires_two_physical_presses_and_preserves_the_draft() {
+        let mut app = app();
+        let run_id = RunId::new("run-escape").unwrap();
+        app.apply_agent_event(AgentSystemEvent::Run {
+            address: ActorAddress::new("/root").unwrap(),
+            event: RunEvent::Started {
+                run_id: run_id.clone(),
+            },
+        });
+        app.input = InputBuffer::at_end("keep this draft".to_owned());
+
+        assert!(
+            app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+                .is_none()
+        );
+        assert_eq!(app.input.text, "keep this draft");
+        assert_eq!(
+            app.interruption_warning(),
+            Some("Press Esc again to stop the current run")
+        );
+        assert!(
+            app.handle_key(KeyEvent::new_with_kind(
+                KeyCode::Esc,
+                KeyModifiers::NONE,
+                KeyEventKind::Repeat,
+            ))
+            .is_none()
+        );
+        assert!(app.interruption_warning().is_some());
+
+        let command = app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(command, Some(Command::Interrupt)));
+        assert!(app.interruption_warning().is_none());
+        assert!(app.interruption_in_progress);
+        assert_eq!(app.input.text, "keep this draft");
+    }
+
+    #[test]
+    fn interruption_warning_disarms_on_other_input_timeout_and_run_completion() {
+        let mut app = app();
+        let run_id = RunId::new("run-disarm").unwrap();
+        app.apply_agent_event(AgentSystemEvent::Run {
+            address: ActorAddress::new("/root").unwrap(),
+            event: RunEvent::Started {
+                run_id: run_id.clone(),
+            },
+        });
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(app.interruption_warning().is_none());
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let deadline = app.interruption_deadline().unwrap();
+        assert!(app.expire_interruption(deadline));
+        assert!(app.interruption_warning().is_none());
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.apply_agent_event(AgentSystemEvent::Run {
+            address: ActorAddress::new("/root").unwrap(),
+            event: RunEvent::Completed { run_id },
+        });
+        assert!(app.interruption_warning().is_none());
+    }
+
+    #[test]
+    fn durable_interruption_replaces_transient_rows_and_ignores_late_deltas() {
+        let mut app = app();
+        let run_id = RunId::new("run-reconcile").unwrap();
+        let root = ActorAddress::new("/root").unwrap();
+        app.apply_agent_event(AgentSystemEvent::Run {
+            address: root.clone(),
+            event: RunEvent::Started {
+                run_id: run_id.clone(),
+            },
+        });
+        app.apply_agent_event(AgentSystemEvent::Run {
+            address: root.clone(),
+            event: RunEvent::ModelDelta {
+                run_id: run_id.clone(),
+                delta: ModelDelta::Text("partial assistant output".to_owned()),
+            },
+        });
+        app.interruption_in_progress = true;
+
+        app.apply_command_result(CommandResult::Interrupt(Ok(Some(InterruptedTree {
+            agents: vec![AgentHistory {
+                address: "/root".to_owned(),
+                parent: None,
+                model: Some("openai/gpt-5".to_owned()),
+                status: "Ready".to_owned(),
+                run_completed: true,
+                history: vec![
+                    HistoryEntry {
+                        kind: HistoryKind::User,
+                        title: "You".to_owned(),
+                        body: "Do some work".to_owned(),
+                    },
+                    HistoryEntry {
+                        kind: HistoryKind::System,
+                        title: "Run interrupted".to_owned(),
+                        body: "The run was stopped.".to_owned(),
+                    },
+                ],
+            }],
+            runs: vec![InterruptedRun {
+                address: "/root".to_owned(),
+                run_id: run_id.to_string(),
+            }],
+        }))));
+
+        assert!(!app.busy);
+        assert_eq!(app.status, "Ready");
+        assert!(
+            app.entries
+                .iter()
+                .all(|entry| !entry.body.contains("partial assistant"))
+        );
+        assert!(
+            app.entries
+                .iter()
+                .any(|entry| entry.title == "Run interrupted")
+        );
+        let entry_count = app.entries.len();
+        app.apply_agent_event(AgentSystemEvent::Run {
+            address: root,
+            event: RunEvent::ModelDelta {
+                run_id,
+                delta: ModelDelta::Text("late buffered delta".to_owned()),
+            },
+        });
+        assert_eq!(app.entries.len(), entry_count);
+        assert!(
+            app.entries
+                .iter()
+                .all(|entry| !entry.body.contains("late buffered"))
+        );
     }
 
     #[test]
