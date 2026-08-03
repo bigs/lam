@@ -121,7 +121,11 @@ fn render_conversation(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let width = usize::from(inner.width.max(1));
     let mut lines = Vec::new();
     let mut ranges = Vec::with_capacity(app.entries.len());
+    let mut previous_kind = None;
     for (index, entry) in app.entries.iter().enumerate() {
+        if needs_message_spacing(previous_kind, Some(entry.kind)) {
+            lines.push(Line::default());
+        }
         let start = lines.len();
         entry_lines(
             entry,
@@ -131,6 +135,10 @@ fn render_conversation(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         );
         let end = lines.len().saturating_sub(1);
         ranges.push((start, end));
+        previous_kind = Some(entry.kind);
+    }
+    if needs_message_spacing(previous_kind, None) {
+        lines.push(Line::default());
     }
 
     let viewport = usize::from(inner.height);
@@ -164,6 +172,14 @@ fn render_conversation(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             app.hitboxes.push((y_start, y_end, index));
         }
     }
+}
+
+fn needs_message_spacing(previous: Option<EntryKind>, next: Option<EntryKind>) -> bool {
+    previous.is_some_and(is_text_message) || next.is_some_and(is_text_message)
+}
+
+fn is_text_message(kind: EntryKind) -> bool {
+    matches!(kind, EntryKind::User | EntryKind::Assistant)
 }
 
 fn viewport_offset(
@@ -795,12 +811,38 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     use super::{
-        PANEL, elide_end, markdown_lines, markdown_preview, render, renders_markdown,
-        viewport_offset, wrap_text,
+        PANEL, elide_end, markdown_lines, markdown_preview, needs_message_spacing, render,
+        renders_markdown, viewport_offset, wrap_text,
     };
     use crate::app::{App, EntryKind, SessionChoice, SessionView};
     use crate::config::ModelChoice;
     use crate::runtime::{AgentHistory, HistoryEntry, HistoryKind};
+
+    fn test_app(history: Vec<HistoryEntry>) -> App {
+        App::new(
+            "/tmp/project".to_owned(),
+            "/tmp/providers.toml".to_owned(),
+            SessionView {
+                id: 1,
+                journal_path: "/tmp/session.redb".to_owned(),
+                resumed: false,
+                agents: vec![AgentHistory::root(history)],
+                choices: vec![SessionChoice {
+                    id: 1,
+                    preview: None,
+                }],
+            },
+            vec![ModelChoice {
+                registry_id: "openai/gpt-5".to_owned(),
+                provider: "openai".to_owned(),
+                model: "gpt-5".to_owned(),
+                display_name: "GPT-5".to_owned(),
+                context_window: 400_000,
+                efforts: vec!["low".to_owned(), "high".to_owned()],
+            }],
+            0,
+        )
+    }
 
     #[test]
     fn wraps_wide_characters_by_terminal_cells() {
@@ -895,6 +937,54 @@ mod tests {
     }
 
     #[test]
+    fn text_message_spacing_is_deduplicated_at_shared_boundaries() {
+        assert!(needs_message_spacing(None, Some(EntryKind::User)));
+        assert!(needs_message_spacing(
+            Some(EntryKind::User),
+            Some(EntryKind::Assistant)
+        ));
+        assert!(needs_message_spacing(
+            Some(EntryKind::Assistant),
+            Some(EntryKind::ToolCall)
+        ));
+        assert!(needs_message_spacing(
+            Some(EntryKind::ToolResult),
+            Some(EntryKind::User)
+        ));
+        assert!(needs_message_spacing(Some(EntryKind::Assistant), None));
+        assert!(!needs_message_spacing(
+            Some(EntryKind::ToolCall),
+            Some(EntryKind::ToolResult)
+        ));
+        assert!(!needs_message_spacing(Some(EntryKind::ToolResult), None));
+    }
+
+    #[test]
+    fn conversation_geometry_includes_one_blank_line_around_text_messages() {
+        let mut app = test_app(vec![
+            HistoryEntry {
+                kind: HistoryKind::User,
+                title: "You".to_owned(),
+                body: "First prompt".to_owned(),
+            },
+            HistoryEntry {
+                kind: HistoryKind::Assistant,
+                title: "/root".to_owned(),
+                body: "First answer".to_owned(),
+            },
+        ]);
+        app.entries.pop();
+        app.selected_entry = Some(1);
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        assert_eq!(app.conversation_total_lines, 7);
+        assert_eq!(app.conversation_ranges, [(1, 2), (4, 5)]);
+    }
+
+    #[test]
     fn incomplete_streamed_code_fence_renders_its_content() {
         let lines = markdown_lines("Working…\n\n```rust\nlet answer = 42;", 80);
         let rendered = lines.iter().map(ToString::to_string).collect::<String>();
@@ -925,29 +1015,7 @@ mod tests {
 
     #[test]
     fn rendered_header_tracks_the_selected_agent() {
-        let mut app = App::new(
-            "/tmp/project".to_owned(),
-            "/tmp/providers.toml".to_owned(),
-            SessionView {
-                id: 1,
-                journal_path: "/tmp/session.redb".to_owned(),
-                resumed: false,
-                agents: vec![AgentHistory::root(Vec::new())],
-                choices: vec![SessionChoice {
-                    id: 1,
-                    preview: None,
-                }],
-            },
-            vec![ModelChoice {
-                registry_id: "openai/gpt-5".to_owned(),
-                provider: "openai".to_owned(),
-                model: "gpt-5".to_owned(),
-                display_name: "GPT-5".to_owned(),
-                context_window: 400_000,
-                efforts: vec!["low".to_owned(), "high".to_owned()],
-            }],
-            0,
-        );
+        let mut app = test_app(Vec::new());
         app.apply_agent_event(AgentSystemEvent::Hosted {
             address: ActorAddress::new("/root/worker").unwrap(),
             parent: Some(ActorAddress::new("/root").unwrap()),
@@ -971,33 +1039,11 @@ mod tests {
 
     #[test]
     fn collapsed_eval_rows_hide_source_until_expanded() {
-        let mut app = App::new(
-            "/tmp/project".to_owned(),
-            "/tmp/providers.toml".to_owned(),
-            SessionView {
-                id: 1,
-                journal_path: "/tmp/session.redb".to_owned(),
-                resumed: false,
-                agents: vec![AgentHistory::root(vec![HistoryEntry {
-                    kind: HistoryKind::ToolCall,
-                    title: "/root · Inspect the workspace".to_owned(),
-                    body: "const secret_marker = await lam.fs.list({ path: '.' });".to_owned(),
-                }])],
-                choices: vec![SessionChoice {
-                    id: 1,
-                    preview: None,
-                }],
-            },
-            vec![ModelChoice {
-                registry_id: "openai/gpt-5".to_owned(),
-                provider: "openai".to_owned(),
-                model: "gpt-5".to_owned(),
-                display_name: "GPT-5".to_owned(),
-                context_window: 400_000,
-                efforts: vec!["low".to_owned(), "high".to_owned()],
-            }],
-            0,
-        );
+        let mut app = test_app(vec![HistoryEntry {
+            kind: HistoryKind::ToolCall,
+            title: "/root · Inspect the workspace".to_owned(),
+            body: "const secret_marker = await lam.fs.list({ path: '.' });".to_owned(),
+        }]);
         let backend = TestBackend::new(100, 24);
         let mut terminal = Terminal::new(backend).unwrap();
 
