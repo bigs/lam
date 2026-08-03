@@ -44,8 +44,8 @@ where
         if model.compactor.is_none() {
             return Ok(state);
         }
-        let trigger = self
-            .compaction_config
+        let compaction_config = model.compaction_config(&self.compaction_config);
+        let trigger = compaction_config
             .automatic_trigger_tokens()
             .map_err(compaction_config_error)?;
         let Some(trigger) = trigger else {
@@ -93,15 +93,15 @@ where
                 CompactionReason::Overflow => Err(ActorError::ContextOverflow),
             };
         };
-        let retain_tokens = self
-            .compaction_config
+        let compaction_config = model.compaction_config(&self.compaction_config);
+        let retain_tokens = compaction_config
             .retain_tokens()
             .map_err(compaction_config_error)?;
         let request = compaction_request(
             &state,
             reason,
             retain_tokens,
-            self.compaction_config.summary_reserve(),
+            compaction_config.summary_reserve(),
             &self.system_prompt,
             None,
             |replacement| model.accepts_compaction_replacement(replacement),

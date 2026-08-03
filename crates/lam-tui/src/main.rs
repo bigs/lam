@@ -3,6 +3,7 @@
 mod app;
 mod config;
 mod runtime;
+mod session;
 mod ui;
 
 use std::env;
@@ -22,9 +23,10 @@ use ratatui::backend::CrosstermBackend;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
-use crate::app::App;
+use crate::app::{App, SessionView};
 use crate::config::LoadedConfig;
 use crate::runtime::{CommandResult, Runtime};
+use crate::session::SessionCatalog;
 
 fn main() -> ExitCode {
     match tokio_main() {
@@ -49,14 +51,25 @@ async fn tokio_main() -> Result<(), AppError> {
     }
 
     let cwd = env::current_dir().map_err(AppError::CurrentDirectory)?;
+    let cwd = cwd
+        .canonicalize()
+        .map_err(AppError::CanonicalCurrentDirectory)?;
     let config = LoadedConfig::load(args.config.as_deref()).map_err(AppError::Config)?;
     let config_path = config.path.display().to_string();
-    let mut runtime = Runtime::build(config, cwd.clone())
+    let sessions = SessionCatalog::open_default().map_err(AppError::Session)?;
+    let selection = sessions.resume_or_create(&cwd).map_err(AppError::Session)?;
+    let mut runtime = Runtime::build(&config, cwd.clone(), &selection.session)
         .await
         .map_err(AppError::Runtime)?;
     let mut app = App::new(
         cwd.display().to_string(),
         config_path,
+        SessionView {
+            id: selection.session.id,
+            journal_path: selection.session.database_path.display().to_string(),
+            resumed: selection.resumed,
+            agents: runtime.agents.clone(),
+        },
         runtime.models.clone(),
         runtime.selected_model,
     );
@@ -75,11 +88,15 @@ async fn tokio_main() -> Result<(), AppError> {
         .map_err(AppError::EventThread)?;
     let (command_results, mut command_receiver) = mpsc::unbounded_channel::<CommandResult>();
 
+    let mut redraw = true;
     while !app.should_exit {
-        terminal
-            .terminal
-            .draw(|frame| ui::render(frame, &mut app))
-            .map_err(AppError::Terminal)?;
+        if redraw {
+            terminal
+                .terminal
+                .draw(|frame| ui::render(frame, &mut app))
+                .map_err(AppError::Terminal)?;
+            redraw = false;
+        }
         tokio::select! {
             terminal_event = terminal_receiver.recv() => {
                 let Some(terminal_event) = terminal_event else {
@@ -88,22 +105,48 @@ async fn tokio_main() -> Result<(), AppError> {
                 match terminal_event.map_err(AppError::Terminal)? {
                     Event::Key(key) => {
                         if let Some(command) = app.handle_key(key) {
-                            runtime.execute(command, command_results.clone());
+                            if matches!(command, crate::runtime::Command::New) {
+                                runtime
+                                    .system
+                                    .shutdown()
+                                    .await
+                                    .map_err(|error| AppError::Shutdown(error.to_string()))?;
+                                let session = sessions.create(&cwd).map_err(AppError::Session)?;
+                                runtime = Runtime::build(&config, cwd.clone(), &session)
+                                    .await
+                                    .map_err(AppError::Runtime)?;
+                                app = App::new(
+                                    cwd.display().to_string(),
+                                    config.path.display().to_string(),
+                                    SessionView {
+                                        id: session.id,
+                                        journal_path: session.database_path.display().to_string(),
+                                        resumed: false,
+                                        agents: runtime.agents.clone(),
+                                    },
+                                    runtime.models.clone(),
+                                    runtime.selected_model,
+                                );
+                            } else {
+                                runtime.execute(command, command_results.clone());
+                            }
                         }
                     }
                     Event::Mouse(mouse) => app.handle_mouse(mouse),
                     Event::Paste(text) => app.handle_paste(&text),
                     Event::Resize(_, _) | Event::FocusGained | Event::FocusLost => {}
                 }
+                redraw = true;
             }
             event = runtime.events.next() => {
                 if let Some(event) = event {
-                    app.apply_agent_event(event);
+                    redraw |= app.apply_agent_event(event);
                 }
             }
             result = command_receiver.recv() => {
                 if let Some(result) = result {
                     app.apply_command_result(result);
+                    redraw = true;
                 }
             }
         }
@@ -219,7 +262,7 @@ impl Drop for TerminalSession {
 
 fn print_help() {
     println!(
-        "lam — a minimal TypeScript coding agent\n\nUSAGE:\n    lam [--config PATH]\n\nOPTIONS:\n    --config PATH  Read providers from PATH instead of ~/.lam/providers.toml\n    -h, --help     Show this help\n    -V, --version  Show the version\n\nInside the TUI, type / for commands. Tab switches focus between the input shelf\nand conversation; arrows select transcript rows; Enter expands the selected row."
+        "lam — a minimal TypeScript coding agent\n\nUSAGE:\n    lam [--config PATH]\n\nOPTIONS:\n    --config PATH  Read providers from PATH instead of ~/.lam/providers.toml\n    -h, --help     Show this help\n    -V, --version  Show the version\n\nLam resumes the latest durable session for the current directory. Inside the TUI,\ntype / for commands, including /new for a fresh session. Tab switches focus\nbetween the input shelf and conversation; arrows select transcript rows; Enter\nexpands the selected row."
     );
 }
 
@@ -229,10 +272,14 @@ enum AppError {
     Arguments(String),
     #[error("could not read the current directory: {0}")]
     CurrentDirectory(std::io::Error),
+    #[error("could not resolve the current directory: {0}")]
+    CanonicalCurrentDirectory(std::io::Error),
     #[error(
         "{0}\n\nCreate the file or pass --config PATH. See crates/lam-tui/README.md for an example."
     )]
     Config(crate::config::ConfigError),
+    #[error(transparent)]
+    Session(crate::session::SessionError),
     #[error(transparent)]
     Runtime(crate::runtime::RuntimeError),
     #[error("terminal operation failed: {0}")]

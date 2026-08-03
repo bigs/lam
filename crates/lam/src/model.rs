@@ -3,8 +3,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use lam_core::{
-    CompactionArtifact, Compactor, EncodedPayload, ModelCodec, ModelDescriptor, ModelDirective,
-    ModelEventSink, ModelProvider, ModelRequestConfig, ModelResponseMetadata,
+    CompactionArtifact, CompactionConfig, Compactor, EncodedPayload, ModelCodec, ModelDescriptor,
+    ModelDirective, ModelEventSink, ModelProvider, ModelRequestConfig, ModelResponseMetadata,
     ProjectedContextEntry,
 };
 
@@ -13,6 +13,7 @@ pub struct Model<P, C> {
     pub(crate) provider: Arc<P>,
     pub(crate) codec: Arc<C>,
     descriptor: ModelDescriptor,
+    context_window_tokens: Option<u64>,
 }
 
 impl<P, C> Clone for Model<P, C> {
@@ -21,6 +22,7 @@ impl<P, C> Clone for Model<P, C> {
             provider: Arc::clone(&self.provider),
             codec: Arc::clone(&self.codec),
             descriptor: self.descriptor.clone(),
+            context_window_tokens: self.context_window_tokens,
         }
     }
 }
@@ -42,6 +44,7 @@ impl<P, C> Model<P, C> {
                 std::any::type_name::<C>(),
             )
             .expect("Rust type names are nonempty"),
+            context_window_tokens: None,
         }
     }
 
@@ -50,6 +53,19 @@ impl<P, C> Model<P, C> {
     pub fn with_descriptor(mut self, descriptor: ModelDescriptor) -> Self {
         self.descriptor = descriptor;
         self
+    }
+
+    /// Declares this model's context window for automatic compaction.
+    #[must_use]
+    pub const fn with_context_window_tokens(mut self, tokens: u64) -> Self {
+        self.context_window_tokens = Some(tokens);
+        self
+    }
+
+    /// Returns this model's declared context window, when configured.
+    #[must_use]
+    pub const fn context_window_tokens(&self) -> Option<u64> {
+        self.context_window_tokens
     }
 
     /// Returns the non-secret durable model description.
@@ -68,6 +84,7 @@ impl<P, C> Model<P, C> {
 pub(crate) struct RegisteredModel {
     runtime: Arc<dyn RuntimeModel>,
     pub(crate) compactor: Option<Arc<dyn Compactor>>,
+    context_window_tokens: Option<u64>,
 }
 
 impl Clone for RegisteredModel {
@@ -75,6 +92,7 @@ impl Clone for RegisteredModel {
         Self {
             runtime: Arc::clone(&self.runtime),
             compactor: self.compactor.as_ref().map(Arc::clone),
+            context_window_tokens: self.context_window_tokens,
         }
     }
 }
@@ -85,10 +103,19 @@ impl RegisteredModel {
         P: ModelProvider,
         C: ModelCodec,
     {
+        let context_window_tokens = model.context_window_tokens;
         Self {
             runtime: Arc::new(RuntimeModelAdapter { model }),
             compactor,
+            context_window_tokens,
         }
+    }
+
+    pub(crate) fn compaction_config(&self, fallback: &CompactionConfig) -> CompactionConfig {
+        self.context_window_tokens.map_or_else(
+            || fallback.clone(),
+            |tokens| fallback.clone().context_window_tokens(tokens),
+        )
     }
 
     pub(crate) fn descriptor(&self) -> &ModelDescriptor {

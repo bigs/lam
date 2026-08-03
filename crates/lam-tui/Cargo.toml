@@ -14,13 +14,19 @@ lam = { path = "../lam" }
 lam-agents = { path = "../lam-agents" }
 lam-code = { path = "../lam-code" }
 lam-openai = { path = "../lam-openai" }
+lam-redb = { path = "../lam-redb" }
 ratatui.workspace = true
+redb.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 toml.workspace = true
+tui-markdown.workspace = true
 unicode-width.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

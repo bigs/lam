@@ -86,7 +86,7 @@ pub enum RunEvent {
     EvalStarted {
         /// Activation requesting eval.
         run_id: RunId,
-        /// TypeScript source and optional requested timeout.
+        /// User-facing intent, TypeScript source, and optional requested timeout.
         request: EvalRequest,
     },
     /// One complete eval outcome became available.

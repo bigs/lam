@@ -9,7 +9,7 @@ use thiserror::Error;
 const CONFIG_DIR: &str = ".lam";
 const CONFIG_FILE: &str = "providers.toml";
 
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum ProviderProtocol {
     #[serde(alias = "openai_responses")]
@@ -35,6 +35,8 @@ pub(crate) struct ProviderConfig {
     pub(crate) api_key: Option<String>,
     #[serde(default)]
     pub(crate) api_key_env: Option<String>,
+    #[serde(default)]
+    pub(crate) effort_path: Option<String>,
     pub(crate) models: Vec<ModelConfig>,
 }
 
@@ -43,6 +45,7 @@ pub(crate) struct ModelConfig {
     pub(crate) id: String,
     pub(crate) name: String,
     pub(crate) context_window: u64,
+    pub(crate) efforts: Vec<String>,
     #[serde(default)]
     pub(crate) extra_body: toml::Table,
 }
@@ -54,6 +57,7 @@ pub(crate) struct ModelChoice {
     pub(crate) model: String,
     pub(crate) display_name: String,
     pub(crate) context_window: u64,
+    pub(crate) efforts: Vec<String>,
 }
 
 pub(crate) struct LoadedConfig {
@@ -115,6 +119,25 @@ impl ProviderConfig {
             (None, None) => Ok(None),
         }
     }
+
+    pub(crate) fn resolved_effort_path(&self) -> Result<Vec<String>, ConfigError> {
+        let path = self.effort_path.as_deref().unwrap_or(match self.protocol {
+            ProviderProtocol::OpenaiResponses => "reasoning.effort",
+            ProviderProtocol::OpenaiChatCompletions => "reasoning_effort",
+        });
+        let segments = path.split('.').map(str::to_owned).collect::<Vec<_>>();
+        if segments.is_empty()
+            || segments
+                .iter()
+                .any(|segment| segment.trim().is_empty() || segment.trim() != segment)
+        {
+            return Err(invalid(format!(
+                "provider `{}` has invalid effort_path `{path}`",
+                self.name
+            )));
+        }
+        Ok(segments)
+    }
 }
 
 fn default_path() -> Result<PathBuf, ConfigError> {
@@ -147,6 +170,7 @@ fn validate(config: &ProvidersConfig) -> Result<(Vec<ModelChoice>, usize), Confi
             )));
         }
         provider.resolved_api_key()?;
+        let effort_path = provider.resolved_effort_path()?;
 
         let mut provider_models = BTreeSet::new();
         for model in &provider.models {
@@ -163,6 +187,8 @@ fn validate(config: &ProvidersConfig) -> Result<(Vec<ModelChoice>, usize), Confi
                     provider.name, model.id
                 )));
             }
+            validate_efforts(&provider.name, model)?;
+            validate_effort_slot(&provider.name, model, &effort_path)?;
             if !provider_models.insert(model.id.as_str()) {
                 return Err(invalid(format!(
                     "model `{}/{}` is configured more than once",
@@ -177,6 +203,7 @@ fn validate(config: &ProvidersConfig) -> Result<(Vec<ModelChoice>, usize), Confi
                 model: model.id.clone(),
                 display_name: model.name.clone(),
                 context_window: model.context_window,
+                efforts: model.efforts.clone(),
             });
         }
     }
@@ -191,6 +218,60 @@ fn validate(config: &ProvidersConfig) -> Result<(Vec<ModelChoice>, usize), Confi
             ))
         })?;
     Ok((models, default_index))
+}
+
+fn validate_efforts(provider: &str, model: &ModelConfig) -> Result<(), ConfigError> {
+    if model.efforts.is_empty() {
+        return Err(invalid(format!(
+            "model `{provider}/{}` must configure at least one effort",
+            model.id
+        )));
+    }
+    let mut efforts = BTreeSet::new();
+    for effort in &model.efforts {
+        if effort.trim().is_empty() || effort.trim() != effort {
+            return Err(invalid(format!(
+                "model `{provider}/{}` has an empty or padded effort",
+                model.id
+            )));
+        }
+        if !efforts.insert(effort.as_str()) {
+            return Err(invalid(format!(
+                "model `{provider}/{}` configures effort `{effort}` more than once",
+                model.id
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_effort_slot(
+    provider: &str,
+    model: &ModelConfig,
+    effort_path: &[String],
+) -> Result<(), ConfigError> {
+    let mut table = &model.extra_body;
+    for (index, segment) in effort_path.iter().enumerate() {
+        let Some(value) = table.get(segment) else {
+            return Ok(());
+        };
+        if index + 1 == effort_path.len() {
+            return Err(invalid(format!(
+                "model `{provider}/{}` configures `{}` in extra_body; use its efforts list instead",
+                model.id,
+                effort_path.join(".")
+            )));
+        }
+        let Some(next) = value.as_table() else {
+            return Err(invalid(format!(
+                "model `{provider}/{}` cannot apply effort_path `{}` through a non-table extra_body field",
+                model.id,
+                effort_path.join(".")
+            )));
+        };
+        table = next;
+    }
+    Ok(())
 }
 
 fn validate_provider_name(value: &str) -> Result<(), ConfigError> {
@@ -253,11 +334,13 @@ api_key = "test-key"
 id = "gpt-5"
 name = "GPT-5"
 context_window = 400000
+efforts = ["none", "low", "medium", "high", "xhigh", "max"]
 
 [[providers.models]]
 id = "gpt-5-mini"
 name = "GPT-5 mini"
 context_window = 128000
+efforts = ["low", "medium", "high"]
 "#;
 
     #[test]
@@ -270,16 +353,71 @@ context_window = 128000
     }
 
     #[test]
+    fn distributed_provider_example_matches_the_config_schema() {
+        let config: ProvidersConfig =
+            toml::from_str(include_str!("../providers.example.toml")).unwrap();
+        let model_ids = config
+            .providers
+            .iter()
+            .flat_map(|provider| {
+                provider
+                    .models
+                    .iter()
+                    .map(move |model| (provider.name.as_str(), model.id.as_str()))
+            })
+            .collect::<Vec<_>>();
+
+        assert!(model_ids.contains(&("openai", "gpt-5.6-sol")));
+        assert!(model_ids.contains(&("openai", "gpt-5.6-terra")));
+        assert!(model_ids.contains(&("synthetic", "syn:large:text")));
+        assert!(model_ids.contains(&("synthetic", "syn:small:vision")));
+    }
+
+    #[test]
     fn parses_model_specific_request_options() {
         let source = VALID.replace(
-            "context_window = 400000",
-            "context_window = 400000\n\n[providers.models.extra_body.reasoning]\neffort = \"high\"",
+            "efforts = [\"none\", \"low\", \"medium\", \"high\", \"xhigh\", \"max\"]",
+            "efforts = [\"none\", \"low\", \"medium\", \"high\", \"xhigh\", \"max\"]\n\n[providers.models.extra_body]\nreasoning_history = \"interleaved\"",
         );
         let config: ProvidersConfig = toml::from_str(&source).unwrap();
         assert_eq!(
-            config.providers[0].models[0].extra_body["reasoning"]["effort"].as_str(),
-            Some("high")
+            config.providers[0].models[0].extra_body["reasoning_history"].as_str(),
+            Some("interleaved")
         );
+    }
+
+    #[test]
+    fn defaults_effort_path_by_protocol_and_rejects_legacy_effort_body() {
+        let config: ProvidersConfig = toml::from_str(VALID).unwrap();
+        assert_eq!(
+            config.providers[0].resolved_effort_path().unwrap(),
+            ["reasoning", "effort"]
+        );
+
+        let source = VALID.replace(
+            "efforts = [\"none\", \"low\", \"medium\", \"high\", \"xhigh\", \"max\"]",
+            "efforts = [\"none\", \"low\", \"medium\", \"high\", \"xhigh\", \"max\"]\n\n[providers.models.extra_body.reasoning]\neffort = \"high\"",
+        );
+        let config: ProvidersConfig = toml::from_str(&source).unwrap();
+        assert!(
+            validate(&config)
+                .unwrap_err()
+                .to_string()
+                .contains("use its efforts list instead")
+        );
+    }
+
+    #[test]
+    fn rejects_empty_or_duplicate_efforts() {
+        for efforts in ["[]", "[\"high\", \"high\"]"] {
+            let source = VALID.replacen(
+                "[\"none\", \"low\", \"medium\", \"high\", \"xhigh\", \"max\"]",
+                efforts,
+                1,
+            );
+            let config: ProvidersConfig = toml::from_str(&source).unwrap();
+            assert!(validate(&config).is_err());
+        }
     }
 
     #[test]
@@ -323,6 +461,7 @@ type = "openai-chat-completions"
 id = "other"
 name = "Other"
 context_window = 1000
+efforts = ["high"]
 "#;
         let source = format!("{VALID}\n{duplicate}");
         let config: ProvidersConfig = toml::from_str(&source).unwrap();

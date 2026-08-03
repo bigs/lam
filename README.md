@@ -32,10 +32,11 @@ model ──eval(TypeScript)──→ persistent Deno isolate
                          typed Rust capabilities
 ```
 
-A single eval can sequence dependent work, use `Promise.all` for independent
-work, retain variables between calls, catch structured errors, and return JSON
-with `lam.result(value)`. Rust remains authoritative over which capabilities
-exist and what types cross the boundary.
+A single eval carries a brief user-facing intent alongside its TypeScript. It
+can sequence dependent work, use `Promise.all` for independent work, retain
+variables between calls, catch structured errors, and return JSON with
+`lam.result(value)`. Rust remains authoritative over which capabilities exist
+and what types cross the boundary.
 
 The isolate exposes `lam.dir()` for complete runtime discovery. Its compact
 system-prompt synopsis is generated from the same manifest, including inferred

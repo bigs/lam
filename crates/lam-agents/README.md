@@ -68,6 +68,7 @@ The exact installed functions are manifest-discoverable through `lam.dir()`:
 | `lam.agents.identity()` | Return the current address and automatic parent |
 | `lam.agents.list(request?)` | List direct resident children |
 | `lam.agents.spawn(request)` | Create a detached persistent child and return after initial task admission |
+| `lam.agents.wait({ addresses })` | Await spawned direct children without steering them |
 | `lam.agents.call(request)` | Create a persistent child and wait directly for its initial task outcome |
 | `lam.agents.send({ to, message })` | Durably send an authenticated steering message to any resident address |
 | `lam.agents.stop({ address })` | Stop one direct child and its descendants, waiting for residency release |
@@ -95,6 +96,14 @@ call stops its owned child subtree.
 then sends one actor-authenticated outcome into the parent's durable mailbox,
 waking or steering the parent. A detached child remains addressable after its
 initial run completes.
+
+`wait` accepts one or more direct-child addresses returned by `spawn` and waits
+for all of their initial tasks without sending, interrupting, or otherwise
+steering those children. It resolves only after every terminal outcome is
+durably admitted to the caller's inbox. At the next model boundary, the wait
+receipt and those inbox messages are therefore visible together in the same
+continuation. Cancelling or timing out the surrounding eval does not cancel the
+spawned work; its eventual outcomes are still delivered.
 
 ## Scheduler model
 
@@ -134,8 +143,6 @@ authority.
 - Durable reconstruction of the live topology after process restart.
 - Overload queues beyond explicit capacity failure.
 - Dynamic rebalancing or isolate migration.
-- Model-visible polling/wait primitives; synchronous work uses `call`, while
-  detached work pushes its outcome.
 
 See the public [`lam`](../lam/README.md) facade, optional
 [`lam-code`](../lam-code/README.md) capabilities, and repository

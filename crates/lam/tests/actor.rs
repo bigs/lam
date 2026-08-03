@@ -528,6 +528,131 @@ async fn post_compaction_estimate_ignores_usage_from_before_the_marker() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn provider_usage_is_authoritative_over_large_durable_payloads() {
+    let provider =
+        ScriptedProvider::new([output_with_usage("x".repeat(20_000), 100), output("done")]);
+    let config = CompactionConfig::default()
+        .context_window_tokens(1_000)
+        .trigger_at(ContextAmount::Tokens(500))
+        .retain(ContextAmount::Tokens(0))
+        .summary_reserve_tokens(100);
+    let mut actor = Lam::builder(Model::new(provider.clone(), ScriptedCodec))
+        .compaction_config(config)
+        .build()
+        .actor("usage-anchor")
+        .build()
+        .await
+        .unwrap();
+    let actor_ref = actor.actor_ref();
+
+    assert_eq!(actor.call("one").await.unwrap(), "x".repeat(20_000));
+    assert_eq!(actor.call("two").await.unwrap(), "done");
+
+    assert_eq!(provider.requests().len(), 2);
+    assert!(
+        actor_ref
+            .state()
+            .await
+            .unwrap()
+            .context()
+            .iter()
+            .all(|entry| {
+                !matches!(entry.entry.transition, ContextTransition::Compaction { .. })
+            })
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn unmetered_suffix_is_added_to_provider_usage() {
+    let provider = ScriptedProvider::new([
+        output_with_usage("first", 450),
+        output("summary"),
+        output("done"),
+    ]);
+    let config = CompactionConfig::default()
+        .context_window_tokens(1_000)
+        .trigger_at(ContextAmount::Tokens(500))
+        .retain(ContextAmount::Tokens(0))
+        .summary_reserve_tokens(100);
+    let mut actor = Lam::builder(Model::new(provider.clone(), ScriptedCodec))
+        .compaction_config(config)
+        .build()
+        .actor("usage-suffix")
+        .build()
+        .await
+        .unwrap();
+    let actor_ref = actor.actor_ref();
+
+    assert_eq!(actor.call("one").await.unwrap(), "first");
+    assert_eq!(actor.call("x".repeat(600)).await.unwrap(), "done");
+
+    assert_eq!(provider.requests().len(), 3);
+    assert!(
+        actor_ref
+            .state()
+            .await
+            .unwrap()
+            .context()
+            .iter()
+            .any(|entry| {
+                matches!(entry.entry.transition, ContextTransition::Compaction { .. })
+            })
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn automatic_compaction_uses_the_selected_models_context_window() {
+    let wide = ScriptedProvider::new([output_with_usage("wide first", 500), output("wide second")]);
+    let narrow = ScriptedProvider::new([
+        output("narrow summary"),
+        output_with_usage("narrow answer", 500),
+    ]);
+    let config = CompactionConfig::default()
+        .retain(ContextAmount::Tokens(0))
+        .summary_reserve_tokens(50);
+    let mut actor =
+        Lam::builder(Model::new(wide.clone(), ScriptedCodec).with_context_window_tokens(1_000))
+            .initial_model_id("wide")
+            .model(
+                "narrow",
+                Model::new(narrow.clone(), ScriptedCodec).with_context_window_tokens(400),
+            )
+            .compaction_config(config)
+            .build()
+            .actor("model-windows")
+            .build()
+            .await
+            .unwrap();
+    let actor_ref = actor.actor_ref();
+
+    assert_eq!(actor.call("first").await.unwrap(), "wide first");
+    actor
+        .switch_model_with_policy("narrow", ModelSwitchPolicy::ReuseContext)
+        .await
+        .unwrap();
+    assert_eq!(actor.call("second").await.unwrap(), "narrow answer");
+    actor
+        .switch_model_with_policy("wide", ModelSwitchPolicy::ReuseContext)
+        .await
+        .unwrap();
+    assert_eq!(actor.call("third").await.unwrap(), "wide second");
+
+    assert_eq!(narrow.requests().len(), 2);
+    assert_eq!(wide.requests().len(), 2);
+    assert_eq!(
+        actor_ref
+            .state()
+            .await
+            .unwrap()
+            .context()
+            .iter()
+            .filter(|entry| matches!(entry.entry.transition, ContextTransition::Compaction { .. }))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn rejected_materialized_replacement_is_never_persisted() {
     let provider = ScriptedProvider::new([output("first"), output("summary")]);
     let mut actor = Lam::builder(Model::new(provider, RejectingCompactionCodec))

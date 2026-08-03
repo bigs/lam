@@ -1,23 +1,72 @@
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 
-use lam::{Lam, LamBuilder, MemStore, Model, ModelDescriptor};
+use lam::{
+    ActorId, ActorState, CompactionArtifact, CompactionRecord, ContextTransition, EncodedPayload,
+    JournalStore, Lam, LamBuilder, MemStore, MessageSource, Model, ModelCodec, ModelDescriptor,
+    ModelDirective, ModelRequestConfig, ModelResponseMetadata, ProjectedContextEntry,
+};
 use lam_agents::{Agent, AgentSystem, AgentSystemEvents, SubagentConfig, SubagentConfigBuilder};
 use lam_code::{CodingPack, FilesystemAccess, LocalCommandRunner};
 use lam_openai::chat_completions::{
     ChatCompletions, ChatCompletionsCodec, ChatCompletionsProvider,
 };
 use lam_openai::responses::{Responses, ResponsesCodec, ResponsesProvider};
+use lam_redb::RedbStore;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
 use crate::config::{LoadedConfig, ModelChoice, ModelConfig, ProviderConfig, ProviderProtocol};
+use crate::session::Session;
 
 pub(crate) struct Runtime {
-    pub(crate) system: AgentSystem<MemStore>,
-    pub(crate) root: Agent<MemStore>,
+    pub(crate) system: AgentSystem<RedbStore>,
+    pub(crate) root: Agent<RedbStore>,
     pub(crate) events: AgentSystemEvents,
     pub(crate) models: Vec<ModelChoice>,
     pub(crate) selected_model: usize,
+    pub(crate) agents: Vec<AgentHistory>,
+    effort_controls: Vec<EffortControl>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct AgentHistory {
+    pub(crate) address: String,
+    pub(crate) parent: Option<String>,
+    pub(crate) model: Option<String>,
+    pub(crate) status: String,
+    pub(crate) run_completed: bool,
+    pub(crate) history: Vec<HistoryEntry>,
+}
+
+impl AgentHistory {
+    pub(crate) fn root(history: Vec<HistoryEntry>) -> Self {
+        Self {
+            address: "/root".to_owned(),
+            parent: None,
+            model: None,
+            status: "Ready".to_owned(),
+            run_completed: true,
+            history,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HistoryKind {
+    User,
+    Assistant,
+    ToolCall,
+    ToolResult,
+    System,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HistoryEntry {
+    pub(crate) kind: HistoryKind,
+    pub(crate) title: String,
+    pub(crate) body: String,
 }
 
 #[derive(Clone, Debug)]
@@ -25,21 +74,42 @@ pub(crate) enum Command {
     Call(String),
     Compact,
     SwitchModel { index: usize, registry_id: String },
+    SetEffort { index: usize, effort: String },
+    New,
 }
 
 #[derive(Debug)]
 pub(crate) enum CommandResult {
-    Call(Result<String, String>),
+    Call(Result<CompletedCall, String>),
     Compact(Result<String, String>),
     SwitchModel {
         index: usize,
         result: Result<String, String>,
     },
+    SetEffort {
+        index: usize,
+        effort: String,
+        result: Result<String, String>,
+    },
+}
+
+#[derive(Debug)]
+pub(crate) struct CompletedCall {
+    pub(crate) output: String,
+    pub(crate) run_id: Option<String>,
 }
 
 impl Runtime {
-    pub(crate) async fn build(config: LoadedConfig, cwd: PathBuf) -> Result<Self, RuntimeError> {
-        let models = configured_models(&config)?;
+    pub(crate) async fn build(
+        config: &LoadedConfig,
+        cwd: PathBuf,
+        session: &Session,
+    ) -> Result<Self, RuntimeError> {
+        let models = configured_models(config)?;
+        let effort_controls = models
+            .iter()
+            .map(|configured| configured.effort.clone())
+            .collect();
         let initial = models
             .get(config.default_index)
             .expect("validated default model index");
@@ -48,7 +118,11 @@ impl Runtime {
             .shell(LocalCommandRunner::default())
             .build()
             .map_err(|error| RuntimeError::CodingPack(error.to_string()))?;
-        let system = AgentSystem::builder(MemStore::new())
+        let store = RedbStore::open(&session.database_path).map_err(RuntimeError::Journal)?;
+        let stored_actors = load_stored_actors(&store)
+            .await
+            .map_err(RuntimeError::AgentSystem)?;
+        let system = AgentSystem::builder(store)
             .worker_threads(default_worker_threads())
             .max_agents(64)
             .build()
@@ -56,7 +130,7 @@ impl Runtime {
         let events = system
             .take_events()
             .expect("a new agent system owns its event receiver");
-        let instruction = coding_instruction(&cwd);
+        let instruction = coding_instruction(&cwd, &config.models, config.default_index);
 
         let mut root_builder = initial
             .model
@@ -64,7 +138,6 @@ impl Runtime {
             .initial_model_id(initial.choice.registry_id.clone())
             .state_store(system.state_store())
             .namespaces(coding.namespaces())
-            .context_window_tokens(smallest_context_window(&config.models))
             .annotate_system_prompt(&instruction);
         for configured in &models {
             if configured.choice.registry_id != initial.choice.registry_id {
@@ -74,13 +147,13 @@ impl Runtime {
             }
         }
 
-        let mut child_builder: SubagentConfigBuilder<MemStore> = initial.model.subagent_builder();
+        let mut child_builder: SubagentConfigBuilder<RedbStore> = initial.model.subagent_builder();
         for configured in &models {
             if configured.choice.registry_id != initial.choice.registry_id {
                 child_builder = configured.model.register_subagent(child_builder);
             }
         }
-        let children: SubagentConfig<MemStore> = child_builder
+        let children: SubagentConfig<RedbStore> = child_builder
             .namespaces(coding.namespaces())
             .required_instructions(instruction)
             .build()
@@ -89,23 +162,58 @@ impl Runtime {
             .host_with_subagents(root_builder.build().actor("/root"), children)
             .await
             .map_err(|error| RuntimeError::AgentSystem(error.to_string()))?;
+        let state = root
+            .state()
+            .await
+            .map_err(|error| RuntimeError::AgentSystem(error.to_string()))?;
+        let selected_model_id = state
+            .selected_model()
+            .expect("actor initialization establishes a model selection")
+            .model_id
+            .as_str()
+            .to_owned();
+        let selected_model = config
+            .models
+            .iter()
+            .position(|model| model.registry_id == selected_model_id)
+            .expect("runtime registration mirrors the validated model list");
+        let mut agents = stored_actors
+            .into_iter()
+            .filter(|(actor, _)| actor.as_str() != "/root")
+            .map(|(actor, state)| agent_history(actor.as_str(), &state, &models, true))
+            .collect::<Vec<_>>();
+        agents.push(agent_history("/root", &state, &models, false));
+        agents.sort_by(|left, right| left.address.cmp(&right.address));
 
         Ok(Self {
             system,
             root,
             events,
-            models: config.models,
-            selected_model: config.default_index,
+            models: config.models.clone(),
+            selected_model,
+            agents,
+            effort_controls,
         })
     }
 
     pub(crate) fn execute(&self, command: Command, output: mpsc::UnboundedSender<CommandResult>) {
         let root = self.root.clone();
+        let effort_controls = self.effort_controls.clone();
         tokio::spawn(async move {
             let result = match command {
-                Command::Call(input) => {
-                    CommandResult::Call(root.call(input).await.map_err(|error| error.to_string()))
-                }
+                Command::Call(input) => match root.call(input).await {
+                    Ok(output) => {
+                        let run_id = root.state().await.ok().and_then(|state| {
+                            state
+                                .context()
+                                .last()
+                                .and_then(|projected| projected.entry.transition.run_id())
+                                .map(ToString::to_string)
+                        });
+                        CommandResult::Call(Ok(CompletedCall { output, run_id }))
+                    }
+                    Err(error) => CommandResult::Call(Err(error.to_string())),
+                },
                 Command::Compact => {
                     let result = root.compact().await.map(|receipt| match receipt {
                         Some(receipt) => format!(
@@ -126,6 +234,19 @@ impl Runtime {
                         result: result.map_err(|error| error.to_string()),
                     }
                 }
+                Command::SetEffort { index, effort } => {
+                    let result = effort_controls
+                        .get(index)
+                        .ok_or_else(|| format!("model index {index} is not configured"))
+                        .and_then(|control| control.set(&effort))
+                        .map(|()| format!("Set reasoning effort to {effort}."));
+                    CommandResult::SetEffort {
+                        index,
+                        effort,
+                        result,
+                    }
+                }
+                Command::New => return,
             };
             let _ = output.send(result);
         });
@@ -135,11 +256,115 @@ impl Runtime {
 struct ConfiguredModel {
     choice: ModelChoice,
     model: AnyModel,
+    effort: EffortControl,
 }
 
 enum AnyModel {
-    Responses(Model<ResponsesProvider, ResponsesCodec>),
-    ChatCompletions(Model<ChatCompletionsProvider, ChatCompletionsCodec>),
+    Responses(Model<ResponsesProvider, EffortCodec<ResponsesCodec>>),
+    ChatCompletions(Model<ChatCompletionsProvider, EffortCodec<ChatCompletionsCodec>>),
+}
+
+#[derive(Clone)]
+struct EffortControl {
+    path: Arc<[String]>,
+    allowed: Arc<[String]>,
+    selected: Arc<RwLock<String>>,
+}
+
+impl EffortControl {
+    fn new(path: Vec<String>, allowed: &[String]) -> Self {
+        let selected = allowed
+            .last()
+            .expect("configuration validation requires at least one effort")
+            .clone();
+        Self {
+            path: path.into(),
+            allowed: allowed.to_vec().into(),
+            selected: Arc::new(RwLock::new(selected)),
+        }
+    }
+
+    fn set(&self, effort: &str) -> Result<(), String> {
+        if !self.allowed.iter().any(|allowed| allowed == effort) {
+            return Err(format!("reasoning effort `{effort}` is not supported"));
+        }
+        *self
+            .selected
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = effort.to_owned();
+        Ok(())
+    }
+
+    fn selected(&self) -> String {
+        self.selected
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+#[derive(Clone)]
+struct EffortCodec<C> {
+    inner: C,
+    control: EffortControl,
+}
+
+impl<C> ModelCodec for EffortCodec<C>
+where
+    C: ModelCodec,
+{
+    type Error = C::Error;
+
+    fn encode_request(
+        &self,
+        context: &[ProjectedContextEntry],
+        config: &ModelRequestConfig<'_>,
+    ) -> Result<EncodedPayload, Self::Error> {
+        let mut request = self.inner.encode_request(context, config)?;
+        let body = request
+            .value
+            .get_mut("body")
+            .expect("OpenAI request codecs always produce a body envelope");
+        insert_json_path(
+            body,
+            &self.control.path,
+            serde_json::Value::String(self.control.selected()),
+        );
+        Ok(request)
+    }
+
+    fn interpret_response(&self, response: &EncodedPayload) -> Result<ModelDirective, Self::Error> {
+        self.inner.interpret_response(response)
+    }
+
+    fn response_metadata(&self, response: &EncodedPayload) -> ModelResponseMetadata {
+        self.inner.response_metadata(response)
+    }
+
+    fn materialize_compaction(
+        &self,
+        artifact: &CompactionArtifact,
+    ) -> Result<Option<EncodedPayload>, Self::Error> {
+        self.inner.materialize_compaction(artifact)
+    }
+
+    fn accepts_compaction_replacement(&self, replacement: &EncodedPayload) -> bool {
+        self.inner.accepts_compaction_replacement(replacement)
+    }
+}
+
+fn insert_json_path(value: &mut serde_json::Value, path: &[String], leaf: serde_json::Value) {
+    let mut object = value
+        .as_object_mut()
+        .expect("OpenAI request codecs always produce an object");
+    for segment in &path[..path.len() - 1] {
+        object = object
+            .entry(segment.clone())
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+            .as_object_mut()
+            .expect("configuration validation reserves object-valued effort path prefixes");
+    }
+    object.insert(path[path.len() - 1].clone(), leaf);
 }
 
 impl AnyModel {
@@ -157,22 +382,171 @@ impl AnyModel {
         }
     }
 
-    fn subagent_builder(&self) -> SubagentConfigBuilder<MemStore> {
+    fn subagent_builder<S>(&self) -> SubagentConfigBuilder<S>
+    where
+        S: JournalStore + 'static,
+    {
         match self {
             Self::Responses(model) => SubagentConfig::builder(model.clone()),
             Self::ChatCompletions(model) => SubagentConfig::builder(model.clone()),
         }
     }
 
-    fn register_subagent(
-        &self,
-        builder: SubagentConfigBuilder<MemStore>,
-    ) -> SubagentConfigBuilder<MemStore> {
+    fn register_subagent<S>(&self, builder: SubagentConfigBuilder<S>) -> SubagentConfigBuilder<S>
+    where
+        S: JournalStore + 'static,
+    {
         match self {
             Self::Responses(model) => builder.model(model.clone()),
             Self::ChatCompletions(model) => builder.model(model.clone()),
         }
     }
+
+    fn interpret_response(&self, payload: &lam::EncodedPayload) -> Option<ModelDirective> {
+        match self {
+            Self::Responses(model) => model.shared_parts().1.interpret_response(payload).ok(),
+            Self::ChatCompletions(model) => model.shared_parts().1.interpret_response(payload).ok(),
+        }
+    }
+}
+
+fn session_history(
+    address: &str,
+    state: &ActorState,
+    models: &[ConfiguredModel],
+) -> Vec<HistoryEntry> {
+    let mut history = Vec::new();
+    for projected in state.context() {
+        let entry = &projected.entry;
+        match &entry.transition {
+            ContextTransition::Messages {
+                consumed_message_ids,
+                ..
+            } => {
+                for message_id in consumed_message_ids {
+                    let Some(message) = state.message(message_id) else {
+                        continue;
+                    };
+                    let (kind, title) = match message.envelope.source() {
+                        MessageSource::User { .. } => (HistoryKind::User, "You".to_owned()),
+                        MessageSource::Host { component } => {
+                            (HistoryKind::System, component.as_str().to_owned())
+                        }
+                        MessageSource::Actor { actor_id } => {
+                            (HistoryKind::System, actor_id.as_str().to_owned())
+                        }
+                    };
+                    history.push(HistoryEntry {
+                        kind,
+                        title,
+                        body: display_json(&message.envelope.payload().value),
+                    });
+                }
+            }
+            ContextTransition::Model { .. } => {
+                let directive = models
+                    .iter()
+                    .find_map(|configured| configured.model.interpret_response(&entry.payload));
+                match directive {
+                    Some(ModelDirective::Eval(request)) => history.push(HistoryEntry {
+                        kind: HistoryKind::ToolCall,
+                        title: format!("{address} · {}", request.intent),
+                        body: request.source,
+                    }),
+                    Some(ModelDirective::Output(output)) => history.push(HistoryEntry {
+                        kind: HistoryKind::Assistant,
+                        title: address.to_owned(),
+                        body: display_json(&output),
+                    }),
+                    None => history.push(HistoryEntry {
+                        kind: HistoryKind::System,
+                        title: "Historical model output".to_owned(),
+                        body: display_json(&entry.payload.value),
+                    }),
+                }
+            }
+            ContextTransition::Eval { .. } => history.push(HistoryEntry {
+                kind: HistoryKind::ToolResult,
+                title: format!("{address} · eval result"),
+                body: display_json(&entry.payload.value),
+            }),
+            ContextTransition::Compaction { .. } => {
+                let body = CompactionRecord::decode(&entry.payload)
+                    .ok()
+                    .flatten()
+                    .and_then(|record| record.artifact)
+                    .map_or_else(
+                        || display_json(&entry.payload.value),
+                        |artifact| artifact.summary,
+                    );
+                history.push(HistoryEntry {
+                    kind: HistoryKind::System,
+                    title: "Compact".to_owned(),
+                    body,
+                });
+            }
+        }
+    }
+    history
+}
+
+fn agent_history(
+    address: &str,
+    state: &ActorState,
+    models: &[ConfiguredModel],
+    restored_child: bool,
+) -> AgentHistory {
+    let active = state.active_run().is_some();
+    AgentHistory {
+        address: address.to_owned(),
+        parent: address
+            .rfind('/')
+            .filter(|separator| *separator > 0)
+            .map(|separator| address[..separator].to_owned()),
+        model: state
+            .selected_model()
+            .map(|selection| selection.model_id.as_str().to_owned()),
+        status: if active && restored_child {
+            "Interrupted".to_owned()
+        } else if active {
+            "Recovering…".to_owned()
+        } else if restored_child {
+            "Stored".to_owned()
+        } else {
+            "Ready".to_owned()
+        },
+        run_completed: !active,
+        history: session_history(address, state, models),
+    }
+}
+
+async fn load_stored_actors(store: &RedbStore) -> Result<Vec<(ActorId, ActorState)>, String> {
+    const PAGE_SIZE: NonZeroUsize = NonZeroUsize::new(256).expect("256 is nonzero");
+    let actor_ids = store.actor_ids().map_err(|error| error.to_string())?;
+    let mut actors = Vec::with_capacity(actor_ids.len());
+    for actor in actor_ids {
+        let mut state = ActorState::new();
+        loop {
+            let page = store
+                .read(&actor, state.revision(), PAGE_SIZE)
+                .await
+                .map_err(|error| error.to_string())?;
+            let head = page.head;
+            state = state.fold_page(page).map_err(|error| error.to_string())?;
+            if state.revision() == head {
+                break;
+            }
+        }
+        actors.push((actor, state));
+    }
+    Ok(actors)
+}
+
+fn display_json(value: &serde_json::Value) -> String {
+    value.as_str().map_or_else(
+        || serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string()),
+        str::to_owned,
+    )
 }
 
 fn configured_models(config: &LoadedConfig) -> Result<Vec<ConfiguredModel>, RuntimeError> {
@@ -188,9 +562,11 @@ fn configured_models(config: &LoadedConfig) -> Result<Vec<ConfiguredModel>, Runt
             (provider, model, choice)
         })
     }) {
+        let (model, effort) = build_model(provider, model, choice)?;
         configured.push(ConfiguredModel {
             choice: choice.clone(),
-            model: build_model(provider, model, choice)?,
+            model,
+            effort,
         });
     }
     Ok(configured)
@@ -200,7 +576,7 @@ fn build_model(
     provider: &ProviderConfig,
     model_config: &ModelConfig,
     choice: &ModelChoice,
-) -> Result<AnyModel, RuntimeError> {
+) -> Result<(AnyModel, EffortControl), RuntimeError> {
     let api_key = provider
         .resolved_api_key()
         .map_err(|error| RuntimeError::Model(error.to_string()))?;
@@ -210,6 +586,12 @@ fn build_model(
     };
     let extra_body = serde_json::to_value(&model_config.extra_body)
         .map_err(|error| RuntimeError::Model(error.to_string()))?;
+    let effort = EffortControl::new(
+        provider
+            .resolved_effort_path()
+            .map_err(|error| RuntimeError::Model(error.to_string()))?,
+        &choice.efforts,
+    );
     match provider.protocol {
         ProviderProtocol::OpenaiResponses => {
             let key = api_key.ok_or_else(|| {
@@ -224,11 +606,19 @@ fn build_model(
             if let Some(base) = &provider.api_base {
                 builder = builder.base_url(base);
             }
-            let model = builder
-                .build()
-                .map_err(|error| RuntimeError::Model(error.to_string()))?
-                .with_descriptor(descriptor("openai/responses"));
-            Ok(AnyModel::Responses(model))
+            let (transport, codec) = builder
+                .build_parts()
+                .map_err(|error| RuntimeError::Model(error.to_string()))?;
+            let model = Model::new(
+                transport,
+                EffortCodec {
+                    inner: codec,
+                    control: effort.clone(),
+                },
+            )
+            .with_descriptor(descriptor("openai/responses"))
+            .with_context_window_tokens(choice.context_window);
+            Ok((AnyModel::Responses(model), effort))
         }
         ProviderProtocol::OpenaiChatCompletions => {
             let mut builder = ChatCompletions::builder(&choice.model).extra_body(extra_body);
@@ -238,21 +628,21 @@ fn build_model(
             if let Some(base) = &provider.api_base {
                 builder = builder.base_url(base);
             }
-            let model = builder
-                .build()
-                .map_err(|error| RuntimeError::Model(error.to_string()))?
-                .with_descriptor(descriptor("openai/chat-completions"));
-            Ok(AnyModel::ChatCompletions(model))
+            let (transport, codec) = builder
+                .build_parts()
+                .map_err(|error| RuntimeError::Model(error.to_string()))?;
+            let model = Model::new(
+                transport,
+                EffortCodec {
+                    inner: codec,
+                    control: effort.clone(),
+                },
+            )
+            .with_descriptor(descriptor("openai/chat-completions"))
+            .with_context_window_tokens(choice.context_window);
+            Ok((AnyModel::ChatCompletions(model), effort))
         }
     }
-}
-
-fn smallest_context_window(models: &[ModelChoice]) -> u64 {
-    models
-        .iter()
-        .map(|model| model.context_window)
-        .min()
-        .expect("configuration validation requires a model")
 }
 
 fn default_worker_threads() -> usize {
@@ -261,19 +651,110 @@ fn default_worker_threads() -> usize {
         .clamp(1, 4)
 }
 
-fn coding_instruction(cwd: &Path) -> String {
+fn coding_instruction(cwd: &Path, models: &[ModelChoice], default_model: usize) -> String {
+    let configured_models = models
+        .iter()
+        .enumerate()
+        .map(|(index, model)| {
+            let default = if index == default_model {
+                " (default)"
+            } else {
+                ""
+            };
+            format!(
+                "- provider: `{}`; model: `{}`; selector: `{}`{default}; efforts: [{}]",
+                model.provider,
+                model.model,
+                model.registry_id,
+                model.efforts.join(", ")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     format!(
-        "You are a coding agent operating in `{}`. Work within this directory unless the user explicitly directs you otherwise. Use the installed coding and multi-agent namespaces when they help complete the task.",
+        "You are a coding agent operating in `{}`. Work within this directory unless the user explicitly directs you otherwise. Use the installed coding and multi-agent namespaces when they help complete the task.\n\nConfigured inference providers and models:\n{configured_models}\n\nFor `lam.agents.spawn` and `lam.agents.call`, pass the exact raw values shown above as `model: {{ provider: \"<provider>\", model: \"<model>\" }}`. The selector is for model selection elsewhere; do not pass the selector in the `model` field. Omit `model` to use the configured default.",
         cwd.display()
     )
 }
 
 #[derive(Debug, Error)]
 pub(crate) enum RuntimeError {
+    #[error("could not open the durable session journal: {0}")]
+    Journal(#[source] lam_redb::RedbStoreError),
     #[error("could not configure a model: {0}")]
     Model(String),
     #[error("could not configure coding capabilities: {0}")]
     CodingPack(String),
     #[error("could not start the agent runtime: {0}")]
     AgentSystem(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use serde_json::json;
+
+    use super::{EffortControl, coding_instruction, insert_json_path};
+    use crate::config::ModelChoice;
+
+    #[test]
+    fn coding_instruction_exposes_exact_subagent_model_coordinates() {
+        let models = vec![
+            ModelChoice {
+                registry_id: "openai/gpt-5.6-luna".to_owned(),
+                provider: "openai".to_owned(),
+                model: "gpt-5.6-luna".to_owned(),
+                display_name: "GPT-5.6 Luna".to_owned(),
+                context_window: 400_000,
+                efforts: vec!["none".to_owned(), "high".to_owned(), "max".to_owned()],
+            },
+            ModelChoice {
+                registry_id: "fireworks/accounts/fireworks/models/deepseek-v4-flash-0731"
+                    .to_owned(),
+                provider: "fireworks".to_owned(),
+                model: "accounts/fireworks/models/deepseek-v4-flash-0731".to_owned(),
+                display_name: "DeepSeek V4 Flash".to_owned(),
+                context_window: 1_040_000,
+                efforts: vec!["none".to_owned(), "high".to_owned(), "max".to_owned()],
+            },
+        ];
+
+        let instruction = coding_instruction(Path::new("/work/project"), &models, 0);
+
+        assert!(instruction.contains("provider: `openai`; model: `gpt-5.6-luna`"));
+        assert!(instruction.contains("selector: `openai/gpt-5.6-luna` (default)"));
+        assert!(instruction.contains("efforts: [none, high, max]"));
+        assert!(instruction.contains(
+            "provider: `fireworks`; model: `accounts/fireworks/models/deepseek-v4-flash-0731`"
+        ));
+        assert!(instruction.contains("do not pass the selector in the `model` field"));
+    }
+
+    #[test]
+    fn effort_control_defaults_to_last_value_and_updates_nested_request_field() {
+        let control = EffortControl::new(
+            vec!["reasoning".to_owned(), "effort".to_owned()],
+            &["low".to_owned(), "high".to_owned()],
+        );
+        let mut request = json!({"outputKind": "text", "body": {"model": "example", "reasoning": {"summary": "auto"}}});
+
+        insert_json_path(
+            &mut request["body"],
+            &control.path,
+            serde_json::Value::String(control.selected()),
+        );
+        assert_eq!(request["body"]["reasoning"]["effort"], "high");
+        assert_eq!(request["body"]["reasoning"]["summary"], "auto");
+        assert!(request.get("reasoning").is_none());
+
+        control.set("low").unwrap();
+        insert_json_path(
+            &mut request["body"],
+            &control.path,
+            serde_json::Value::String(control.selected()),
+        );
+        assert_eq!(request["body"]["reasoning"]["effort"], "low");
+        assert!(control.set("max").is_err());
+    }
 }

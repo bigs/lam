@@ -124,6 +124,37 @@ async fn actor_projection_survives_database_reopen() {
     assert_eq!(state.context().len(), 3, "raw context remains available");
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn actor_journals_can_be_discovered_in_canonical_order() {
+    let directory = tempfile::tempdir().expect("temporary directory should exist");
+    let store =
+        RedbStore::create(directory.path().join("actors.redb")).expect("redb store should open");
+    for name in ["/root/zeta", "/root", "/root/alpha"] {
+        let actor = ActorId::new(name).unwrap();
+        let outcome = store
+            .append(
+                &actor,
+                Revision::ZERO,
+                EventBatch::one(ActorEvent::message_admitted(message(
+                    MessageId::new(format!("message-{name}")).unwrap(),
+                    DeliveryMode::Steer,
+                    1,
+                ))),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(outcome, AppendOutcome::Appended { .. }));
+    }
+
+    let actors = store
+        .actor_ids()
+        .unwrap()
+        .into_iter()
+        .map(|actor| actor.to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(actors, ["/root", "/root/alpha", "/root/zeta"]);
+}
+
 fn message(id: MessageId, delivery: DeliveryMode, time: i64) -> MessageEnvelope {
     MessageEnvelope::new(
         id,

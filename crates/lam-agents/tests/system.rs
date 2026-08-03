@@ -34,6 +34,7 @@ enum RoutingScenario {
     General,
     ChildCall,
     BackgroundOutcome,
+    SpawnWait,
     DirectStop,
     CancelCall,
     UnauthorizedStop,
@@ -310,6 +311,7 @@ fn scenario_response(scenario: RoutingScenario, request: &Value) -> Option<Value
         RoutingScenario::General => None,
         RoutingScenario::ChildCall => Some(child_call_response(request)),
         RoutingScenario::BackgroundOutcome => Some(background_outcome_response(request)),
+        RoutingScenario::SpawnWait => Some(spawn_wait_response(request)),
         RoutingScenario::DirectStop => Some(direct_stop_response(request)),
         RoutingScenario::CancelCall => Some(cancel_call_response(request)),
         RoutingScenario::UnauthorizedStop => Some(unauthorized_stop_response(request)),
@@ -356,6 +358,33 @@ fn background_outcome_response(request: &Value) -> Value {
   namespaces: []
 });
 lam.result("spawned")"#
+        });
+    }
+    json!({ "kind": "output", "value": "plain complete" })
+}
+
+fn spawn_wait_response(request: &Value) -> Value {
+    if has_message(request, "waited child task", Some("actor")) {
+        return json!({ "kind": "output", "value": "waited child complete" });
+    }
+    if has_message(request, "spawn wait root", Some("user")) {
+        if transition_payload_contains(request, "eval", "inboxMessageId")
+            && has_message(request, "waited child complete", Some("actor"))
+        {
+            return json!({ "kind": "output", "value": "WAIT_OK" });
+        }
+        if has_transition(request, "eval") {
+            return json!({ "kind": "output", "value": "WAIT_INCOMPLETE" });
+        }
+        return json!({
+            "kind": "eval",
+            "source": r#"const child = await lam.agents.spawn({
+  name: "waited",
+  task: "waited child task",
+  namespaces: []
+});
+const receipt = await lam.agents.wait({ addresses: [child.address] });
+lam.result(receipt)"#
         });
     }
     json!({ "kind": "output", "value": "plain complete" })
@@ -472,6 +501,12 @@ impl ModelCodec for TestCodec {
     fn interpret_response(&self, response: &EncodedPayload) -> Result<ModelDirective, Self::Error> {
         match response.value.get("kind").and_then(Value::as_str) {
             Some("eval") => Ok(ModelDirective::Eval(EvalRequest {
+                intent: response
+                    .value
+                    .get("intent")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Evaluate TypeScript")
+                    .to_owned(),
                 source: response
                     .value
                     .get("source")
@@ -695,6 +730,71 @@ async fn background_outcome_steers_the_parent_and_system_waits_for_quiescence() 
     assert!(provider.requests().iter().any(|request| {
         has_message(&request.value, "background child complete", Some("actor"))
     }));
+
+    system.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn spawn_wait_returns_with_the_durable_outcome_in_the_same_model_turn() {
+    let provider = RoutingProvider::for_scenario(RoutingScenario::SpawnWait);
+    let model = Model::new(provider.clone(), TestCodec)
+        .with_descriptor(ModelDescriptor::new("test", "model-a", "test/messages").unwrap());
+    let system = AgentSystem::builder(MemStore::new())
+        .max_agents(2)
+        .build()
+        .unwrap();
+    let subagents: SubagentConfig<MemStore> = SubagentConfig::builder(model.clone())
+        .agent_namespace(false)
+        .build()
+        .unwrap();
+    let root = system
+        .host_with_subagents(
+            Lam::builder(model)
+                .state_store(system.state_store())
+                .build()
+                .actor("/wait-root"),
+            subagents,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(root.call("spawn wait root").await.unwrap(), "WAIT_OK");
+
+    let requests = provider.requests();
+    let continuation = requests
+        .iter()
+        .find(|request| {
+            transition_payload_contains(&request.value, "eval", "inboxMessageId")
+                && has_message(&request.value, "waited child complete", Some("actor"))
+        })
+        .expect("one continuation must contain both the wait result and child outcome");
+    let context = continuation.value["context"]
+        .as_array()
+        .expect("test codec context should be an array");
+    let wait_result = context
+        .iter()
+        .position(|entry| transition_payload_contains(entry, "eval", "inboxMessageId"))
+        .expect("wait result should be model-visible");
+    let outcome = context
+        .iter()
+        .position(|entry| has_message(entry, "waited child complete", Some("actor")))
+        .expect("durable child outcome should be model-visible");
+    assert!(
+        wait_result < outcome,
+        "the wait result must precede the synchronously drained inbox outcome"
+    );
+    assert!(
+        requests.iter().any(|request| {
+            request.value["systemPrompt"]
+                .as_str()
+                .is_some_and(|prompt| {
+                    prompt.contains("lam.agents.wait")
+                        && prompt.contains("durably admitted")
+                        && prompt.contains("does not message, interrupt, stop")
+                })
+        }),
+        "generated API documentation should explain the wait contract"
+    );
 
     system.shutdown().await.unwrap();
 }

@@ -61,6 +61,8 @@ impl<'a> ModelRequestConfig<'a> {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EvalRequest {
+    /// Brief one-line explanation of what the program is intended to accomplish.
+    pub intent: String,
     /// TypeScript program to evaluate in the actor's persistent isolate.
     pub source: String,
     /// Optional model-requested timeout, still bounded by the host maximum.

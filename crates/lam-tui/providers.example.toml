@@ -8,10 +8,20 @@ api_key_env = "OPENAI_API_KEY"
 [[providers.models]]
 id = "gpt-5.6-luna"
 name = "GPT-5.6 Luna"
-context_window = 400000
+context_window = 1050000
+efforts = ["none", "low", "medium", "high", "xhigh", "max"]
 
-[providers.models.extra_body.reasoning]
-effort = "high"
+[[providers.models]]
+id = "gpt-5.6-sol"
+name = "GPT-5.6 Sol"
+context_window = 1050000
+efforts = ["none", "low", "medium", "high", "xhigh", "max"]
+
+[[providers.models]]
+id = "gpt-5.6-terra"
+name = "GPT-5.6 Terra"
+context_window = 1050000
+efforts = ["none", "low", "medium", "high", "xhigh", "max"]
 
 [[providers]]
 name = "fireworks"
@@ -23,7 +33,37 @@ api_key_env = "FIREWORKS_API_KEY"
 id = "accounts/fireworks/models/deepseek-v4-flash-0731"
 name = "DeepSeek V4 Flash 0731"
 context_window = 1040000
+efforts = ["none", "low", "medium", "high", "xhigh", "max"]
 
 [providers.models.extra_body]
-reasoning_effort = "high"
 reasoning_history = "interleaved"
+
+[[providers]]
+name = "synthetic"
+type = "openai-chat-completions"
+api_base = "https://api.synthetic.new/openai/v1"
+api_key_env = "SYNTHETIC_API_KEY"
+
+[[providers.models]]
+id = "syn:large:text"
+name = "Large (Text)"
+context_window = 524288
+efforts = ["low", "medium", "high"]
+
+[[providers.models]]
+id = "syn:large:vision"
+name = "Large (Vision)"
+context_window = 524288
+efforts = ["low", "medium", "high"]
+
+[[providers.models]]
+id = "syn:small:text"
+name = "Small (Text)"
+context_window = 196608
+efforts = ["low", "medium", "high"]
+
+[[providers.models]]
+id = "syn:small:vision"
+name = "Small (Vision)"
+context_window = 262144
+efforts = ["low", "medium", "high"]

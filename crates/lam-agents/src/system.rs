@@ -17,7 +17,10 @@ use serde::de::DeserializeOwned;
 use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc, oneshot};
 
 use crate::config::{AGENTS_NAMESPACE, ChildActorSpec};
-use crate::namespace::{SpawnError, SpawnReceipt, SpawnRequest, StopError, agents_namespace};
+use crate::namespace::{
+    SpawnError, SpawnReceipt, SpawnRequest, StopError, WaitError, WaitReceipt, WaitRequest,
+    WaitedTask, agents_namespace,
+};
 use crate::{
     ActorAddress, AgentIdentity, AgentOutcome, AgentSystemBuildError, AgentSystemError,
     AgentSystemEvent, AgentSystemEvents, StopReason, SubagentConfig,
@@ -454,6 +457,24 @@ where
     shutting_down: bool,
     stopped: bool,
     active_operations: usize,
+    spawned_tasks: BTreeMap<ActorAddress, SpawnedTask>,
+}
+
+struct SpawnedTask {
+    parent: ActorAddress,
+    message_id: String,
+    delivery: OutcomeDelivery,
+}
+
+enum OutcomeDelivery {
+    Pending,
+    Delivered {
+        inbox_message_id: String,
+        inbox_revision: u64,
+    },
+    Failed {
+        message: String,
+    },
 }
 
 struct ChildLaunch<S>
@@ -480,6 +501,7 @@ where
             shutting_down: false,
             stopped: false,
             active_operations: 0,
+            spawned_tasks: BTreeMap::new(),
         }
     }
 }
@@ -755,7 +777,16 @@ where
                 return;
             }
         };
+        self.track_spawned_task(
+            parent.address.clone(),
+            child.resident.address.clone(),
+            message_id.to_string(),
+        );
         if ready.send(Ok(receipt)).is_err() || accepted.await.is_err() {
+            self.fail_spawned_delivery(
+                &child.resident.address,
+                "spawn was cancelled before its admission receipt was accepted".to_owned(),
+            );
             drop(owner);
             self.cancel_subtree(&child.resident.address, StopReason::Cancelled);
             return;
@@ -767,13 +798,50 @@ where
         self.emit(AgentSystemEvent::Outcome {
             outcome: outcome.clone(),
         });
-        if parent.ensure_running().is_ok() {
-            let _ = parent
+        let delivery = match parent.ensure_running() {
+            Ok(()) => parent
                 .actor_ref
                 .send_from_actor(&child.resident.actor_ref, outcome)
-                .await;
-            self.activity.notify_waiters();
+                .await
+                .map_err(AgentSystemError::from),
+            Err(error) => Err(error),
+        };
+        match delivery {
+            Ok(receipt) => self.complete_spawned_delivery(&child.resident.address, receipt),
+            Err(error) => {
+                self.fail_spawned_delivery(&child.resident.address, error.to_string());
+            }
         }
+    }
+
+    fn track_spawned_task(&self, parent: ActorAddress, address: ActorAddress, message_id: String) {
+        let previous = lock(&self.state).spawned_tasks.insert(
+            address,
+            SpawnedTask {
+                parent,
+                message_id,
+                delivery: OutcomeDelivery::Pending,
+            },
+        );
+        debug_assert!(previous.is_none(), "spawned addresses are create-only");
+        self.activity.notify_waiters();
+    }
+
+    fn complete_spawned_delivery(&self, address: &ActorAddress, receipt: MessageReceipt) {
+        if let Some(task) = lock(&self.state).spawned_tasks.get_mut(address) {
+            task.delivery = OutcomeDelivery::Delivered {
+                inbox_message_id: receipt.message_id.to_string(),
+                inbox_revision: receipt.revision.get(),
+            };
+        }
+        self.activity.notify_waiters();
+    }
+
+    fn fail_spawned_delivery(&self, address: &ActorAddress, message: String) {
+        if let Some(task) = lock(&self.state).spawned_tasks.get_mut(address) {
+            task.delivery = OutcomeDelivery::Failed { message };
+        }
+        self.activity.notify_waiters();
     }
 
     async fn prepare_child(
@@ -920,6 +988,79 @@ where
             .map_err(AgentSystemError::from)?;
         self.activity.notify_waiters();
         Ok(receipt)
+    }
+
+    pub(crate) async fn wait_for_spawned(
+        &self,
+        requester: &ActorAddress,
+        request: WaitRequest,
+    ) -> Result<WaitReceipt, WaitError> {
+        if request.addresses.is_empty() {
+            return Err(WaitError::Empty);
+        }
+        let mut unique = BTreeSet::new();
+        for address in &request.addresses {
+            if !address.is_direct_child_of(requester) {
+                return Err(WaitError::NotDirectChild {
+                    requester: requester.clone(),
+                    address: address.clone(),
+                });
+            }
+            if !unique.insert(address.clone()) {
+                return Err(WaitError::Duplicate {
+                    address: address.clone(),
+                });
+            }
+        }
+
+        loop {
+            let notified = self.activity.notified();
+            let completed = {
+                let state = lock(&self.state);
+                if state.shutting_down {
+                    return Err(WaitError::Unavailable);
+                }
+                let mut completed = Vec::with_capacity(request.addresses.len());
+                let mut pending = false;
+                for address in &request.addresses {
+                    let Some(task) = state.spawned_tasks.get(address) else {
+                        return Err(WaitError::NotSpawned {
+                            requester: requester.clone(),
+                            address: address.clone(),
+                        });
+                    };
+                    if task.parent != *requester {
+                        return Err(WaitError::NotSpawned {
+                            requester: requester.clone(),
+                            address: address.clone(),
+                        });
+                    }
+                    match &task.delivery {
+                        OutcomeDelivery::Pending => pending = true,
+                        OutcomeDelivery::Delivered {
+                            inbox_message_id,
+                            inbox_revision,
+                        } => completed.push(WaitedTask {
+                            address: address.clone(),
+                            message_id: task.message_id.clone(),
+                            inbox_message_id: inbox_message_id.clone(),
+                            inbox_revision: *inbox_revision,
+                        }),
+                        OutcomeDelivery::Failed { message } => {
+                            return Err(WaitError::DeliveryFailed {
+                                address: address.clone(),
+                                message: message.clone(),
+                            });
+                        }
+                    }
+                }
+                (!pending).then_some(completed)
+            };
+            if let Some(completed) = completed {
+                return Ok(WaitReceipt { completed });
+            }
+            notified.await;
+        }
     }
 
     pub(crate) fn list_children(

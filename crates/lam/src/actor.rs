@@ -255,7 +255,7 @@ impl<S> LamBuilder<S> {
         self
     }
 
-    /// Declares the selected model's context window for automatic compaction.
+    /// Declares a fallback context window for models without their own value.
     #[must_use]
     pub fn context_window_tokens(mut self, tokens: u64) -> Self {
         self.compaction_config = self.compaction_config.context_window_tokens(tokens);
@@ -522,10 +522,12 @@ where
                 model.compactor = None;
             }
         }
-        builder
-            .compaction_config
-            .validate()
-            .map_err(ActorBuildError::InvalidCompactionConfig)?;
+        for model in models.values() {
+            model
+                .compaction_config(&builder.compaction_config)
+                .validate()
+                .map_err(ActorBuildError::InvalidCompactionConfig)?;
+        }
 
         Ok(Self {
             actor_id,

@@ -132,6 +132,12 @@ impl ModelCodec for ScriptedCodec {
                     .and_then(Value::as_u64)
                     .map(Duration::from_millis);
                 Ok(ModelDirective::Eval(EvalRequest {
+                    intent: response
+                        .value
+                        .get("intent")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Evaluate TypeScript")
+                        .to_owned(),
                     source: source.to_owned(),
                     timeout,
                 }))

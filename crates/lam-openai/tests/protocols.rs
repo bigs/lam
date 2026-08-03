@@ -48,7 +48,7 @@ fn responses_request_is_stateless_and_replays_encrypted_reasoning_unchanged() {
         "id": "fc_1",
         "call_id": "call_1",
         "name": "eval",
-        "arguments": "{\"source\":\"1 + 1\",\"timeoutMs\":250}",
+        "arguments": "{\"intent\":\"Calculate the result\",\"source\":\"1 + 1\",\"timeoutMs\":250}",
         "status": "completed"
     });
     let native_response = json!({
@@ -67,6 +67,7 @@ fn responses_request_is_stateless_and_replays_encrypted_reasoning_unchanged() {
     assert_eq!(
         codec.interpret_response(&response).expect("valid eval"),
         ModelDirective::Eval(lam::EvalRequest {
+            intent: "Calculate the result".to_owned(),
             source: "1 + 1".to_owned(),
             timeout: Some(Duration::from_millis(250)),
         })
@@ -92,6 +93,14 @@ fn responses_request_is_stateless_and_replays_encrypted_reasoning_unchanged() {
     assert_eq!(body["stream"], true);
     assert_eq!(body["parallel_tool_calls"], false);
     assert_eq!(body["instructions"], "runtime instructions");
+    assert_eq!(
+        body["tools"][0]["parameters"]["required"],
+        json!(["intent", "source", "timeoutMs"])
+    );
+    assert_eq!(
+        body["tools"][0]["parameters"]["properties"]["intent"]["maxLength"],
+        120
+    );
     assert_eq!(body["reasoning"]["effort"], "high");
     assert!(
         body["include"]
@@ -442,6 +451,7 @@ fn chat_replays_reasoning_extensions_and_tool_calls_from_native_chunks() {
     assert_eq!(
         codec.interpret_response(&response).expect("valid eval"),
         ModelDirective::Eval(lam::EvalRequest {
+            intent: "Evaluate TypeScript".to_owned(),
             source: "2 + 2".to_owned(),
             timeout: None,
         })
@@ -465,6 +475,10 @@ fn chat_replays_reasoning_extensions_and_tool_calls_from_native_chunks() {
     assert_eq!(body["stream"], true);
     assert_eq!(body["stream_options"]["include_usage"], true);
     assert_eq!(body["parallel_tool_calls"], false);
+    assert_eq!(
+        body["tools"][0]["function"]["parameters"]["required"],
+        json!(["intent", "source", "timeoutMs"])
+    );
     assert_eq!(body["reasoning_effort"], "high");
     assert_eq!(body["reasoning_history"], "preserved");
     let assistant = &body["messages"][0];

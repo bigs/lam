@@ -40,6 +40,26 @@ impl RedbStore {
         Ok(Self { database })
     }
 
+    /// Lists actor journals in canonical actor-ID order.
+    ///
+    /// This is an observability surface for embeddings which need to discover
+    /// durable actors, such as a session browser. Journal mutation remains
+    /// available only through [`JournalStore`].
+    pub fn actor_ids(&self) -> Result<Vec<ActorId>, RedbStoreError> {
+        let read = self.database.begin_read().map_err(database_error)?;
+        let heads = read.open_table(HEADS).map_err(database_error)?;
+        heads
+            .iter()
+            .map_err(database_error)?
+            .map(|item| {
+                let (actor, _) = item.map_err(database_error)?;
+                ActorId::new(actor.value()).map_err(|error| RedbStoreError::ActorId {
+                    message: error.to_string(),
+                })
+            })
+            .collect()
+    }
+
     fn read_page(
         &self,
         actor: &ActorId,
@@ -161,6 +181,12 @@ pub enum RedbStoreError {
     /// An actor event could not cross the JSON storage boundary.
     #[error("actor event serialization failed: {0}")]
     Serialization(#[from] serde_json::Error),
+    /// A stored actor key violated Lam's actor-ID contract.
+    #[error("stored actor id is invalid: {message}")]
+    ActorId {
+        /// Identifier validation failure.
+        message: String,
+    },
 }
 
 fn database_error(error: impl Into<redb::Error>) -> RedbStoreError {
