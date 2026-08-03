@@ -934,7 +934,15 @@ impl App {
                     "Complete".to_owned()
                 };
             }
-            RunEvent::Failed { message } => self.push_error("Run failed", message),
+            RunEvent::Failed { message } => {
+                tracing::error!(
+                    target: "lam_tui::runtime",
+                    event = "tui.run_failed",
+                    actor_id = address,
+                    "agent run failed"
+                );
+                self.push_error("Run failed", message);
+            }
         }
     }
 

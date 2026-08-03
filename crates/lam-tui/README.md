@@ -85,6 +85,19 @@ first. Each choice previews the first user message on one line. Selecting a
 session gracefully closes the current runtime, restores the selected journal,
 and makes it the directory's default for the next launch.
 
+## Debug diagnostics
+
+Start Lam with `--debug-log` to append transport and runtime diagnostics to
+`~/.lam/sessions/session-<index>.debug.jsonl`. The active file follows `/new`
+and `/session`, is reused across process restarts, and is restricted to the
+current user on Unix systems.
+
+The log contains request and response sizes, timing, selected response headers,
+SSE framing counters, protocol terminal markers, model/run correlation, and
+HTTP error classifications and source chains. It does not record API keys,
+authorization headers, prompts, generated text or reasoning, tool arguments,
+or raw SSE payloads.
+
 ## Interaction
 
 - Type a message and press Enter to call the root coding agent.

@@ -164,15 +164,72 @@ impl ModelProvider for ChatCompletionsProvider {
                     message: "Chat Completions request has no model".to_owned(),
                 })?
                 .to_owned();
+            let request_body_bytes = serde_json::to_vec(&request.body).map_or(0, |body| body.len());
+            let message_count = request
+                .body
+                .get("messages")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            let tool_count = request
+                .body
+                .get("tools")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            let stream = request.body.get("stream").and_then(Value::as_bool);
+            let include_usage = request
+                .body
+                .pointer("/stream_options/include_usage")
+                .and_then(Value::as_bool);
+            let reasoning_effort = request.body.get("reasoning_effort").and_then(Value::as_str);
+            let max_tokens = request.body.get("max_tokens").and_then(Value::as_u64);
+            let max_completion_tokens = request
+                .body
+                .get("max_completion_tokens")
+                .and_then(Value::as_u64);
+            tracing::debug!(
+                target: "lam_openai::chat_completions",
+                event = "chat.request_metadata",
+                model,
+                output_kind = ?request.output_kind,
+                body_bytes = request_body_bytes,
+                message_count,
+                tool_count,
+                stream,
+                include_usage,
+                reasoning_effort,
+                max_tokens,
+                max_completion_tokens,
+                "prepared Chat Completions request"
+            );
             let mut chunks = Vec::new();
-            let mut saw_terminal = false;
+            let mut event_count = 0_u64;
+            let mut saw_done = false;
+            let mut saw_finish_reason = false;
+            let mut saw_usage = false;
+            let mut emitted = DeltaSummary::default();
             let body = transport
                 .post_stream("chat_completions", &request.body, |event| {
+                    event_count += 1;
                     if event.data == "[DONE]" {
-                        saw_terminal = true;
+                        saw_done = true;
+                        tracing::debug!(
+                            target: "lam_openai::chat_completions",
+                            event = "chat.done_received",
+                            event_index = event_count,
+                            chunks = chunks.len(),
+                            "received Chat Completions done marker"
+                        );
                         return Ok(());
                     }
                     let chunk: Value = serde_json::from_str(&event.data).map_err(|error| {
+                        tracing::error!(
+                            target: "lam_openai::chat_completions",
+                            event = "chat.invalid_event_json",
+                            event_index = event_count,
+                            data_bytes = event.data.len(),
+                            error = %error,
+                            "Chat Completions event was not valid JSON"
+                        );
                         ProviderError::InvalidEventJson {
                             message: error.to_string(),
                         }
@@ -189,43 +246,123 @@ impl ModelProvider for ChatCompletionsProvider {
                             message: error.to_string(),
                         });
                     }
+                    let summary = summarize_chunk(&chunk);
+                    emitted.add(summary);
+                    saw_usage |= chunk.get("usage").is_some_and(|usage| !usage.is_null());
+                    let finish_reasons = chunk
+                        .get("choices")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|choice| choice.get("finish_reason").and_then(Value::as_str))
+                        .collect::<Vec<_>>();
+                    let has_finish_reason = chunk
+                        .get("choices")
+                        .and_then(Value::as_array)
+                        .is_some_and(|choices| {
+                            choices.iter().any(|choice| {
+                                choice
+                                    .get("finish_reason")
+                                    .is_some_and(|reason| !reason.is_null())
+                            })
+                        });
+                    saw_finish_reason |= has_finish_reason;
+                    let top_level_type = chunk.get("type").and_then(Value::as_str);
+                    let choice_count = chunk
+                        .get("choices")
+                        .and_then(Value::as_array)
+                        .map_or(0, Vec::len);
+                    let usage_present = chunk.get("usage").is_some_and(|usage| !usage.is_null());
+                    tracing::trace!(
+                        target: "lam_openai::chat_completions",
+                        event = "chat.chunk_decoded",
+                        event_index = event_count,
+                        native_chunk_index = chunks.len() + 1,
+                        top_level_type,
+                        choice_count,
+                        finish_reasons = ?finish_reasons,
+                        usage_present,
+                        text_bytes = summary.text_bytes,
+                        reasoning_bytes = summary.reasoning_bytes,
+                        tool_call_count = summary.tool_call_count,
+                        tool_argument_bytes = summary.tool_argument_bytes,
+                        "decoded Chat Completions chunk"
+                    );
                     emit_chunk_deltas(&events, &chunk);
-                    saw_terminal |=
-                        chunk
-                            .get("choices")
-                            .and_then(Value::as_array)
-                            .is_some_and(|choices| {
-                                choices.iter().any(|choice| {
-                                    choice
-                                        .get("finish_reason")
-                                        .is_some_and(|reason| !reason.is_null())
-                                })
-                            });
                     chunks.push(chunk);
                     Ok(())
                 })
                 .await;
+            let saw_terminal = saw_done || saw_finish_reason;
             let body = match body {
                 Ok(body) => body,
                 Err(error)
                     if saw_terminal && !chunks.is_empty() && error.is_response_body_failure() =>
                 {
                     tracing::warn!(
+                        target: "lam_openai::chat_completions",
+                        event = "chat.trailing_body_failure_accepted",
                         error = %error,
                         chunks = chunks.len(),
+                        event_count,
+                        saw_done,
+                        saw_finish_reason,
+                        saw_usage,
                         "accepting a semantically complete Chat Completions response after a trailing body failure"
                     );
                     StreamBody::Events
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    tracing::error!(
+                        target: "lam_openai::chat_completions",
+                        event = "chat.stream_failed",
+                        error_kind = provider_error_kind(&error),
+                        response_body_failure = error.is_response_body_failure(),
+                        chunks = chunks.len(),
+                        event_count,
+                        saw_done,
+                        saw_finish_reason,
+                        saw_usage,
+                        text_bytes = emitted.text_bytes,
+                        reasoning_bytes = emitted.reasoning_bytes,
+                        tool_call_count = emitted.tool_call_count,
+                        tool_argument_bytes = emitted.tool_argument_bytes,
+                        "Chat Completions stream failed"
+                    );
+                    return Err(error);
+                }
             };
             match body {
                 StreamBody::Events => {
                     if chunks.is_empty() || !saw_terminal {
+                        tracing::error!(
+                            target: "lam_openai::chat_completions",
+                            event = "chat.missing_terminal",
+                            chunks = chunks.len(),
+                            event_count,
+                            saw_done,
+                            saw_finish_reason,
+                            saw_usage,
+                            "Chat Completions stream ended without a terminal chunk"
+                        );
                         return Err(ProviderError::MissingTerminal {
                             expected: "a final Chat Completions chunk",
                         });
                     }
+                    tracing::debug!(
+                        target: "lam_openai::chat_completions",
+                        event = "chat.stream_completed",
+                        chunks = chunks.len(),
+                        event_count,
+                        saw_done,
+                        saw_finish_reason,
+                        saw_usage,
+                        text_bytes = emitted.text_bytes,
+                        reasoning_bytes = emitted.reasoning_bytes,
+                        tool_call_count = emitted.tool_call_count,
+                        tool_argument_bytes = emitted.tool_argument_bytes,
+                        "completed Chat Completions stream"
+                    );
                     Ok(response_payload(
                         CHAT_RESPONSE_CODEC_ID,
                         request.output_kind,
@@ -254,6 +391,75 @@ impl ModelProvider for ChatCompletionsProvider {
 
     fn is_context_overflow(&self, error: &Self::Error) -> bool {
         error.is_context_overflow()
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct DeltaSummary {
+    text_bytes: u64,
+    reasoning_bytes: u64,
+    tool_call_count: u64,
+    tool_argument_bytes: u64,
+}
+
+impl DeltaSummary {
+    fn add(&mut self, other: Self) {
+        self.text_bytes = self.text_bytes.saturating_add(other.text_bytes);
+        self.reasoning_bytes = self.reasoning_bytes.saturating_add(other.reasoning_bytes);
+        self.tool_call_count = self.tool_call_count.saturating_add(other.tool_call_count);
+        self.tool_argument_bytes = self
+            .tool_argument_bytes
+            .saturating_add(other.tool_argument_bytes);
+    }
+}
+
+fn summarize_chunk(chunk: &Value) -> DeltaSummary {
+    let mut summary = DeltaSummary::default();
+    let Some(choices) = chunk.get("choices").and_then(Value::as_array) else {
+        return summary;
+    };
+    for delta in choices
+        .iter()
+        .filter_map(|choice| choice.get("delta").and_then(Value::as_object))
+    {
+        summary.text_bytes = summary.text_bytes.saturating_add(
+            delta
+                .get("content")
+                .and_then(Value::as_str)
+                .map_or(0, |text| text.len() as u64),
+        );
+        for field in ["reasoning_content", "reasoning", "thinking"] {
+            summary.reasoning_bytes = summary.reasoning_bytes.saturating_add(
+                delta
+                    .get(field)
+                    .and_then(Value::as_str)
+                    .map_or(0, |text| text.len() as u64),
+            );
+        }
+        if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
+            summary.tool_call_count = summary.tool_call_count.saturating_add(calls.len() as u64);
+            for call in calls {
+                summary.tool_argument_bytes = summary.tool_argument_bytes.saturating_add(
+                    call.pointer("/function/arguments")
+                        .and_then(Value::as_str)
+                        .map_or(0, |arguments| arguments.len() as u64),
+                );
+            }
+        }
+    }
+    summary
+}
+
+const fn provider_error_kind(error: &ProviderError) -> &'static str {
+    match error {
+        ProviderError::UnexpectedRequestCodec { .. } => "unexpected_request_codec",
+        ProviderError::InvalidRequest { .. } => "invalid_request",
+        ProviderError::Http(_) => "http",
+        ProviderError::HttpStatus { .. } => "http_status",
+        ProviderError::InvalidEventStream { .. } => "invalid_event_stream",
+        ProviderError::InvalidEventJson { .. } => "invalid_event_json",
+        ProviderError::Api { .. } => "api",
+        ProviderError::MissingTerminal { .. } => "missing_terminal",
     }
 }
 

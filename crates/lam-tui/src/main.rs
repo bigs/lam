@@ -2,6 +2,7 @@
 
 mod app;
 mod config;
+mod diagnostics;
 mod runtime;
 mod session;
 mod ui;
@@ -25,6 +26,7 @@ use tokio::sync::mpsc;
 
 use crate::app::{App, SessionChoice, SessionView};
 use crate::config::LoadedConfig;
+use crate::diagnostics::DiagnosticLog;
 use crate::runtime::{Command, CommandResult, Runtime};
 use crate::session::{Session, SessionCatalog};
 
@@ -58,6 +60,16 @@ async fn tokio_main() -> Result<(), AppError> {
     let config_path = config.path.display().to_string();
     let sessions = SessionCatalog::open_default().map_err(AppError::Session)?;
     let selection = sessions.resume_or_create(&cwd).map_err(AppError::Session)?;
+    let diagnostics = args
+        .debug_log
+        .then(DiagnosticLog::install)
+        .transpose()
+        .map_err(AppError::Diagnostics)?;
+    if let Some(diagnostics) = &diagnostics {
+        diagnostics
+            .activate(&selection.session)
+            .map_err(AppError::Diagnostics)?;
+    }
     let (mut runtime, mut app) = open_session(
         &config,
         &sessions,
@@ -118,6 +130,11 @@ async fn tokio_main() -> Result<(), AppError> {
                                     _ => unreachable!("session commands were matched above"),
                                 };
                                 drop(runtime);
+                                if let Some(diagnostics) = &diagnostics {
+                                    diagnostics
+                                        .activate(&session)
+                                        .map_err(AppError::Diagnostics)?;
+                                }
                                 (runtime, app) = open_session(
                                     &config,
                                     &sessions,
@@ -210,6 +227,7 @@ async fn session_choices(
 
 struct Args {
     config: Option<PathBuf>,
+    debug_log: bool,
     help: bool,
     version: bool,
 }
@@ -217,6 +235,7 @@ struct Args {
 impl Args {
     fn parse() -> Result<Self, AppError> {
         let mut config = None;
+        let mut debug_log = false;
         let mut help = false;
         let mut version = false;
         let mut arguments = env::args_os().skip(1);
@@ -228,6 +247,7 @@ impl Args {
                     })?;
                     config = Some(PathBuf::from(path));
                 }
+                Some("--debug-log") => debug_log = true,
                 Some("--help" | "-h") => help = true,
                 Some("--version" | "-V") => version = true,
                 Some(value) => {
@@ -244,6 +264,7 @@ impl Args {
         }
         Ok(Self {
             config,
+            debug_log,
             help,
             version,
         })
@@ -309,7 +330,7 @@ impl Drop for TerminalSession {
 
 fn print_help() {
     println!(
-        "lam — a minimal TypeScript coding agent\n\nUSAGE:\n    lam [--config PATH]\n\nOPTIONS:\n    --config PATH  Read providers from PATH instead of ~/.lam/providers.toml\n    -h, --help     Show this help\n    -V, --version  Show the version\n\nLam resumes the latest durable session for the current directory. Inside the TUI,\ntype / for commands, including /new for a fresh session and /session to restore\nan earlier one. Tab switches focus between the input shelf and conversation;\narrows select transcript rows; Enter expands the selected row."
+        "lam — a minimal TypeScript coding agent\n\nUSAGE:\n    lam [--config PATH] [--debug-log]\n\nOPTIONS:\n    --config PATH  Read providers from PATH instead of ~/.lam/providers.toml\n    --debug-log    Append metadata-only diagnostics beside the session journal\n    -h, --help     Show this help\n    -V, --version  Show the version\n\nLam resumes the latest durable session for the current directory. Inside the TUI,\ntype / for commands, including /new for a fresh session and /session to restore\nan earlier one. Tab switches focus between the input shelf and conversation;\narrows select transcript rows; Enter expands the selected row."
     );
 }
 
@@ -327,6 +348,8 @@ enum AppError {
     Config(crate::config::ConfigError),
     #[error(transparent)]
     Session(crate::session::SessionError),
+    #[error(transparent)]
+    Diagnostics(crate::diagnostics::DiagnosticError),
     #[error(transparent)]
     Runtime(crate::runtime::RuntimeError),
     #[error("terminal operation failed: {0}")]

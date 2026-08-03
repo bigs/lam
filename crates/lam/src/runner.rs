@@ -11,6 +11,7 @@ use lam_core::{
 use lam_deno::{EvalOptions, Isolate};
 use serde::Serialize;
 use tokio::sync::{mpsc, watch};
+use tracing::Instrument;
 
 use crate::actor::{Clock, RuntimeIds};
 use crate::command::{CallRequest, RunnerCommand};
@@ -182,6 +183,12 @@ where
     ) -> Result<Option<serde_json::Value>, ActorError> {
         let mut state = load_state(self.store.as_ref(), &self.actor_id).await?;
         let model = self.selected_model(&state)?.clone();
+        let model_id = state
+            .selected_model()
+            .expect("selected_model succeeded above")
+            .model_id
+            .clone();
+        let descriptor = model.descriptor().clone();
         let run_id = match state.active_run() {
             Some(run_id) => run_id.clone(),
             None => {
@@ -230,11 +237,38 @@ where
                     );
                 });
                 let mut abort = self.abort.clone();
+                let attempt = u8::from(overflow_retried) + 1;
+                let invoke_span = tracing::info_span!(
+                    target: "lam::model",
+                    "lam.model.request",
+                    actor_id = %self.actor_id,
+                    run_id = %run_id,
+                    registry_model_id = %model_id,
+                    provider = descriptor.provider(),
+                    model = descriptor.model(),
+                    codec = descriptor.codec(),
+                    attempt,
+                );
                 let result = tokio::select! {
                     biased;
                     _ = wait_for_abort(&mut abort) => return Err(ActorError::Aborted),
-                    result = model.invoke(request, sink) => result,
+                    result = model.invoke(request, sink).instrument(invoke_span) => result,
                 };
+                if let Err(error) = &result {
+                    tracing::error!(
+                        target: "lam::model",
+                        event = "model.request_failed",
+                        actor_id = %self.actor_id,
+                        run_id = %run_id,
+                        registry_model_id = %model_id,
+                        provider = descriptor.provider(),
+                        model = descriptor.model(),
+                        codec = descriptor.codec(),
+                        attempt,
+                        context_overflow = error.context_overflow,
+                        "model request failed"
+                    );
+                }
                 match result {
                     Ok(response) => break response,
                     Err(error) if error.context_overflow => {

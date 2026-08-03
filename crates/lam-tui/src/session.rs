@@ -26,6 +26,12 @@ pub(crate) struct Session {
     pub(crate) database_path: PathBuf,
 }
 
+impl Session {
+    pub(crate) fn diagnostic_log_path(&self) -> PathBuf {
+        self.database_path.with_extension("debug.jsonl")
+    }
+}
+
 /// Whether startup selected an existing session or created a fresh one.
 pub(crate) struct SessionSelection {
     pub(crate) session: Session,

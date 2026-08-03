@@ -212,9 +212,25 @@ impl Runtime {
                                 .and_then(|projected| projected.entry.transition.run_id())
                                 .map(ToString::to_string)
                         });
+                        tracing::debug!(
+                            target: "lam_tui::runtime",
+                            event = "tui.call_completed",
+                            actor_id = "/root",
+                            run_id = ?run_id,
+                            output_bytes = output.len(),
+                            "root call completed"
+                        );
                         CommandResult::Call(Ok(CompletedCall { output, run_id }))
                     }
-                    Err(error) => CommandResult::Call(Err(error.to_string())),
+                    Err(error) => {
+                        tracing::error!(
+                            target: "lam_tui::runtime",
+                            event = "tui.call_failed",
+                            actor_id = "/root",
+                            "root call failed"
+                        );
+                        CommandResult::Call(Err(error.to_string()))
+                    }
                 },
                 Command::Compact => {
                     let result = root.compact().await.map(|receipt| match receipt {
