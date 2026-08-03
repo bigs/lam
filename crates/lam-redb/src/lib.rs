@@ -41,10 +41,6 @@ impl RedbStore {
     }
 
     /// Lists actor journals in canonical actor-ID order.
-    ///
-    /// This is an observability surface for embeddings which need to discover
-    /// durable actors, such as a session browser. Journal mutation remains
-    /// available only through [`JournalStore`].
     pub fn actor_ids(&self) -> Result<Vec<ActorId>, RedbStoreError> {
         let read = self.database.begin_read().map_err(database_error)?;
         let heads = read.open_table(HEADS).map_err(database_error)?;
@@ -172,7 +168,7 @@ impl JournalStore for RedbStore {
     }
 }
 
-/// A redb operation or actor-event serialization failed.
+/// A redb operation, actor-event serialization, or stored-key validation failed.
 #[derive(Debug, thiserror::Error)]
 pub enum RedbStoreError {
     /// The embedded database rejected an operation.

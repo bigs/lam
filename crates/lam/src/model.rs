@@ -84,7 +84,6 @@ impl<P, C> Model<P, C> {
 pub(crate) struct RegisteredModel {
     runtime: Arc<dyn RuntimeModel>,
     pub(crate) compactor: Option<Arc<dyn Compactor>>,
-    context_window_tokens: Option<u64>,
 }
 
 impl Clone for RegisteredModel {
@@ -92,7 +91,6 @@ impl Clone for RegisteredModel {
         Self {
             runtime: Arc::clone(&self.runtime),
             compactor: self.compactor.as_ref().map(Arc::clone),
-            context_window_tokens: self.context_window_tokens,
         }
     }
 }
@@ -103,16 +101,14 @@ impl RegisteredModel {
         P: ModelProvider,
         C: ModelCodec,
     {
-        let context_window_tokens = model.context_window_tokens;
         Self {
             runtime: Arc::new(RuntimeModelAdapter { model }),
             compactor,
-            context_window_tokens,
         }
     }
 
     pub(crate) fn compaction_config(&self, fallback: &CompactionConfig) -> CompactionConfig {
-        self.context_window_tokens.map_or_else(
+        self.runtime.context_window_tokens().map_or_else(
             || fallback.clone(),
             |tokens| fallback.clone().context_window_tokens(tokens),
         )
@@ -172,6 +168,8 @@ pub(crate) type RuntimeModelFuture<'a> =
 trait RuntimeModel: Send + Sync {
     fn descriptor(&self) -> &ModelDescriptor;
 
+    fn context_window_tokens(&self) -> Option<u64>;
+
     fn encode_request(
         &self,
         context: &[ProjectedContextEntry],
@@ -203,6 +201,10 @@ where
 {
     fn descriptor(&self) -> &ModelDescriptor {
         self.model.descriptor()
+    }
+
+    fn context_window_tokens(&self) -> Option<u64> {
+        self.model.context_window_tokens()
     }
 
     fn encode_request(

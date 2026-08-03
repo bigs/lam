@@ -120,7 +120,8 @@ task retires—not merely when its inner runner observes cancellation.
 ## Embedded control and events
 
 `Agent` is a cloneable embedded handle with serialized `call`, structured
-`call_structured`, durable `send`, state projection, and out-of-band abort.
+`call_structured`, explicit compaction, model switching, durable `send`, state
+projection, and out-of-band abort.
 
 `AgentSystem::wait()` waits for quiescence: no active host operations,
 reservations, actor runs, or eligible mailbox work. It does not retire idle

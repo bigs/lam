@@ -8,8 +8,8 @@ use futures_util::future::join_all;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use lam::{
     AbortHandle, Actor, ActorBuilder, ActorId, ActorRef, ActorState, CompactionReceipt,
-    DeliveryMode, JournalStore, MessageReceipt, ModelSwitchPolicy, ModelSwitchReceipt, RunEvents,
-    RuntimeEvents,
+    DeliveryMode, JournalStore, MessageId, MessageReceipt, ModelSwitchPolicy, ModelSwitchReceipt,
+    RunEvents, RuntimeEvents,
 };
 use schemars::JsonSchema;
 use serde::Serialize;
@@ -461,20 +461,14 @@ where
 }
 
 struct SpawnedTask {
-    parent: ActorAddress,
-    message_id: String,
+    message_id: MessageId,
     delivery: OutcomeDelivery,
 }
 
 enum OutcomeDelivery {
     Pending,
-    Delivered {
-        inbox_message_id: String,
-        inbox_revision: u64,
-    },
-    Failed {
-        message: String,
-    },
+    Delivered(MessageReceipt),
+    Failed { message: String },
 }
 
 struct ChildLaunch<S>
@@ -777,15 +771,14 @@ where
                 return;
             }
         };
-        self.track_spawned_task(
-            parent.address.clone(),
-            child.resident.address.clone(),
-            message_id.to_string(),
-        );
+        self.track_spawned_task(child.resident.address.clone(), message_id.clone());
         if ready.send(Ok(receipt)).is_err() || accepted.await.is_err() {
-            self.fail_spawned_delivery(
+            self.set_spawned_delivery(
                 &child.resident.address,
-                "spawn was cancelled before its admission receipt was accepted".to_owned(),
+                OutcomeDelivery::Failed {
+                    message: "spawn was cancelled before its admission receipt was accepted"
+                        .to_owned(),
+                },
             );
             drop(owner);
             self.cancel_subtree(&child.resident.address, StopReason::Cancelled);
@@ -807,18 +800,21 @@ where
             Err(error) => Err(error),
         };
         match delivery {
-            Ok(receipt) => self.complete_spawned_delivery(&child.resident.address, receipt),
-            Err(error) => {
-                self.fail_spawned_delivery(&child.resident.address, error.to_string());
-            }
+            Ok(receipt) => self
+                .set_spawned_delivery(&child.resident.address, OutcomeDelivery::Delivered(receipt)),
+            Err(error) => self.set_spawned_delivery(
+                &child.resident.address,
+                OutcomeDelivery::Failed {
+                    message: error.to_string(),
+                },
+            ),
         }
     }
 
-    fn track_spawned_task(&self, parent: ActorAddress, address: ActorAddress, message_id: String) {
+    fn track_spawned_task(&self, address: ActorAddress, message_id: MessageId) {
         let previous = lock(&self.state).spawned_tasks.insert(
             address,
             SpawnedTask {
-                parent,
                 message_id,
                 delivery: OutcomeDelivery::Pending,
             },
@@ -827,20 +823,12 @@ where
         self.activity.notify_waiters();
     }
 
-    fn complete_spawned_delivery(&self, address: &ActorAddress, receipt: MessageReceipt) {
-        if let Some(task) = lock(&self.state).spawned_tasks.get_mut(address) {
-            task.delivery = OutcomeDelivery::Delivered {
-                inbox_message_id: receipt.message_id.to_string(),
-                inbox_revision: receipt.revision.get(),
-            };
-        }
-        self.activity.notify_waiters();
-    }
-
-    fn fail_spawned_delivery(&self, address: &ActorAddress, message: String) {
-        if let Some(task) = lock(&self.state).spawned_tasks.get_mut(address) {
-            task.delivery = OutcomeDelivery::Failed { message };
-        }
+    fn set_spawned_delivery(&self, address: &ActorAddress, delivery: OutcomeDelivery) {
+        lock(&self.state)
+            .spawned_tasks
+            .get_mut(address)
+            .expect("spawned tasks are tracked before outcome delivery")
+            .delivery = delivery;
         self.activity.notify_waiters();
     }
 
@@ -1029,22 +1017,13 @@ where
                             address: address.clone(),
                         });
                     };
-                    if task.parent != *requester {
-                        return Err(WaitError::NotSpawned {
-                            requester: requester.clone(),
-                            address: address.clone(),
-                        });
-                    }
                     match &task.delivery {
                         OutcomeDelivery::Pending => pending = true,
-                        OutcomeDelivery::Delivered {
-                            inbox_message_id,
-                            inbox_revision,
-                        } => completed.push(WaitedTask {
+                        OutcomeDelivery::Delivered(receipt) => completed.push(WaitedTask {
                             address: address.clone(),
-                            message_id: task.message_id.clone(),
-                            inbox_message_id: inbox_message_id.clone(),
-                            inbox_revision: *inbox_revision,
+                            message_id: task.message_id.to_string(),
+                            inbox_message_id: receipt.message_id.to_string(),
+                            inbox_revision: receipt.revision.get(),
                         }),
                         OutcomeDelivery::Failed { message } => {
                             return Err(WaitError::DeliveryFailed {

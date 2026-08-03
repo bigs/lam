@@ -130,25 +130,31 @@ async fn actor_journals_can_be_discovered_in_canonical_order() {
     let store =
         RedbStore::create(directory.path().join("actors.redb")).expect("redb store should open");
     for name in ["/root/zeta", "/root", "/root/alpha"] {
-        let actor = ActorId::new(name).unwrap();
+        let actor = ActorId::new(name).expect("fixture actor ID should be valid");
         let outcome = store
             .append(
                 &actor,
                 Revision::ZERO,
                 EventBatch::one(ActorEvent::message_admitted(message(
-                    MessageId::new(format!("message-{name}")).unwrap(),
+                    MessageId::new(format!("message-{name}"))
+                        .expect("fixture message ID should be valid"),
                     DeliveryMode::Steer,
                     1,
                 ))),
             )
             .await
-            .unwrap();
-        assert!(matches!(outcome, AppendOutcome::Appended { .. }));
+            .expect("journal append should succeed");
+        assert_eq!(
+            outcome,
+            AppendOutcome::Appended {
+                head: Revision::new(1)
+            }
+        );
     }
 
     let actors = store
         .actor_ids()
-        .unwrap()
+        .expect("actor discovery should succeed")
         .into_iter()
         .map(|actor| actor.to_string())
         .collect::<Vec<_>>();
