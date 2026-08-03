@@ -7,9 +7,9 @@ use std::thread::JoinHandle;
 use futures_util::future::join_all;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use lam::{
-    AbortHandle, Actor, ActorBuilder, ActorId, ActorRef, ActorState, CompactionReceipt,
-    DeliveryMode, JournalStore, MessageId, MessageReceipt, ModelSwitchPolicy, ModelSwitchReceipt,
-    RunEvents, RuntimeEvents,
+    AbortHandle, Actor, ActorBuilder, ActorHandle, ActorId, ActorRef, ActorState,
+    CompactionReceipt, DeliveryMode, JournalStore, MessageId, MessageReceipt, ModelSwitchPolicy,
+    ModelSwitchReceipt, RunEvents, RuntimeEvents,
 };
 use schemars::JsonSchema;
 use serde::Serialize;
@@ -35,7 +35,7 @@ where
 {
     address: ActorAddress,
     owner: AsyncMutex<Option<Actor<Arc<S>>>>,
-    actor_ref: ActorRef<Arc<S>>,
+    handle: ActorHandle<Arc<S>>,
     abort: AbortHandle,
     status: Arc<ActorTaskStatus>,
 }
@@ -64,7 +64,7 @@ where
     fn new(address: ActorAddress, actor: Actor<Arc<S>>, status: Arc<ActorTaskStatus>) -> Arc<Self> {
         Arc::new(Self {
             address,
-            actor_ref: actor.actor_ref(),
+            handle: actor.handle(),
             abort: actor.abort_handle(),
             owner: AsyncMutex::new(Some(actor)),
             status,
@@ -328,13 +328,13 @@ where
     /// Returns the underlying single-actor journal identity.
     #[must_use]
     pub fn actor_id(&self) -> &ActorId {
-        self.resident.actor_ref.actor_id()
+        self.resident.handle.actor_id()
     }
 
     /// Returns a cloneable send-only mailbox address.
     #[must_use]
     pub fn actor_ref(&self) -> ActorRef<Arc<S>> {
-        self.resident.actor_ref.clone()
+        self.resident.handle.actor_ref()
     }
 
     /// Returns explicit force-cancellation authority while the actor is live.
@@ -359,7 +359,7 @@ where
         let _activity = self._system.begin_activity()?;
         let receipt = self
             .resident
-            .actor_ref
+            .handle
             .send(input, delivery)
             .await
             .map_err(AgentSystemError::from)?;
@@ -374,9 +374,7 @@ where
     {
         self.resident.ensure_running()?;
         let _activity = self._system.begin_activity()?;
-        let mut actor = self.resident.owner.lock().await;
-        let actor = actor.as_mut().ok_or(AgentSystemError::ShuttingDown)?;
-        actor.call(input).await.map_err(Into::into)
+        self.resident.handle.call(input).await.map_err(Into::into)
     }
 
     /// Runs one linear schema-constrained call to completion.
@@ -387,18 +385,19 @@ where
     {
         self.resident.ensure_running()?;
         let _activity = self._system.begin_activity()?;
-        let mut actor = self.resident.owner.lock().await;
-        let actor = actor.as_mut().ok_or(AgentSystemError::ShuttingDown)?;
-        actor.call(input).output::<O>().await.map_err(Into::into)
+        self.resident
+            .handle
+            .call(input)
+            .output::<O>()
+            .await
+            .map_err(Into::into)
     }
 
     /// Explicitly compacts this actor's current model-visible context.
     pub async fn compact(&self) -> Result<Option<CompactionReceipt>, AgentSystemError> {
         self.resident.ensure_running()?;
         let _activity = self._system.begin_activity()?;
-        let mut actor = self.resident.owner.lock().await;
-        let actor = actor.as_mut().ok_or(AgentSystemError::ShuttingDown)?;
-        actor.compact().await.map_err(Into::into)
+        self.resident.handle.compact().await.map_err(Into::into)
     }
 
     /// Compacts existing history and selects another registered root model.
@@ -418,9 +417,8 @@ where
     ) -> Result<ModelSwitchReceipt, AgentSystemError> {
         self.resident.ensure_running()?;
         let _activity = self._system.begin_activity()?;
-        let mut actor = self.resident.owner.lock().await;
-        let actor = actor.as_mut().ok_or(AgentSystemError::ShuttingDown)?;
-        actor
+        self.resident
+            .handle
             .switch_model_with_policy(model_id, policy)
             .await
             .map_err(Into::into)
@@ -429,7 +427,7 @@ where
     /// Rebuilds this actor's current projection from its journal.
     pub async fn state(&self) -> Result<ActorState, AgentSystemError> {
         self.resident.ensure_running()?;
-        self.resident.actor_ref.state().await.map_err(Into::into)
+        self.resident.handle.state().await.map_err(Into::into)
     }
 }
 
@@ -581,7 +579,7 @@ where
         let run_events = pending.actor.take_run_events();
         let runtime_events = pending.actor.take_runtime_events();
         let resident = ResidentActor::new(address.clone(), pending.actor, pending.status);
-        debug_assert_eq!(resident.actor_ref.actor_id().as_str(), address.as_str());
+        debug_assert_eq!(resident.handle.actor_id().as_str(), address.as_str());
         {
             let mut state = lock(&self.state);
             state.reservations.remove(&address);
@@ -729,9 +727,8 @@ where
             .await?;
         let admission_guard = ChildAdmissionGuard::new(self, &child);
         let _activity = self.begin_activity().map_err(spawn_system_error)?;
-        let mut owner = child.resident.owner.lock().await;
-        let actor = owner.as_mut().ok_or(SpawnError::Unavailable)?;
-        let mut run = actor.call_from_actor(&parent.actor_ref, task);
+        let parent_ref = parent.handle.actor_ref();
+        let mut run = child.resident.handle.call_from_actor(&parent_ref, task);
         let message_id = run.message_id().clone();
         run.wait_admitted()
             .await
@@ -739,7 +736,6 @@ where
                 message: error.to_string(),
             })?;
         let result = run.await;
-        drop(owner);
         let outcome = AgentOutcome::from_result(address, &message_id, result);
         self.emit(AgentSystemEvent::Outcome {
             outcome: outcome.clone(),
@@ -757,12 +753,8 @@ where
         accepted: oneshot::Receiver<()>,
         _activity: ActivityGuard<S>,
     ) {
-        let mut owner = child.resident.owner.lock().await;
-        let Some(actor) = owner.as_mut() else {
-            let _ = ready.send(Err(lam::ActorError::Unavailable));
-            return;
-        };
-        let mut run = actor.call_from_actor(&parent.actor_ref, task);
+        let parent_ref = parent.handle.actor_ref();
+        let mut run = child.resident.handle.call_from_actor(&parent_ref, task);
         let message_id = run.message_id().clone();
         let receipt = match run.wait_admitted().await {
             Ok(receipt) => receipt,
@@ -780,23 +772,25 @@ where
                         .to_owned(),
                 },
             );
-            drop(owner);
             self.cancel_subtree(&child.resident.address, StopReason::Cancelled);
             return;
         }
         let result = run.await;
-        drop(owner);
         let outcome =
             AgentOutcome::from_result(child.resident.address.clone(), &message_id, result);
         self.emit(AgentSystemEvent::Outcome {
             outcome: outcome.clone(),
         });
         let delivery = match parent.ensure_running() {
-            Ok(()) => parent
-                .actor_ref
-                .send_from_actor(&child.resident.actor_ref, outcome)
-                .await
-                .map_err(AgentSystemError::from),
+            Ok(()) => {
+                let child_ref = child.resident.handle.actor_ref();
+                parent
+                    .handle
+                    .actor_ref()
+                    .send_from_actor(&child_ref, outcome)
+                    .await
+                    .map_err(AgentSystemError::from)
+            }
             Err(error) => Err(error),
         };
         match delivery {
@@ -969,9 +963,11 @@ where
     ) -> Result<MessageReceipt, AgentSystemError> {
         let sender = self.resident(sender_address)?;
         let target = self.resident(target_address)?;
+        let sender_ref = sender.handle.actor_ref();
         let receipt = target
-            .actor_ref
-            .send_from_actor(&sender.actor_ref, message)
+            .handle
+            .actor_ref()
+            .send_from_actor(&sender_ref, message)
             .await
             .map_err(AgentSystemError::from)?;
         self.activity.notify_waiters();
@@ -1099,7 +1095,7 @@ where
                 if resident.is_stopped() {
                     continue;
                 }
-                let state = resident.actor_ref.state().await?;
+                let state = resident.handle.state().await?;
                 if state.active_run().is_some() || state.eligible_messages().next().is_some() {
                     idle = false;
                     break;

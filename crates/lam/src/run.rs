@@ -15,7 +15,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::command::{CallLease, CallRequest, RunnerCommand};
+use crate::command::{CallRequest, OperationLease, RunnerCommand};
 use crate::{ActorError, EvalOutcome, MessageReceipt};
 
 pub(crate) const RUN_EVENT_BUFFER: usize = 256;
@@ -110,7 +110,7 @@ pub enum RunEvent {
 
 struct RunStart {
     commands: mpsc::UnboundedSender<RunnerCommand>,
-    active: Arc<AtomicBool>,
+    operation_active: Arc<AtomicBool>,
     message: Result<MessageEnvelope, ActorError>,
     output: OutputContract,
     events: mpsc::Sender<RunEvent>,
@@ -119,25 +119,25 @@ struct RunStart {
 }
 
 /// One linear call which can be awaited for output or consumed as events.
-pub struct Run<'actor, T> {
+pub struct Run<T> {
     message_id: MessageId,
     start: Option<RunStart>,
     events: mpsc::Receiver<RunEvent>,
     admission: Option<oneshot::Receiver<Result<MessageReceipt, ActorError>>>,
     completion: oneshot::Receiver<Result<serde_json::Value, ActorError>>,
-    marker: PhantomData<(&'actor mut (), T)>,
+    marker: PhantomData<T>,
 }
 
-impl<T> Unpin for Run<'_, T> {}
+impl<T> Unpin for Run<T> {}
 
-impl<'actor> Run<'actor, String> {
+impl Run<String> {
     /// Changes this call from ordinary text to schema-constrained output.
     ///
     /// # Panics
     ///
     /// Panics if the run has already been polled and sent to the actor.
     #[must_use]
-    pub fn output<T>(self) -> Run<'actor, T>
+    pub fn output<T>(self) -> Run<T>
     where
         T: DeserializeOwned + JsonSchema,
     {
@@ -160,10 +160,10 @@ impl<'actor> Run<'actor, String> {
     }
 }
 
-impl<'actor, T> Run<'actor, T> {
+impl<T> Run<T> {
     pub(crate) fn new(
         commands: mpsc::UnboundedSender<RunnerCommand>,
-        active: Arc<AtomicBool>,
+        operation_active: Arc<AtomicBool>,
         message_id: MessageId,
         message: Result<MessageEnvelope, ActorError>,
     ) -> Self {
@@ -174,7 +174,7 @@ impl<'actor, T> Run<'actor, T> {
             message_id,
             start: Some(RunStart {
                 commands,
-                active,
+                operation_active,
                 message,
                 output: OutputContract::Text,
                 events: event_sender,
@@ -218,7 +218,7 @@ impl<'actor, T> Run<'actor, T> {
         };
         let RunStart {
             commands,
-            active,
+            operation_active,
             message,
             output,
             events,
@@ -237,7 +237,7 @@ impl<'actor, T> Run<'actor, T> {
                 return;
             }
         };
-        let lease = match CallLease::acquire(active) {
+        let lease = match OperationLease::acquire(operation_active) {
             Ok(lease) => lease,
             Err(error) => {
                 let _ = admission.send(Err(error.clone()));
@@ -282,7 +282,7 @@ impl Stream for RunEvents {
     }
 }
 
-impl<T> Stream for Run<'_, T> {
+impl<T> Stream for Run<T> {
     type Item = RunEvent;
 
     fn poll_next(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -292,7 +292,7 @@ impl<T> Stream for Run<'_, T> {
     }
 }
 
-impl<T> Future for Run<'_, T>
+impl<T> Future for Run<T>
 where
     T: DeserializeOwned,
 {

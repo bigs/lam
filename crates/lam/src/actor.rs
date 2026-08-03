@@ -14,7 +14,7 @@ use lam_deno::{Isolate, IsolateInterrupt, Namespace};
 use serde::Serialize;
 use tokio::sync::{mpsc, oneshot, watch};
 
-use crate::command::RunnerCommand;
+use crate::command::{OperationLease, RunnerCommand};
 use crate::compaction::{CompactionReceipt, SummaryTailCompactor};
 use crate::model::RegisteredModel;
 use crate::prompt::SystemPrompt;
@@ -559,7 +559,7 @@ where
             });
         }
         let ids = Arc::new(RuntimeIds::new());
-        let call_active = Arc::new(AtomicBool::new(false));
+        let operation_active = Arc::new(AtomicBool::new(false));
         let shutdown = Arc::new(AtomicBool::new(false));
         let (commands, receiver) = mpsc::unbounded_channel();
         let (run_event_sender, run_event_receiver) = mpsc::channel(RUN_EVENT_BUFFER);
@@ -655,9 +655,12 @@ where
             clock: self.clock,
             ids,
         };
-        let actor = Actor {
+        let handle = ActorHandle {
             actor_ref,
-            call_active,
+            operation_active,
+        };
+        let actor = Actor {
+            handle,
             shutdown,
             thread: None,
             stopped: Some(stopped),
@@ -679,13 +682,161 @@ fn initialization_error(error: impl std::fmt::Display) -> ActorBuildError {
     }
 }
 
-/// Linear owner of one actor's correlated call interface.
-pub struct Actor<S>
+/// Cloneable authority for correlated actor operations.
+///
+/// Calls, compaction, and model switches are mutually exclusive. A conflicting
+/// operation returns [`ActorError::Busy`] instead of waiting for the active
+/// operation to finish. Ordinary mailbox delivery remains available through
+/// [`ActorRef`].
+pub struct ActorHandle<S>
 where
     S: JournalStore + 'static,
 {
     actor_ref: ActorRef<S>,
-    call_active: Arc<AtomicBool>,
+    operation_active: Arc<AtomicBool>,
+}
+
+impl<S> Clone for ActorHandle<S>
+where
+    S: JournalStore + 'static,
+{
+    fn clone(&self) -> Self {
+        Self {
+            actor_ref: self.actor_ref.clone(),
+            operation_active: Arc::clone(&self.operation_active),
+        }
+    }
+}
+
+impl<S> ActorHandle<S>
+where
+    S: JournalStore + 'static,
+{
+    /// Returns this actor's stable journal identity.
+    #[must_use]
+    pub const fn actor_id(&self) -> &ActorId {
+        self.actor_ref.actor_id()
+    }
+
+    /// Returns a cloneable send-only mailbox address.
+    #[must_use]
+    pub fn actor_ref(&self) -> ActorRef<S> {
+        self.actor_ref.clone()
+    }
+
+    /// Rebuilds the current actor projection from its authoritative journal.
+    pub async fn state(&self) -> Result<ActorState, ActorError> {
+        self.actor_ref.state().await
+    }
+
+    /// Durably admits a value to this actor's mailbox.
+    pub async fn send<T>(
+        &self,
+        input: T,
+        delivery: DeliveryMode,
+    ) -> Result<MessageReceipt, ActorError>
+    where
+        T: Serialize,
+    {
+        self.actor_ref.send(input, delivery).await
+    }
+
+    /// Explicitly compacts the current context with the configured strategy.
+    ///
+    /// `None` means the context does not yet contain a prefix outside the
+    /// retained-tail target.
+    pub async fn compact(&self) -> Result<Option<CompactionReceipt>, ActorError> {
+        let _lease = OperationLease::acquire(Arc::clone(&self.operation_active))?;
+        let (completion, result) = oneshot::channel();
+        self.actor_ref
+            .commands
+            .send(RunnerCommand::Compact(completion))
+            .map_err(|_| ActorError::Unavailable)?;
+        result.await.map_err(|_| ActorError::Unavailable)?
+    }
+
+    /// Compacts existing history and selects another registered model.
+    pub async fn switch_model(
+        &self,
+        model_id: impl Into<String>,
+    ) -> Result<ModelSwitchReceipt, ActorError> {
+        self.switch_model_with_policy(model_id, ModelSwitchPolicy::Compact)
+            .await
+    }
+
+    /// Selects another registered model using an explicit context policy.
+    pub async fn switch_model_with_policy(
+        &self,
+        model_id: impl Into<String>,
+        policy: ModelSwitchPolicy,
+    ) -> Result<ModelSwitchReceipt, ActorError> {
+        let _lease = OperationLease::acquire(Arc::clone(&self.operation_active))?;
+        let model_id = ModelId::new(model_id).map_err(|error| ActorError::InvalidModelId {
+            message: error.to_string(),
+        })?;
+        let (completion, result) = oneshot::channel();
+        self.actor_ref
+            .commands
+            .send(RunnerCommand::SwitchModel {
+                model_id,
+                policy,
+                completion,
+            })
+            .map_err(|_| ActorError::Unavailable)?;
+        result.await.map_err(|_| ActorError::Unavailable)?
+    }
+
+    /// Creates a lazy text run which starts when first polled.
+    #[must_use]
+    pub fn call<T>(&self, input: T) -> Run<String>
+    where
+        T: Serialize,
+    {
+        let message_id = self.actor_ref.ids.message_id();
+        let message = self
+            .actor_ref
+            .user_message(message_id.clone(), input, DeliveryMode::Steer);
+        Run::new(
+            self.actor_ref.commands.clone(),
+            Arc::clone(&self.operation_active),
+            message_id,
+            message,
+        )
+    }
+
+    /// Creates a lazy text run with authenticated actor provenance.
+    ///
+    /// Multi-actor runtimes use this correlated counterpart to
+    /// [`ActorRef::send_from_actor`] when the sender must await an outcome.
+    #[must_use]
+    pub fn call_from_actor<T>(&self, sender: &ActorRef<S>, input: T) -> Run<String>
+    where
+        T: Serialize,
+    {
+        let message_id = self.actor_ref.ids.message_id();
+        let message = self.actor_ref.message(
+            message_id.clone(),
+            MessageSource::Actor {
+                actor_id: sender.actor_id.clone(),
+            },
+            input,
+            DeliveryMode::Steer,
+        );
+        Run::new(
+            self.actor_ref.commands.clone(),
+            Arc::clone(&self.operation_active),
+            message_id,
+            message,
+        )
+    }
+}
+
+/// Linear owner of one actor runtime and its single-consumer event streams.
+pub struct Actor<S>
+where
+    S: JournalStore + 'static,
+{
+    handle: ActorHandle<S>,
     shutdown: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     stopped: Option<oneshot::Receiver<()>>,
@@ -701,7 +852,13 @@ where
     /// Returns a cloneable send-only mailbox address.
     #[must_use]
     pub fn actor_ref(&self) -> ActorRef<S> {
-        self.actor_ref.clone()
+        self.handle.actor_ref()
+    }
+
+    /// Returns cloneable authority for correlated actor operations.
+    #[must_use]
+    pub fn handle(&self) -> ActorHandle<S> {
+        self.handle.clone()
     }
 
     /// Returns explicit kill authority for cancelling work from another task.
@@ -729,8 +886,6 @@ where
 
     /// Durably admits a value to this actor's mailbox.
     ///
-    /// Clone an [`ActorRef`] before starting a call when the actor must be
-    /// steered while that call holds its mutable borrow.
     pub async fn send<T>(
         &self,
         input: T,
@@ -739,7 +894,7 @@ where
     where
         T: Serialize,
     {
-        self.actor_ref.send(input, delivery).await
+        self.handle.send(input, delivery).await
     }
 
     /// Explicitly compacts the current context with the configured strategy.
@@ -747,15 +902,7 @@ where
     /// `None` means the context does not yet contain a prefix outside the
     /// retained-tail target.
     pub async fn compact(&mut self) -> Result<Option<CompactionReceipt>, ActorError> {
-        if self.call_active.load(Ordering::Acquire) {
-            return Err(ActorError::Busy);
-        }
-        let (completion, result) = oneshot::channel();
-        self.actor_ref
-            .commands
-            .send(RunnerCommand::Compact(completion))
-            .map_err(|_| ActorError::Unavailable)?;
-        result.await.map_err(|_| ActorError::Unavailable)?
+        self.handle.compact().await
     }
 
     /// Compacts existing history and selects another registered model.
@@ -773,64 +920,26 @@ where
         model_id: impl Into<String>,
         policy: ModelSwitchPolicy,
     ) -> Result<ModelSwitchReceipt, ActorError> {
-        if self.call_active.load(Ordering::Acquire) {
-            return Err(ActorError::Busy);
-        }
-        let model_id = ModelId::new(model_id).map_err(|error| ActorError::InvalidModelId {
-            message: error.to_string(),
-        })?;
-        let (completion, result) = oneshot::channel();
-        self.actor_ref
-            .commands
-            .send(RunnerCommand::SwitchModel {
-                model_id,
-                policy,
-                completion,
-            })
-            .map_err(|_| ActorError::Unavailable)?;
-        result.await.map_err(|_| ActorError::Unavailable)?
+        self.handle.switch_model_with_policy(model_id, policy).await
     }
 
     /// Starts a linear text call when the returned run is first polled.
-    pub fn call<T>(&mut self, input: T) -> Run<'_, String>
+    pub fn call<T>(&mut self, input: T) -> Run<String>
     where
         T: Serialize,
     {
-        let message_id = self.actor_ref.ids.message_id();
-        let message = self
-            .actor_ref
-            .user_message(message_id.clone(), input, DeliveryMode::Steer);
-        Run::new(
-            self.actor_ref.commands.clone(),
-            Arc::clone(&self.call_active),
-            message_id,
-            message,
-        )
+        self.handle.call(input)
     }
 
     /// Starts a linear text call with authenticated actor provenance.
     ///
     /// Multi-actor runtimes use this correlated counterpart to
     /// [`ActorRef::send_from_actor`] when the sender must await an outcome.
-    pub fn call_from_actor<T>(&mut self, sender: &ActorRef<S>, input: T) -> Run<'_, String>
+    pub fn call_from_actor<T>(&mut self, sender: &ActorRef<S>, input: T) -> Run<String>
     where
         T: Serialize,
     {
-        let message_id = self.actor_ref.ids.message_id();
-        let message = self.actor_ref.message(
-            message_id.clone(),
-            MessageSource::Actor {
-                actor_id: sender.actor_id.clone(),
-            },
-            input,
-            DeliveryMode::Steer,
-        );
-        Run::new(
-            self.actor_ref.commands.clone(),
-            Arc::clone(&self.call_active),
-            message_id,
-            message,
-        )
+        self.handle.call_from_actor(sender, input)
     }
 
     /// Gracefully stops this actor and waits for its runner to exit.
@@ -839,7 +948,7 @@ where
     /// mailbox messages are not discarded.
     pub async fn shutdown(mut self) -> Result<(), ActorError> {
         self.shutdown.store(true, Ordering::Release);
-        let _ = self.actor_ref.commands.send(RunnerCommand::Shutdown);
+        let _ = self.handle.actor_ref.commands.send(RunnerCommand::Shutdown);
         self.join_runner().await
     }
 
@@ -890,7 +999,7 @@ where
     fn drop(&mut self) {
         if self.stopped.is_some() {
             self.shutdown.store(true, Ordering::Release);
-            let _ = self.actor_ref.commands.send(RunnerCommand::Shutdown);
+            let _ = self.handle.actor_ref.commands.send(RunnerCommand::Shutdown);
         }
     }
 }

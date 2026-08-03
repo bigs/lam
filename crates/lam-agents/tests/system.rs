@@ -1247,7 +1247,43 @@ async fn agent_system_rejects_noncanonical_host_addresses() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn abort_bypasses_the_call_lock_and_retires_the_resident() {
+async fn conflicting_agent_operations_do_not_wait_for_active_calls() {
+    let provider = RoutingProvider::new();
+    let model = Model::new(provider.clone(), TestCodec)
+        .with_descriptor(ModelDescriptor::new("test", "model-a", "test/messages").unwrap());
+    let system = AgentSystem::builder(MemStore::new()).build().unwrap();
+    let root = system
+        .host(
+            Lam::builder(model)
+                .state_store(system.state_store())
+                .build()
+                .actor("/blocked"),
+        )
+        .await
+        .unwrap();
+    let caller = root.clone();
+    let call = tokio::spawn(async move { caller.call("blocking task").await });
+    provider.wait_for_request("blocking task").await;
+
+    let error = tokio::time::timeout(std::time::Duration::from_secs(2), root.compact())
+        .await
+        .expect("a conflicting operation should not wait for inference")
+        .expect_err("compaction should conflict with the active call");
+    assert!(matches!(
+        error,
+        AgentSystemError::Actor(lam::ActorError::Busy)
+    ));
+
+    root.abort_handle().abort();
+    assert!(matches!(
+        call.await.unwrap(),
+        Err(AgentSystemError::Actor(lam::ActorError::Aborted))
+    ));
+    system.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn abort_retires_a_resident_with_an_active_owned_run() {
     let provider = RoutingProvider::new();
     let model = Model::new(provider.clone(), TestCodec)
         .with_descriptor(ModelDescriptor::new("test", "model-a", "test/messages").unwrap());
@@ -1271,7 +1307,7 @@ async fn abort_bypasses_the_call_lock_and_retires_the_resident() {
     root.abort_handle().abort();
     let result = tokio::time::timeout(std::time::Duration::from_secs(2), call)
         .await
-        .expect("abort should not wait for the call-owner lock")
+        .expect("abort should not wait for the active run")
         .unwrap();
     assert!(matches!(
         result,

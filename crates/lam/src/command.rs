@@ -25,7 +25,7 @@ pub(crate) struct CallRequest {
     pub(crate) events: mpsc::Sender<RunEvent>,
     admission: Option<oneshot::Sender<Result<MessageReceipt, ActorError>>>,
     pub(crate) completion: oneshot::Sender<Result<serde_json::Value, ActorError>>,
-    _lease: CallLease,
+    _lease: OperationLease,
 }
 
 impl CallRequest {
@@ -35,7 +35,7 @@ impl CallRequest {
         events: mpsc::Sender<RunEvent>,
         admission: oneshot::Sender<Result<MessageReceipt, ActorError>>,
         completion: oneshot::Sender<Result<serde_json::Value, ActorError>>,
-        lease: CallLease,
+        lease: OperationLease,
     ) -> Self {
         Self {
             message,
@@ -68,21 +68,21 @@ impl CallRequest {
     }
 }
 
-pub(crate) struct CallLease {
-    active: Arc<AtomicBool>,
+pub(crate) struct OperationLease {
+    operation_active: Arc<AtomicBool>,
 }
 
-impl CallLease {
-    pub(crate) fn acquire(active: Arc<AtomicBool>) -> Result<Self, ActorError> {
-        active
+impl OperationLease {
+    pub(crate) fn acquire(operation_active: Arc<AtomicBool>) -> Result<Self, ActorError> {
+        operation_active
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| ActorError::Busy)?;
-        Ok(Self { active })
+        Ok(Self { operation_active })
     }
 }
 
-impl Drop for CallLease {
+impl Drop for OperationLease {
     fn drop(&mut self) {
-        self.active.store(false, Ordering::Release);
+        self.operation_active.store(false, Ordering::Release);
     }
 }

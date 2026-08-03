@@ -150,11 +150,12 @@ messages, full provider-native context, and compaction records. A
 `JournalStore` needs only ordered reads and compare-and-append batches. Pure
 projections derive pending work and the effective context.
 
-`Actor::call` is linear and waits for one tool-calling loop to finish.
+`ActorHandle::call` returns an owned run for one tool-calling loop, while the
+linear `Actor` retains runtime lifecycle and event-stream ownership.
 `ActorRef::send` returns after durable admission. Steering messages join the
 active run at its next boundary; queued messages wait for that run to finish.
-Recovery creates a fresh isolate, preserves the complete journal, and inserts a
-model-visible notice when an interrupted eval may have had partial effects.
+Recovery creates a fresh isolate, preserves the complete journal, and inserts
+a model-visible notice when an interrupted eval may have had partial effects.
 
 ### Provider-native history
 

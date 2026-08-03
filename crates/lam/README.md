@@ -74,19 +74,22 @@ one actor identity:
 
 ## Handles and control flow
 
-- `Actor` is the linear owner used for correlated calls, compaction, model
-  switching, graceful shutdown, and joined abort.
+- `Actor` is the linear runtime owner used for event-stream ownership, graceful
+  shutdown, and joined abort. Its operation methods delegate to its handle.
+- `ActorHandle` is cloneable authority for correlated calls, compaction, model
+  switching, state projection, and durable mailbox delivery.
 - `ActorRef` is cloneable send-only mailbox authority. `send` returns after the
   message is durably admitted.
 - `AbortHandle` is cloneable out-of-band cancellation authority and can
   interrupt a blocked model request or active JavaScript without waiting for
-  the `Actor` call lock.
-- `Run<T>` is the lazy, streamable form of a call. It exposes progress events
-  and can decode schema-constrained output.
+  the active correlated operation.
+- `Run<T>` is the owned, lazy, streamable form of a call. It exposes progress
+  events and can decode schema-constrained output.
 
-Only one call may run at a time for an actor. Additional input should use the
-mailbox: steering joins the active run at its next boundary, while queueing
-waits for that run to finish.
+Calls, compaction, and model switches are mutually exclusive per actor. A
+conflicting operation returns `ActorError::Busy`. Additional input should use
+the mailbox: steering joins the active run at its next boundary, while
+queueing waits for that run to finish.
 
 ## Context and recovery
 

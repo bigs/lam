@@ -119,9 +119,11 @@ task retires—not merely when its inner runner observes cancellation.
 
 ## Embedded control and events
 
-`Agent` is a cloneable embedded handle with serialized `call`, structured
+`Agent` is a cloneable embedded handle with `call`, structured
 `call_structured`, explicit compaction, model switching, durable `send`, state
-projection, and out-of-band abort.
+projection, and out-of-band abort. Correlated operations use Lam's shared actor
+operation lease; a conflict returns `ActorError::Busy` rather than waiting
+behind the resident lifecycle owner.
 
 `AgentSystem::wait()` waits for quiescence: no active host operations,
 reservations, actor runs, or eligible mailbox work. It does not retire idle

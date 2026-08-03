@@ -147,7 +147,7 @@ async fn new_actor_starts_with_one_durable_model_selection() {
     assert_eq!(state.selected_model().unwrap().model_id.as_str(), "primary");
 }
 
-async fn wait_for_model_start(run: &mut Run<'_, String>) {
+async fn wait_for_model_start(run: &mut Run<String>) {
     loop {
         match run.next().await {
             Some(RunEvent::ModelStarted { .. }) => return,
@@ -1278,6 +1278,30 @@ async fn dropping_a_run_detaches_without_permitting_an_overlapping_call() {
             ..
         }
     ));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cloned_actor_handles_share_exclusive_operation_admission() {
+    let gate = Arc::new(Barrier::new(2));
+    let provider = ScriptedProvider::new([
+        gated_output(json!("first"), Arc::clone(&gate)),
+        output(json!("second")),
+    ]);
+    let actor = build_actor(provider, []).await;
+    let handle = actor.handle();
+    let other = handle.clone();
+    let mut first = handle.call("first");
+    wait_for_model_start(&mut first).await;
+
+    assert_eq!(
+        other.call("overlapping").await.unwrap_err(),
+        ActorError::Busy
+    );
+    assert_eq!(other.compact().await.unwrap_err(), ActorError::Busy);
+
+    gate.wait();
+    assert_eq!(first.await.unwrap(), "first");
+    assert_eq!(other.call("second").await.unwrap(), "second");
 }
 
 async fn wait_for_context(actor: &lam::ActorRef<MemStore>, count: usize) -> lam::ActorState {

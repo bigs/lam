@@ -476,11 +476,11 @@ let structured: Review = actor.call(input).output::<Review>().await?;
 `call` starts a new correlated run and waits for its tool-calling loop to
 finish. It supports text and schema-constrained structured output.
 
-**Settled for Slice 3.** `Actor` is a non-cloneable linear owner, while
-`ActorRef` is a cloneable mailbox address exposing `send`. `Actor::call`
-requires `&mut self` and returns a `Run<'_, T>` which holds that mutable borrow,
-preventing overlapping calls through safe Rust while cloned references remain
-available for steering.
+**Updated after Slice 6.** `Actor` is the non-cloneable lifecycle and event
+owner. `ActorHandle` is cloneable correlated-operation authority, while
+`ActorRef` remains a cloneable send-only mailbox address. Calls return owned
+`Run<T>` values; a shared operation lease rejects overlapping calls,
+compactions, and model switches with `ActorError::Busy`.
 
 `Run<T>` is both a `Future<Output = Result<T, _>>` and a stream of ephemeral
 runtime events. Ignoring the stream never blocks the actor. Text is the default
@@ -1339,8 +1339,9 @@ outcomes use the `lam/eval@1` context codec.
 
 The slice has one actor and one dedicated runner thread. It does not include
 subagents, actor-to-actor routing, child lifecycle, or the eventual scheduler.
-`Actor` is linear for calls; cloneable `ActorRef` values remain available for
-mailbox delivery. Dropping a started run only detaches its consumer.
+The later `ActorHandle` API provides cloneable correlated operations;
+`ActorRef` remains available for send-only mailbox delivery. Dropping a started
+run only detaches its consumer.
 
 The essential end-to-end test is:
 

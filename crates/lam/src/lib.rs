@@ -20,8 +20,8 @@ mod runtime_event;
 mod runtime_journal;
 
 pub use actor::{
-    AbortHandle, Actor, ActorBuilder, ActorRef, Clock, Lam, LamBuilder, LamRuntime, MessageReceipt,
-    ModelSwitchPolicy, ModelSwitchReceipt, SystemClock,
+    AbortHandle, Actor, ActorBuilder, ActorHandle, ActorRef, Clock, Lam, LamBuilder, LamRuntime,
+    MessageReceipt, ModelSwitchPolicy, ModelSwitchReceipt, SystemClock,
 };
 pub use actor_task::ActorTask;
 pub use compaction::{
