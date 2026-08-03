@@ -19,6 +19,8 @@ use serde_json::{Value, json};
 const FIREWORKS_MODEL: &str = "accounts/fireworks/models/deepseek-v4-flash-0731";
 const FIREWORKS_BASE_URL: &str = "https://api.fireworks.ai/inference/v1";
 const OPENAI_MODEL: &str = "gpt-5.6-luna";
+const SYNTHETIC_MODEL: &str = "syn:large:text";
+const SYNTHETIC_BASE_URL: &str = "https://api.synthetic.new/openai/v1";
 const MAX_MODEL_REQUESTS: usize = 6;
 
 #[tokio::test(flavor = "current_thread")]
@@ -121,7 +123,31 @@ async fn fireworks_chat_completions_smoke() {
         }))
         .build()
         .expect("valid Fireworks model configuration");
-    project_navigation_smoke(model).await;
+    project_navigation_smoke(
+        model,
+        FIREWORKS_MODEL,
+        "fireworks-project-navigation",
+        "deepseek-console-result-run.json",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires SYNTHETIC_API_KEY and makes bounded live API calls"]
+async fn synthetic_chat_completions_project_navigation_smoke() {
+    let model = ChatCompletions::builder(SYNTHETIC_MODEL)
+        .api_key(required_env("SYNTHETIC_API_KEY"))
+        .base_url(SYNTHETIC_BASE_URL)
+        .extra_body(json!({ "reasoning_effort": "high" }))
+        .build()
+        .expect("valid Synthetic model configuration");
+    project_navigation_smoke(
+        model,
+        SYNTHETIC_MODEL,
+        "synthetic-project-navigation",
+        "synthetic-large-text-project-run.json",
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -307,8 +333,12 @@ struct LargestFile {
     size_bytes: u64,
 }
 
-async fn project_navigation_smoke<P, C>(model: Model<P, C>)
-where
+async fn project_navigation_smoke<P, C>(
+    model: Model<P, C>,
+    requested_model: &str,
+    actor_id: &str,
+    capture_file: &str,
+) where
     P: ModelProvider,
     C: ModelCodec,
 {
@@ -337,7 +367,7 @@ where
         .default_eval_timeout(Duration::from_secs(30))
         .max_eval_timeout(Duration::from_secs(45))
         .build()
-        .actor("fireworks-project-navigation")
+        .actor(actor_id)
         .build()
         .await
         .expect("live actor starts");
@@ -352,7 +382,15 @@ where
         .state()
         .await
         .expect("live context projects");
-    let capture_path = capture_run(&root, &state, &observation, &expected);
+    let capture_path = capture_run(
+        &root,
+        &state,
+        &observation,
+        &expected,
+        actor_id,
+        requested_model,
+        capture_file,
+    );
     actor.shutdown().await.expect("live actor shuts down");
 
     println!("run.capture {}", capture_path.display());
@@ -615,6 +653,9 @@ fn capture_run(
     state: &ActorState,
     observation: &Observation,
     expected: &LargestFile,
+    actor_id: &str,
+    requested_model: &str,
+    capture_file: &str,
 ) -> PathBuf {
     let context = state
         .context()
@@ -633,8 +674,8 @@ fn capture_run(
         .as_millis();
     let capture = json!({
         "capturedAtUnixMs": captured_at,
-        "actorId": "fireworks-project-navigation",
-        "requestedModel": FIREWORKS_MODEL,
+        "actorId": actor_id,
+        "requestedModel": requested_model,
         "projectRoot": root,
         "scope": { "excludedRootEntries": [".git", "target"], "followsSymlinks": false },
         "expectedLargestFile": expected,
@@ -648,7 +689,7 @@ fn capture_run(
     });
     let directory = root.join("target/live-reports");
     fs::create_dir_all(&directory).expect("create live report directory");
-    let path = directory.join("deepseek-console-result-run.json");
+    let path = directory.join(capture_file);
     fs::write(
         &path,
         serde_json::to_vec_pretty(&capture).expect("capture is serializable"),

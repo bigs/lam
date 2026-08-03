@@ -21,7 +21,7 @@ use lam_openai::responses::{
     OpenAiResponsesCompactor, REQUEST_CODEC_ID as RESPONSES_REQUEST_CODEC_ID,
     RESPONSE_CODEC_ID as RESPONSES_RESPONSE_CODEC_ID, Responses,
 };
-use lam_openai::{BuildError, ModelPricing};
+use lam_openai::{BuildError, ModelPricing, ProviderError};
 use serde_json::{Value, json};
 
 #[test]
@@ -920,6 +920,71 @@ async fn chat_provider_preserves_every_chunk_and_streams_reasoning() {
 }
 
 #[tokio::test]
+async fn chat_provider_accepts_a_terminal_chunk_before_a_truncated_body() {
+    let terminal = json!({
+        "id": "chat_complete",
+        "choices": [{
+            "index": 0,
+            "delta": { "role": "assistant", "content": "complete" },
+            "finish_reason": "stop"
+        }]
+    });
+    let stream = format!("data: {terminal}\n\n");
+    let server = MockServer::start_truncated("text/event-stream", stream);
+    let (provider, codec) = ChatCompletions::builder("test-model")
+        .base_url(format!("{}/v1", server.origin))
+        .build_parts()
+        .expect("valid adapter");
+    let request = codec
+        .encode_request(
+            &[user_message("hello")],
+            &ModelRequestConfig::agent(&OutputContract::Text, ""),
+        )
+        .expect("valid request");
+
+    let response = provider
+        .invoke(request, ModelEventSink::new(|_| {}))
+        .await
+        .expect("terminal response should survive a trailing body failure");
+
+    assert_eq!(response.value["chunks"], json!([terminal]));
+    server.finish();
+}
+
+#[tokio::test]
+async fn chat_provider_rejects_a_truncated_body_before_a_terminal_chunk() {
+    let partial = json!({
+        "id": "chat_partial",
+        "choices": [{
+            "index": 0,
+            "delta": { "role": "assistant", "content": "partial" },
+            "finish_reason": null
+        }]
+    });
+    let stream = format!("data: {partial}\n\n");
+    let server = MockServer::start_truncated("text/event-stream", stream);
+    let (provider, codec) = ChatCompletions::builder("test-model")
+        .base_url(format!("{}/v1", server.origin))
+        .build_parts()
+        .expect("valid adapter");
+    let request = codec
+        .encode_request(
+            &[user_message("hello")],
+            &ModelRequestConfig::agent(&OutputContract::Text, ""),
+        )
+        .expect("valid request");
+
+    let error = provider
+        .invoke(request, ModelEventSink::new(|_| {}))
+        .await
+        .expect_err("an incomplete response must still fail");
+
+    assert!(matches!(error, ProviderError::Http(_)));
+    assert!(error.to_string().contains("decoding response body"));
+    server.finish();
+}
+
+#[tokio::test]
 async fn responses_adapter_drives_a_complete_lam_eval_loop() {
     let first_response = json!({
         "id": "resp_eval",
@@ -1259,19 +1324,38 @@ impl MockServer {
         )
     }
 
+    fn start_truncated(content_type: &'static str, response_body: String) -> Self {
+        Self::start_responses(vec![(
+            content_type,
+            response_body.clone(),
+            response_body.len() + 128,
+        )])
+    }
+
     fn start_mixed(responses: Vec<(&'static str, String)>) -> Self {
+        Self::start_responses(
+            responses
+                .into_iter()
+                .map(|(content_type, response_body)| {
+                    let content_length = response_body.len();
+                    (content_type, response_body, content_length)
+                })
+                .collect(),
+        )
+    }
+
+    fn start_responses(responses: Vec<(&'static str, String, usize)>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
         let address = listener.local_addr().expect("mock address");
         let (sender, request) = mpsc::channel();
         let expected_requests = responses.len();
         let join = std::thread::spawn(move || {
-            for (content_type, response_body) in responses {
+            for (content_type, response_body, content_length) in responses {
                 let (mut stream, _) = listener.accept().expect("accept request");
                 let captured = read_request(&mut stream);
                 sender.send(captured).expect("capture request");
                 let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
-                    response_body.len()
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {content_length}\r\nConnection: close\r\n\r\n{response_body}"
                 );
                 stream
                     .write_all(response.as_bytes())

@@ -204,7 +204,21 @@ impl ModelProvider for ChatCompletionsProvider {
                     chunks.push(chunk);
                     Ok(())
                 })
-                .await?;
+                .await;
+            let body = match body {
+                Ok(body) => body,
+                Err(error)
+                    if saw_terminal && !chunks.is_empty() && error.is_response_body_failure() =>
+                {
+                    tracing::warn!(
+                        error = %error,
+                        chunks = chunks.len(),
+                        "accepting a semantically complete Chat Completions response after a trailing body failure"
+                    );
+                    StreamBody::Events
+                }
+                Err(error) => return Err(error),
+            };
             match body {
                 StreamBody::Events => {
                     if chunks.is_empty() || !saw_terminal {

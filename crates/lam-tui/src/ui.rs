@@ -261,15 +261,273 @@ fn renders_markdown(kind: EntryKind) -> bool {
 fn markdown_lines(markdown: &str, width: usize) -> Vec<Line<'static>> {
     let options = MarkdownOptions::new(MarkdownStyle);
     let text = from_str_with_options(markdown, &options);
-    text.lines
-        .into_iter()
-        .flat_map(|line| wrap_styled_line(line, width, Style::default().fg(Color::Gray)))
-        .collect()
+    wrap_markdown_lines(text.lines, width, Style::default().fg(Color::Gray))
 }
 
 fn markdown_preview(markdown: &str) -> String {
     let options = MarkdownOptions::new(MarkdownStyle);
     one_line(&from_str_with_options(markdown, &options).to_string())
+}
+
+fn wrap_markdown_lines(lines: Vec<Line<'_>>, width: usize, base: Style) -> Vec<Line<'static>> {
+    let mut output = Vec::new();
+    let mut lines = lines.into_iter().peekable();
+    while let Some(line) = lines.next() {
+        if line.to_string().starts_with('┌') {
+            let mut table = vec![line];
+            while let Some(next) = lines.next_if(|next| !next.to_string().starts_with('└')) {
+                table.push(next);
+            }
+            if let Some(bottom) = lines.next() {
+                table.push(bottom);
+            }
+            if table
+                .last()
+                .is_some_and(|bottom| bottom.to_string().starts_with('└'))
+                && let Some(wrapped) = wrap_markdown_table(table.clone(), width, base)
+            {
+                output.extend(wrapped);
+                continue;
+            }
+            for line in table {
+                output.extend(wrap_styled_line(line, width, base));
+            }
+        } else {
+            output.extend(wrap_styled_line(line, width, base));
+        }
+    }
+    output
+}
+
+fn wrap_markdown_table(
+    table: Vec<Line<'_>>,
+    width: usize,
+    base: Style,
+) -> Option<Vec<Line<'static>>> {
+    let desired = table_column_widths(table.first()?.to_string().as_str())?;
+    let overhead = desired.len().saturating_mul(3).saturating_add(1);
+    let available = width.checked_sub(overhead)?;
+    if available < desired.len() {
+        return None;
+    }
+    let widths = constrain_column_widths(&desired, available);
+    let mut output = Vec::new();
+    for line in table {
+        let text = line.to_string();
+        let border_style = line
+            .spans
+            .first()
+            .map_or(line.style, |span| line.style.patch(span.style));
+        match text.chars().next() {
+            Some('┌') => output.push(table_border_line('┌', '┬', '┐', &widths, border_style)),
+            Some('├') => output.push(table_border_line('├', '┼', '┤', &widths, border_style)),
+            Some('└') => output.push(table_border_line('└', '┴', '┘', &widths, border_style)),
+            Some('│') => output.extend(wrap_table_row(line, &widths, base)?),
+            _ => return None,
+        }
+    }
+    Some(output)
+}
+
+fn table_column_widths(top_border: &str) -> Option<Vec<usize>> {
+    let top_border = top_border.strip_prefix('┌')?.strip_suffix('┐')?;
+    let widths = top_border
+        .split('┬')
+        .map(|segment| UnicodeWidthStr::width(segment).checked_sub(2))
+        .collect::<Option<Vec<_>>>()?;
+    (!widths.is_empty()).then_some(widths)
+}
+
+fn constrain_column_widths(desired: &[usize], available: usize) -> Vec<usize> {
+    if desired.iter().sum::<usize>() <= available {
+        return desired.to_vec();
+    }
+    let mut widths = vec![1; desired.len()];
+    let mut remaining = available.saturating_sub(widths.len());
+    while remaining > 0 {
+        let mut advanced = false;
+        for (width, desired) in widths.iter_mut().zip(desired) {
+            if *width < *desired {
+                *width += 1;
+                remaining -= 1;
+                advanced = true;
+                if remaining == 0 {
+                    break;
+                }
+            }
+        }
+        if !advanced {
+            break;
+        }
+    }
+    widths
+}
+
+fn table_border_line(
+    left: char,
+    intersection: char,
+    right: char,
+    widths: &[usize],
+    style: Style,
+) -> Line<'static> {
+    let mut border = String::from(left);
+    for (index, width) in widths.iter().enumerate() {
+        border.push_str(&"─".repeat(width + 2));
+        border.push(if index + 1 == widths.len() {
+            right
+        } else {
+            intersection
+        });
+    }
+    Line::from(Span::styled(border, style))
+}
+
+fn wrap_table_row(line: Line<'_>, widths: &[usize], base: Style) -> Option<Vec<Line<'static>>> {
+    let border_style = line
+        .spans
+        .iter()
+        .find(|span| span.content.as_ref() == "│")
+        .map_or(line.style, |span| line.style.patch(span.style));
+    let mut cells = Vec::new();
+    let mut cell = Vec::new();
+    let mut inside = false;
+    for span in line.spans {
+        if span.content.as_ref() == "│" {
+            if inside {
+                cells.push(trim_cell_spans(std::mem::take(&mut cell)));
+            }
+            inside = true;
+        } else if inside {
+            cell.push(Span::styled(
+                span.content.into_owned(),
+                line.style.patch(span.style),
+            ));
+        }
+    }
+    if cells.len() != widths.len() {
+        return None;
+    }
+    let cells = cells
+        .into_iter()
+        .zip(widths)
+        .map(|(spans, width)| wrap_styled_words(Line::from(spans), *width, base))
+        .collect::<Vec<_>>();
+    let height = cells.iter().map(Vec::len).max().unwrap_or(1);
+    let mut rows = Vec::with_capacity(height);
+    for row in 0..height {
+        let mut spans = vec![Span::styled("│", border_style)];
+        for (column, width) in widths.iter().enumerate() {
+            spans.push(Span::raw(" "));
+            if let Some(line) = cells[column].get(row) {
+                let used = line.width();
+                spans.extend(line.spans.clone());
+                spans.push(Span::raw(" ".repeat(width.saturating_sub(used))));
+            } else {
+                spans.push(Span::raw(" ".repeat(*width)));
+            }
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled("│", border_style));
+        }
+        rows.push(Line::from(spans));
+    }
+    Some(rows)
+}
+
+fn trim_cell_spans(mut spans: Vec<Span<'static>>) -> Vec<Span<'static>> {
+    while spans
+        .first()
+        .is_some_and(|span| span.content.trim().is_empty())
+    {
+        spans.remove(0);
+    }
+    while spans
+        .last()
+        .is_some_and(|span| span.content.trim().is_empty())
+    {
+        spans.pop();
+    }
+    if let Some(first) = spans.first_mut() {
+        first.content = first.content.trim_start().to_owned().into();
+    }
+    if let Some(last) = spans.last_mut() {
+        last.content = last.content.trim_end().to_owned().into();
+    }
+    spans
+}
+
+fn wrap_styled_words(line: Line<'_>, width: usize, base: Style) -> Vec<Line<'static>> {
+    if width == 0 {
+        return vec![Line::default()];
+    }
+    let line_style = base.patch(line.style);
+    let characters = line
+        .spans
+        .into_iter()
+        .flat_map(|span| {
+            let style = line_style.patch(span.style);
+            span.content
+                .into_owned()
+                .chars()
+                .map(move |character| (character, style))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    if characters.is_empty() {
+        return vec![Line::default()];
+    }
+
+    let mut lines = Vec::new();
+    let mut start = 0;
+    while start < characters.len() {
+        while start < characters.len() && characters[start].0.is_whitespace() {
+            start += 1;
+        }
+        if start == characters.len() {
+            break;
+        }
+        let mut end = start;
+        let mut used = 0;
+        while end < characters.len() {
+            let character_width = characters[end].0.width().unwrap_or(0);
+            if end > start && used + character_width > width {
+                break;
+            }
+            used += character_width;
+            end += 1;
+            if used >= width {
+                break;
+            }
+        }
+        let cut = if end < characters.len() {
+            characters[start..end]
+                .iter()
+                .rposition(|(character, _)| character.is_whitespace())
+                .map_or(end, |space| start + space)
+        } else {
+            end
+        };
+        let cut = cut.max(start + 1);
+        lines.push(styled_character_line(&characters[start..cut]));
+        start = if cut < end { cut + 1 } else { end };
+    }
+    if lines.is_empty() {
+        lines.push(Line::default());
+    }
+    lines
+}
+
+fn styled_character_line(characters: &[(char, Style)]) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (character, style) in characters {
+        if let Some(span) = spans.last_mut()
+            && span.style == *style
+        {
+            span.content.to_mut().push(*character);
+        } else {
+            spans.push(Span::styled(character.to_string(), *style));
+        }
+    }
+    Line::from(spans)
 }
 
 fn wrap_styled_line(line: Line<'_>, width: usize, base: Style) -> Vec<Line<'static>> {
@@ -571,6 +829,27 @@ mod tests {
                 .add_modifier
                 .contains(ratatui::style::Modifier::BOLD)
         }));
+    }
+
+    #[test]
+    fn markdown_tables_wrap_cells_within_the_pane() {
+        let markdown = "| Term | Meaning |\n| --- | --- |\n| **Thread-mobile / migratable** | The value can be moved across threads while work is running. |\n| **Thread-affine** | The value must remain on the worker that owns it. |";
+        let lines = markdown_lines(markdown, 42);
+        let rendered = lines.iter().map(ToString::to_string).collect::<Vec<_>>();
+        let rows = rendered
+            .iter()
+            .filter(|line| line.starts_with('│'))
+            .collect::<Vec<_>>();
+
+        assert!(lines.iter().all(|line| line.width() <= 42));
+        assert!(rows.len() > 3, "cells should grow table rows vertically");
+        assert!(
+            rows.iter()
+                .all(|line| line.ends_with('│') && line.matches('│').count() == 3)
+        );
+        assert!(rendered.iter().any(|line| line.contains("Thread-mobile")));
+        assert!(rendered.iter().any(|line| line.contains("across")));
+        assert!(rendered.iter().any(|line| line.contains("threads")));
     }
 
     #[test]

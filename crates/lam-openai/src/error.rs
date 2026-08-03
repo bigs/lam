@@ -47,7 +47,7 @@ pub enum ProviderError {
         message: String,
     },
     /// The HTTP request or response stream failed.
-    #[error("model HTTP request failed")]
+    #[error("model HTTP request failed: {0}")]
     Http(#[source] reqwest::Error),
     /// The server rejected the request with a non-success status.
     #[error("model endpoint returned HTTP {status}: {body}")]
@@ -84,6 +84,10 @@ pub enum ProviderError {
 }
 
 impl ProviderError {
+    pub(crate) fn is_response_body_failure(&self) -> bool {
+        matches!(self, Self::Http(error) if error.is_body() || error.is_decode())
+    }
+
     pub(crate) fn is_context_overflow(&self) -> bool {
         let text = match self {
             Self::HttpStatus {
