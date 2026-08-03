@@ -7,6 +7,7 @@ mod runtime;
 mod session;
 mod ui;
 
+use std::collections::BTreeMap;
 use std::env;
 use std::io::{self, stdout};
 use std::path::{Path, PathBuf};
@@ -27,7 +28,7 @@ use tokio::sync::mpsc;
 use crate::app::{App, SessionChoice, SessionView};
 use crate::config::LoadedConfig;
 use crate::diagnostics::DiagnosticLog;
-use crate::runtime::{Command, CommandResult, Runtime};
+use crate::runtime::{Command, CommandResult, Runtime, RuntimePreferences};
 use crate::session::{Session, SessionCatalog};
 
 fn main() -> ExitCode {
@@ -70,13 +71,16 @@ async fn tokio_main() -> Result<(), AppError> {
             .activate(&selection.session)
             .map_err(AppError::Diagnostics)?;
     }
+    let choices = session_choices(&sessions, &cwd).await?;
+    let mut session_lease = selection.lease;
     let (mut runtime, mut app) = open_session(
         &config,
-        &sessions,
         &cwd,
         selection.session,
         selection.resumed,
         &config_path,
+        choices,
+        None,
     )
     .await?;
 
@@ -114,37 +118,69 @@ async fn tokio_main() -> Result<(), AppError> {
                         if let Some(command) = app.handle_key(key) {
                             match command {
                                 session_command @ (Command::New | Command::LoadSession(_)) => {
-                                runtime
-                                    .system
-                                    .shutdown()
-                                    .await
-                                    .map_err(|error| AppError::Shutdown(error.to_string()))?;
-                                let (session, resumed) = match session_command {
-                                    Command::New => (
-                                        sessions.create(&cwd).map_err(AppError::Session)?,
-                                        false,
-                                    ),
-                                    Command::LoadSession(id) => (
-                                        sessions.select(id, &cwd).map_err(AppError::Session)?,
-                                        true,
-                                    ),
-                                    _ => unreachable!("session commands were matched above"),
-                                };
-                                drop(runtime);
-                                if let Some(diagnostics) = &diagnostics {
-                                    diagnostics
-                                        .activate(&session)
-                                        .map_err(AppError::Diagnostics)?;
+                                    let preferences = matches!(session_command, Command::New)
+                                        .then(|| app.runtime_preferences());
+                                    let claimed = match session_command {
+                                        Command::New => sessions
+                                            .create(&cwd)
+                                            .map(|(session, lease)| (session, lease, false)),
+                                        Command::LoadSession(id) => sessions
+                                            .select(id, &cwd)
+                                            .map(|(session, lease)| (session, lease, true)),
+                                        _ => unreachable!("session commands were matched above"),
+                                    };
+                                    let (session, next_lease, resumed) = match claimed {
+                                        Ok(claimed) => claimed,
+                                        Err(error) => {
+                                            app.session_change_failed(error.to_string());
+                                            redraw = true;
+                                            continue;
+                                        }
+                                    };
+                                    let choices = reconcile_session_choices(
+                                        &sessions,
+                                        &cwd,
+                                        &app.sessions,
+                                        (!resumed).then_some(session.id),
+                                    ).await?;
+                                    terminal
+                                        .terminal
+                                        .draw(|frame| ui::render(frame, &mut app))
+                                        .map_err(AppError::Terminal)?;
+                                    runtime
+                                        .system
+                                        .shutdown()
+                                        .await
+                                        .map_err(|error| AppError::Shutdown(error.to_string()))?;
+                                    drop(runtime);
+                                    drop(session_lease);
+                                    session_lease = next_lease;
+                                    if let Some(diagnostics) = &diagnostics {
+                                        diagnostics
+                                            .activate(&session)
+                                            .map_err(AppError::Diagnostics)?;
+                                    }
+                                    (runtime, app) = open_session(
+                                        &config,
+                                        &cwd,
+                                        session,
+                                        resumed,
+                                        &config_path,
+                                        choices,
+                                        preferences.as_ref(),
+                                    )
+                                    .await?;
                                 }
-                                (runtime, app) = open_session(
-                                    &config,
-                                    &sessions,
-                                    &cwd,
-                                    session,
-                                    resumed,
-                                    &config_path,
-                                )
-                                .await?;
+                                Command::RefreshSessions => {
+                                    match reconcile_session_choices(
+                                        &sessions,
+                                        &cwd,
+                                        &app.sessions,
+                                        None,
+                                    ).await {
+                                        Ok(choices) => app.replace_sessions(choices),
+                                        Err(error) => app.session_change_failed(error.to_string()),
+                                    }
                                 }
                                 command => runtime.execute(command, command_results.clone()),
                             }
@@ -190,16 +226,17 @@ async fn wait_for_interruption_deadline(deadline: Option<std::time::Instant>) {
 
 async fn open_session(
     config: &LoadedConfig,
-    catalog: &SessionCatalog,
     cwd: &Path,
     session: Session,
     resumed: bool,
     config_path: &str,
+    choices: Vec<SessionChoice>,
+    preferences: Option<&RuntimePreferences>,
 ) -> Result<(Runtime, App), AppError> {
-    let choices = session_choices(catalog, cwd).await?;
-    let runtime = Runtime::build(config, cwd.to_path_buf(), &session)
+    let runtime = Runtime::build(config, cwd.to_path_buf(), &session, preferences)
         .await
         .map_err(AppError::Runtime)?;
+    let selected_effort = runtime.selected_effort();
     let app = App::new(
         cwd.display().to_string(),
         config_path.to_owned(),
@@ -212,6 +249,7 @@ async fn open_session(
         },
         runtime.models.clone(),
         runtime.selected_model,
+        &selected_effort,
     );
     Ok((runtime, app))
 }
@@ -220,9 +258,39 @@ async fn session_choices(
     catalog: &SessionCatalog,
     cwd: &Path,
 ) -> Result<Vec<SessionChoice>, AppError> {
+    reconcile_session_choices(catalog, cwd, &[], None).await
+}
+
+async fn reconcile_session_choices(
+    catalog: &SessionCatalog,
+    cwd: &Path,
+    cached: &[SessionChoice],
+    fresh_session: Option<u64>,
+) -> Result<Vec<SessionChoice>, AppError> {
     let sessions = catalog.list(cwd).map_err(AppError::Session)?;
+    let mut cached = cached
+        .iter()
+        .cloned()
+        .map(|choice| (choice.id, choice))
+        .collect::<BTreeMap<_, _>>();
     let mut choices = Vec::with_capacity(sessions.len());
     for session in sessions {
+        if fresh_session == Some(session.id) {
+            choices.push(SessionChoice {
+                id: session.id,
+                preview: None,
+            });
+            continue;
+        }
+        if let Some(choice) = cached.remove(&session.id)
+            && !choice
+                .preview
+                .as_deref()
+                .is_some_and(|preview| preview.starts_with("Preview unavailable:"))
+        {
+            choices.push(choice);
+            continue;
+        }
         let preview = match runtime::first_user_message(&session).await {
             Ok(preview) => preview,
             Err(error) => Some(format!("Preview unavailable: {error}")),

@@ -841,6 +841,7 @@ mod tests {
                 efforts: vec!["low".to_owned(), "high".to_owned()],
             }],
             0,
+            "high",
         )
     }
 

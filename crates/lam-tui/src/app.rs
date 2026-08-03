@@ -10,7 +10,8 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::config::ModelChoice;
 use crate::runtime::{
-    AgentHistory, Command, CommandResult, CompletedCall, HistoryEntry, HistoryKind, InterruptedTree,
+    AgentHistory, Command, CommandResult, CompletedCall, HistoryEntry, HistoryKind,
+    InterruptedTree, RuntimePreferences,
 };
 
 const MOUSE_SCROLL_LINES: usize = 3;
@@ -155,6 +156,7 @@ impl App {
         session: SessionView,
         models: Vec<ModelChoice>,
         selected_model: usize,
+        selected_effort: &str,
     ) -> Self {
         let action = if session.resumed {
             "Resumed"
@@ -193,7 +195,15 @@ impl App {
             tool_name: String::new(),
         });
         let selected_entry = entries.len().checked_sub(1);
-        let selected_efforts = models.iter().map(|model| model.efforts.len() - 1).collect();
+        let mut selected_efforts = models
+            .iter()
+            .map(|model| model.efforts.len() - 1)
+            .collect::<Vec<_>>();
+        selected_efforts[selected_model] = models[selected_model]
+            .efforts
+            .iter()
+            .position(|effort| effort == selected_effort)
+            .unwrap_or(selected_efforts[selected_model]);
         let inactive_agents = agents
             .into_iter()
             .map(|agent| {
@@ -265,6 +275,24 @@ impl App {
             .efforts
             .get(self.selected_efforts[model_index])
             .map(String::as_str)
+    }
+
+    pub(crate) fn runtime_preferences(&self) -> RuntimePreferences {
+        RuntimePreferences {
+            model_id: self.models[self.selected_model].registry_id.clone(),
+            effort: self.models[self.selected_model].efforts
+                [self.selected_efforts[self.selected_model]]
+                .clone(),
+        }
+    }
+
+    pub(crate) fn replace_sessions(&mut self, sessions: Vec<SessionChoice>) {
+        self.sessions = sessions;
+    }
+
+    pub(crate) fn session_change_failed(&mut self, error: impl Into<String>) {
+        self.busy = false;
+        self.push_error("Session change failed", error.into());
     }
 
     pub(crate) fn interruption_warning(&self) -> Option<&'static str> {
@@ -627,7 +655,7 @@ impl App {
             }
             "/session" => {
                 self.input = InputBuffer::at_end("/session ".to_owned());
-                None
+                Some(Command::RefreshSessions)
             }
             _ if input.starts_with("/session ") => {
                 let id = input
@@ -2014,6 +2042,7 @@ mod tests {
                 efforts: vec!["low".to_owned(), "high".to_owned()],
             }],
             0,
+            "high",
         )
     }
 
@@ -2099,6 +2128,24 @@ mod tests {
             result: Ok("Set reasoning effort to low.".to_owned()),
         });
         assert_eq!(app.current_agent_effort(), Some("low"));
+        assert_eq!(
+            app.runtime_preferences(),
+            crate::runtime::RuntimePreferences {
+                model_id: "openai/gpt-5".to_owned(),
+                effort: "low".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn session_picker_requests_an_authoritative_catalog_refresh() {
+        let mut app = app();
+        app.input = InputBuffer::at_end("/session".to_owned());
+
+        let command = app.submit();
+
+        assert!(matches!(command, Some(Command::RefreshSessions)));
+        assert_eq!(app.input.text, "/session ");
     }
 
     #[test]
@@ -2500,6 +2547,7 @@ mod tests {
             },
             app.models,
             0,
+            "high",
         );
 
         assert_eq!(restored.entries.len(), 4);

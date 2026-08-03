@@ -27,7 +27,11 @@ impl RedbStore {
     /// Opens an existing database.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, RedbStoreError> {
         let database = Database::open(path).map_err(database_error)?;
-        Self::initialize(database)
+        let read = database.begin_read().map_err(database_error)?;
+        read.open_table(HEADS).map_err(database_error)?;
+        read.open_table(EVENTS).map_err(database_error)?;
+        drop(read);
+        Ok(Self { database })
     }
 
     fn initialize(database: Database) -> Result<Self, RedbStoreError> {

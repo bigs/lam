@@ -9,6 +9,7 @@ use lam_core::{
     MessageSource, ModelResponseMetadata, Revision, RunId, RunProgress, Timestamp,
 };
 use lam_redb::RedbStore;
+use redb::Database;
 use serde_json::json;
 
 #[tokio::test(flavor = "current_thread")]
@@ -18,6 +19,20 @@ async fn redb_store_obeys_the_journal_contract() {
         .expect("redb store should open");
 
     lam_core::test_support::assert_actor_journal_conformance(&store).await;
+}
+
+#[test]
+fn opening_requires_an_initialized_journal_schema() {
+    let directory = tempfile::tempdir().expect("temporary directory should exist");
+    let path = directory.path().join("uninitialized.redb");
+    drop(Database::create(&path).expect("empty redb database should be created"));
+
+    assert!(
+        RedbStore::open(&path).is_err(),
+        "open must validate rather than silently initialize the journal schema"
+    );
+    RedbStore::create(&path).expect("create should initialize the journal schema");
+    RedbStore::open(&path).expect("initialized journal should open");
 }
 
 #[tokio::test(flavor = "current_thread")]

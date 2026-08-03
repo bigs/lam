@@ -36,6 +36,12 @@ pub(crate) struct Runtime {
     history_models: Arc<[ConfiguredModel]>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimePreferences {
+    pub(crate) model_id: String,
+    pub(crate) effort: String,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct AgentHistory {
     pub(crate) address: String,
@@ -84,6 +90,7 @@ pub(crate) enum Command {
     SetEffort { index: usize, effort: String },
     New,
     LoadSession(u64),
+    RefreshSessions,
 }
 
 #[derive(Debug)]
@@ -126,15 +133,28 @@ impl Runtime {
         config: &LoadedConfig,
         cwd: PathBuf,
         session: &Session,
+        preferences: Option<&RuntimePreferences>,
     ) -> Result<Self, RuntimeError> {
         let models = configured_models(config)?;
         let effort_controls = models
             .iter()
             .map(|configured| configured.effort.clone())
-            .collect();
+            .collect::<Vec<_>>();
+        let initial_index = preferences
+            .and_then(|preferences| {
+                models
+                    .iter()
+                    .position(|model| model.choice.registry_id == preferences.model_id)
+            })
+            .unwrap_or(config.default_index);
+        if let Some(preferences) = preferences {
+            effort_controls[initial_index]
+                .set(&preferences.effort)
+                .map_err(RuntimeError::Preferences)?;
+        }
         let initial = models
-            .get(config.default_index)
-            .expect("validated default model index");
+            .get(initial_index)
+            .expect("the selected model index comes from the validated model list");
         let coding = CodingPack::builder(&cwd)
             .filesystem_access(FilesystemAccess::ReadWrite)
             .shell(LocalCommandRunner::default())
@@ -152,7 +172,7 @@ impl Runtime {
         let events = system
             .take_events()
             .expect("a new agent system owns its event receiver");
-        let instruction = coding_instruction(&cwd, &config.models, config.default_index);
+        let instruction = coding_instruction(&cwd, &config.models, initial_index);
 
         let mut root_builder = initial
             .model
@@ -217,6 +237,10 @@ impl Runtime {
             effort_controls,
             history_models: models.into(),
         })
+    }
+
+    pub(crate) fn selected_effort(&self) -> String {
+        self.effort_controls[self.selected_model].selected()
     }
 
     pub(crate) fn execute(&self, command: Command, output: mpsc::UnboundedSender<CommandResult>) {
@@ -308,7 +332,7 @@ impl Runtime {
                         result,
                     }
                 }
-                Command::New | Command::LoadSession(_) => return,
+                Command::New | Command::LoadSession(_) | Command::RefreshSessions => return,
             };
             let _ = output.send(result);
         });
@@ -873,6 +897,8 @@ pub(crate) enum RuntimeError {
     Model(String),
     #[error("could not configure coding capabilities: {0}")]
     CodingPack(String),
+    #[error("could not restore runtime preferences: {0}")]
+    Preferences(String),
     #[error("could not start the agent runtime: {0}")]
     AgentSystem(String),
 }
