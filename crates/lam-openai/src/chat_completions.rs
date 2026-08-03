@@ -471,11 +471,19 @@ fn emit_chunk_deltas(events: &ModelEventSink, chunk: &Value) {
         .iter()
         .filter_map(|choice| choice.get("delta").and_then(Value::as_object))
     {
-        if let Some(text) = delta.get("content").and_then(Value::as_str) {
+        if let Some(text) = delta
+            .get("content")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+        {
             events.emit(ModelDelta::Text(text.to_owned()));
         }
         for field in ["reasoning_content", "reasoning", "thinking"] {
-            if let Some(text) = delta.get(field).and_then(Value::as_str) {
+            if let Some(text) = delta
+                .get(field)
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+            {
                 events.emit(ModelDelta::Reasoning(text.to_owned()));
             }
         }
@@ -1075,6 +1083,45 @@ fn message_text(message: &Value) -> Result<String, CodecError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_streamed_text_is_a_noop_but_whitespace_is_preserved() {
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let output = std::sync::Arc::clone(&captured);
+        let events = ModelEventSink::new(move |delta| output.lock().unwrap().push(delta));
+
+        emit_chunk_deltas(
+            &events,
+            &json!({
+                "choices": [{
+                    "delta": {
+                        "content": "",
+                        "reasoning_content": "",
+                        "role": "assistant"
+                    }
+                }]
+            }),
+        );
+        emit_chunk_deltas(
+            &events,
+            &json!({
+                "choices": [{
+                    "delta": {
+                        "content": " ",
+                        "reasoning_content": "\n"
+                    }
+                }]
+            }),
+        );
+
+        assert_eq!(
+            *captured.lock().unwrap(),
+            [
+                ModelDelta::Text(" ".to_owned()),
+                ModelDelta::Reasoning("\n".to_owned()),
+            ]
+        );
+    }
 
     #[test]
     fn assembles_reasoning_and_tool_arguments_without_losing_extensions() {

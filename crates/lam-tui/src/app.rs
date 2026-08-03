@@ -927,12 +927,14 @@ impl App {
                 }
             }
             RunEvent::ModelDelta { run_id, delta } => match delta {
+                ModelDelta::Text(text) if text.is_empty() => {}
                 ModelDelta::Text(text) => {
                     if !self.is_completed_run(&run_id) {
                         self.append_delta(EntryKind::Assistant, address, &run_id, text);
                         self.status = format!("{address} is responding…");
                     }
                 }
+                ModelDelta::Reasoning(text) if text.is_empty() => {}
                 ModelDelta::Reasoning(text) => {
                     self.append_delta(EntryKind::Reasoning, address, &run_id, text);
                     if !self.is_completed_run(&run_id) {
@@ -2796,6 +2798,44 @@ mod tests {
         app.selected_entry = app.entries.len().checked_sub(1);
         app.toggle_selected();
         assert!(!app.entries.last().unwrap().expanded);
+    }
+
+    #[test]
+    fn empty_model_deltas_do_not_create_conversation_rows() {
+        let mut app = app();
+        let address = ActorAddress::new("/root").unwrap();
+        let run_id = RunId::new("run-1").unwrap();
+        let initial_entries = app.entries.len();
+
+        for delta in [
+            ModelDelta::Text(String::new()),
+            ModelDelta::Reasoning(String::new()),
+        ] {
+            app.apply_agent_event(AgentSystemEvent::Run {
+                address: address.clone(),
+                event: RunEvent::ModelDelta {
+                    run_id: run_id.clone(),
+                    delta,
+                },
+            });
+        }
+        assert_eq!(app.entries.len(), initial_entries);
+
+        for delta in [
+            ModelDelta::Text(" ".to_owned()),
+            ModelDelta::Reasoning("\n".to_owned()),
+        ] {
+            app.apply_agent_event(AgentSystemEvent::Run {
+                address: address.clone(),
+                event: RunEvent::ModelDelta {
+                    run_id: run_id.clone(),
+                    delta,
+                },
+            });
+        }
+        assert_eq!(app.entries.len(), initial_entries + 2);
+        assert_eq!(app.entries[initial_entries].body, " ");
+        assert_eq!(app.entries[initial_entries + 1].body, "\n");
     }
 
     #[test]

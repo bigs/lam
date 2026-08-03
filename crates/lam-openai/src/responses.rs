@@ -217,7 +217,11 @@ impl ModelProvider for ResponsesProvider {
 }
 
 fn emit_delta(events: &ModelEventSink, value: &Value, reasoning: bool) {
-    if let Some(delta) = value.get("delta").and_then(Value::as_str) {
+    if let Some(delta) = value
+        .get("delta")
+        .and_then(Value::as_str)
+        .filter(|delta| !delta.is_empty())
+    {
         let delta = if reasoning {
             ModelDelta::Reasoning(delta.to_owned())
         } else {
@@ -721,6 +725,26 @@ fn response_text(response: &Value) -> Result<String, CodecError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_streamed_text_is_a_noop_but_whitespace_is_preserved() {
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let output = std::sync::Arc::clone(&captured);
+        let events = ModelEventSink::new(move |delta| output.lock().unwrap().push(delta));
+
+        emit_delta(&events, &json!({ "delta": "" }), false);
+        emit_delta(&events, &json!({ "delta": "" }), true);
+        emit_delta(&events, &json!({ "delta": " " }), false);
+        emit_delta(&events, &json!({ "delta": "\n" }), true);
+
+        assert_eq!(
+            *captured.lock().unwrap(),
+            [
+                ModelDelta::Text(" ".to_owned()),
+                ModelDelta::Reasoning("\n".to_owned()),
+            ]
+        );
+    }
 
     #[test]
     fn public_codec_constants_are_stable() {
