@@ -1410,6 +1410,32 @@ after process death, so autonomously recovered work uses the ordinary text
 output contract. Durable attachable jobs with persisted output contracts remain
 a possible future API.
 
+#### Slice 4C: recoverable single-actor interruption
+
+**Implemented.**
+
+`ActorHandle::interrupt` is out-of-band control over the process-local active
+run. It is distinct from shutdown and abort: provider and compactor futures are
+dropped, active JavaScript is terminated, and the actor remains available for
+later calls. V8 interruption covers the race where an immediately completed
+Rust builtin hands control back to synchronous JavaScript; an interrupted
+isolate generation is discarded and replaced before the operation returns.
+
+The durable boundary is one compare-and-append batch. It admits a structured
+`runInterrupted` notice from `lam/runtime`, records an explicit failed
+`lam/eval` result when a native eval request was durable but unfinished, and
+appends `ContextTransition::Interrupted` to consume pending steering plus the
+notice and permanently close the run. Partial provider text, reasoning, and
+tool-call JSON remain ephemeral and are discarded. If a terminal model output
+was already committed, ordinary completion wins and no interruption boundary
+is appended.
+
+The same actor can begin a new run after interruption. Both OpenAI Responses
+and Chat Completions replay the explicit eval failure and runtime notice using
+their native tool-result and system/developer message forms. Tree-wide fan-out,
+descendant retirement, and the embedding's double-Escape interaction are
+separate higher-level slices.
+
 ### Slice 5: real provider codec
 
 **Implemented and live-validated for both protocols.**

@@ -716,6 +716,108 @@ fn resumption_notice_closes_pending_eval_in_both_native_protocols() {
     );
 }
 
+#[test]
+fn durable_interruption_replays_eval_failure_and_notice_in_both_protocols() {
+    let failure = payload(
+        "lam/eval",
+        json!({
+            "status": "failure",
+            "error": {
+                "kind": "interrupted",
+                "effects_may_have_completed": true,
+                "previous_generation": 1,
+                "new_generation": 2
+            }
+        }),
+    );
+    let notice = interruption_notice_message();
+
+    let (_, responses) = Responses::builder("gpt-test")
+        .api_key("test-key")
+        .build_parts()
+        .expect("valid adapter");
+    let responses_call = response_payload(
+        RESPONSES_RESPONSE_CODEC_ID,
+        "text",
+        "response",
+        json!({
+            "status": "completed",
+            "output": [{
+                "type": "function_call",
+                "call_id": "call_responses",
+                "name": "eval",
+                "arguments": "{\"source\":\"sideEffect()\"}"
+            }]
+        }),
+    );
+    let request = responses
+        .encode_request(
+            &[
+                projected(1, model_transition(), responses_call),
+                projected(2, eval_transition(), failure.clone()),
+                projected(3, interruption_transition(), notice.clone()),
+            ],
+            &ModelRequestConfig::agent(&OutputContract::Text, ""),
+        )
+        .expect("durable interruption should replay through Responses");
+    let input = request.value["body"]["input"].as_array().unwrap();
+    assert_eq!(input[1]["type"], "function_call_output");
+    assert_eq!(input[1]["call_id"], "call_responses");
+    assert!(input[1]["output"].as_str().unwrap().contains("interrupted"));
+    assert_eq!(input[2]["role"], "developer");
+    assert!(input[2].to_string().contains("runInterrupted"));
+
+    let (_, chat) = ChatCompletions::builder("test-model")
+        .build_parts()
+        .expect("valid adapter");
+    let chat_call = response_payload(
+        CHAT_RESPONSE_CODEC_ID,
+        "text",
+        "response",
+        json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call_chat",
+                        "type": "function",
+                        "function": {
+                            "name": "eval",
+                            "arguments": "{\"source\":\"sideEffect()\"}"
+                        }
+                    }]
+                }
+            }]
+        }),
+    );
+    let request = chat
+        .encode_request(
+            &[
+                projected(1, model_transition(), chat_call),
+                projected(2, eval_transition(), failure),
+                projected(3, interruption_transition(), notice),
+            ],
+            &ModelRequestConfig::agent(&OutputContract::Text, ""),
+        )
+        .expect("durable interruption should replay through Chat Completions");
+    let messages = request.value["body"]["messages"].as_array().unwrap();
+    assert_eq!(messages[1]["role"], "tool");
+    assert_eq!(messages[1]["tool_call_id"], "call_chat");
+    assert!(
+        messages[1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("interrupted")
+    );
+    assert_eq!(messages[2]["role"], "system");
+    assert!(
+        messages[2]["content"]
+            .as_str()
+            .unwrap()
+            .contains("runInterrupted")
+    );
+}
+
 #[tokio::test]
 async fn responses_provider_sends_store_false_and_returns_completed_native_response() {
     let completed = json!({
@@ -1265,6 +1367,13 @@ fn recovery_transition() -> ContextTransition {
     }
 }
 
+fn interruption_transition() -> ContextTransition {
+    ContextTransition::Interrupted {
+        run_id: run_id(),
+        consumed_message_ids: vec![lam::MessageId::new("interruption-message").unwrap()],
+    }
+}
+
 fn recovery_notice_message() -> EncodedPayload {
     payload(
         "lam/messages",
@@ -1278,6 +1387,26 @@ fn recovery_notice_message() -> EncodedPayload {
                     "isolateState": "reset",
                     "resumedRunId": "run-1",
                     "interruptedEvalOutcome": "unknown"
+                }
+            }
+        }]),
+    )
+}
+
+fn interruption_notice_message() -> EncodedPayload {
+    payload(
+        "lam/messages",
+        json!([{
+            "messageId": "interruption-message",
+            "source": { "kind": "host", "component": "lam/runtime" },
+            "payload": {
+                "codec": { "id": "lam/system-notice", "version": 1 },
+                "value": {
+                    "type": "runInterrupted",
+                    "runId": "run-1",
+                    "reason": "user",
+                    "isolateState": "reset",
+                    "interruptedEvalOutcome": "failureRecorded"
                 }
             }
         }]),

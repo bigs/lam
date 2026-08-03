@@ -57,6 +57,20 @@ pub enum EvalError {
         new_generation: u64,
     },
 
+    /// The host deliberately stopped a cell and replaced its isolate.
+    ///
+    /// Host side effects may have completed before interruption and are not
+    /// rolled back.
+    #[error("evaluation was interrupted by the host; isolate restarted")]
+    Interrupted {
+        /// Whether execution began far enough for host effects to be possible.
+        effects_may_have_completed: bool,
+        /// Generation which contained the requested evaluation.
+        previous_generation: u64,
+        /// Generation available after interruption handling.
+        new_generation: u64,
+    },
+
     /// The poisoned isolate was dropped, but its replacement could not start.
     ///
     /// The previous heap is lost. Host side effects completed before the
@@ -70,6 +84,17 @@ pub enum EvalError {
         /// Generation which failed to initialize.
         attempted_generation: u64,
         /// Startup failure.
+        message: String,
+    },
+
+    /// A host-interrupted isolate was dropped, but its replacement failed.
+    #[error("evaluation was interrupted and isolate restart failed: {message}")]
+    InterruptionRestartFailed {
+        /// Generation which was interrupted.
+        previous_generation: u64,
+        /// Generation which failed to initialize.
+        attempted_generation: u64,
+        /// Isolate initialization failure.
         message: String,
     },
 

@@ -16,13 +16,17 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::command::{OperationLease, RunnerCommand};
 use crate::compaction::{CompactionReceipt, SummaryTailCompactor};
+use crate::control::RunControl;
 use crate::model::RegisteredModel;
 use crate::prompt::SystemPrompt;
 use crate::recovery::recover_actor;
 use crate::run::RUN_EVENT_BUFFER;
 use crate::runner::ActorRunner;
 use crate::runtime_journal::{admit_message, ensure_model_selection, load_state};
-use crate::{ActorBuildError, ActorError, ActorTask, Model, Run, RunEvents, RuntimeEvents};
+use crate::{
+    ActorBuildError, ActorError, ActorTask, InterruptedEvalOutcome, IsolateState, Model, Run,
+    RunEvents, RuntimeEvents,
+};
 
 const RUNTIME_EVENT_BUFFER: usize = 256;
 const ACTOR_EXISTENCE_PROBE: NonZeroUsize = NonZeroUsize::new(1).expect("one is nonzero");
@@ -51,6 +55,25 @@ pub struct ModelSwitchReceipt {
     /// Compaction installed atomically with the selection, when required.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compaction: Option<CompactionReceipt>,
+}
+
+/// Durable result of recoverably closing one active run.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InterruptionReceipt {
+    /// Actor whose run was interrupted.
+    pub actor_id: ActorId,
+    /// Run closed by the interruption boundary.
+    pub run_id: RunId,
+    /// Durable identity of the model-visible interruption notice.
+    pub notice_message_id: MessageId,
+    /// Journal revision containing the terminal interruption entry.
+    pub revision: Revision,
+    /// Whether the persistent TypeScript heap was retained or reset.
+    pub isolate_state: IsolateState,
+    /// Status of a durable eval request lacking its ordinary result.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interrupted_eval_outcome: Option<InterruptedEvalOutcome>,
 }
 
 /// Supplies informational host timestamps for durable actor entries.
@@ -584,6 +607,7 @@ where
             .map_err(initialization_error)?;
         let system_prompt = self.system_prompt.render(&isolate.api_inventory());
         let interrupt = isolate.interrupt_handle();
+        let control = Arc::new(RunControl::new(interrupt.clone()));
         let initial_descriptor = self
             .models
             .get(&self.initial_model_id)
@@ -647,6 +671,7 @@ where
             shutdown: Arc::clone(&shutdown),
             run_events: run_event_sender,
             runtime_events: runtime_event_sender,
+            control: Arc::clone(&control),
         };
         let actor_ref = ActorRef {
             actor_id: self.actor_id,
@@ -658,6 +683,7 @@ where
         let handle = ActorHandle {
             actor_ref,
             operation_active,
+            control,
         };
         let actor = Actor {
             handle,
@@ -694,6 +720,7 @@ where
 {
     actor_ref: ActorRef<S>,
     operation_active: Arc<AtomicBool>,
+    control: Arc<RunControl>,
 }
 
 impl<S> Clone for ActorHandle<S>
@@ -704,6 +731,7 @@ where
         Self {
             actor_ref: self.actor_ref.clone(),
             operation_active: Arc::clone(&self.operation_active),
+            control: Arc::clone(&self.control),
         }
     }
 }
@@ -727,6 +755,15 @@ where
     /// Rebuilds the current actor projection from its authoritative journal.
     pub async fn state(&self) -> Result<ActorState, ActorError> {
         self.actor_ref.state().await
+    }
+
+    /// Recoverably closes the active run without retiring the actor.
+    ///
+    /// Returns `None` when no process-local run is executing. A successful
+    /// interruption becomes a durable, model-visible terminal boundary before
+    /// this method returns.
+    pub async fn interrupt(&self) -> Result<Option<InterruptionReceipt>, ActorError> {
+        self.control.interrupt().await
     }
 
     /// Durably admits a value to this actor's mailbox.
@@ -865,6 +902,11 @@ where
     #[must_use]
     pub fn abort_handle(&self) -> AbortHandle {
         self.abort_handle.clone()
+    }
+
+    /// Recoverably closes the active run without retiring this actor.
+    pub async fn interrupt(&self) -> Result<Option<InterruptionReceipt>, ActorError> {
+        self.handle.interrupt().await
     }
 
     /// Takes the single-consumer stream covering every run on this actor.

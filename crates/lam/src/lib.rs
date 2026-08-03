@@ -8,6 +8,7 @@ mod actor_task;
 mod command;
 mod compaction;
 mod compaction_engine;
+mod control;
 mod error;
 mod eval;
 mod model;
@@ -20,8 +21,8 @@ mod runtime_event;
 mod runtime_journal;
 
 pub use actor::{
-    AbortHandle, Actor, ActorBuilder, ActorHandle, ActorRef, Clock, Lam, LamBuilder, LamRuntime,
-    MessageReceipt, ModelSwitchPolicy, ModelSwitchReceipt, SystemClock,
+    AbortHandle, Actor, ActorBuilder, ActorHandle, ActorRef, Clock, InterruptionReceipt, Lam,
+    LamBuilder, LamRuntime, MessageReceipt, ModelSwitchPolicy, ModelSwitchReceipt, SystemClock,
 };
 pub use actor_task::ActorTask;
 pub use compaction::{
@@ -31,8 +32,8 @@ pub use error::{ActorBuildError, ActorError};
 pub use eval::EvalOutcome;
 pub use model::Model;
 pub use notice::{
-    InterruptedEvalOutcome, IsolateState, RUNTIME_COMPONENT_ID, SYSTEM_NOTICE_CODEC_ID,
-    SYSTEM_NOTICE_CODEC_VERSION, SystemNotice,
+    InterruptedEvalOutcome, InterruptionReason, IsolateState, RUNTIME_COMPONENT_ID,
+    SYSTEM_NOTICE_CODEC_ID, SYSTEM_NOTICE_CODEC_VERSION, SystemNotice,
 };
 pub use run::{Run, RunEvent, RunEvents};
 pub use runtime_event::{RuntimeEvent, RuntimeEvents};

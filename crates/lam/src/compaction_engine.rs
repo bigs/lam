@@ -11,6 +11,7 @@ use tokio::sync::mpsc;
 use crate::compaction::{
     CompactionReceipt, compaction_request, estimated_context_tokens, model_context,
 };
+use crate::control::RunPhase;
 use crate::model::RegisteredModel;
 use crate::runner::{ActorRunner, emit, wait_for_abort};
 use crate::runtime_journal::{
@@ -290,10 +291,28 @@ where
     ) -> Result<CompactionPlan, ActorError> {
         self.emit_compaction_started(events, run_id, reason);
         let mut abort = self.abort.clone();
-        let result = tokio::select! {
-            biased;
-            _ = wait_for_abort(&mut abort) => return Err(ActorError::Aborted),
-            result = compactor.compact(request) => result,
+        let result = if let Some(run_id) = run_id {
+            if self.control.set_phase(run_id, RunPhase::Inference)? {
+                return Err(ActorError::Interrupted);
+            }
+            let result = tokio::select! {
+                biased;
+                _ = wait_for_abort(&mut abort) => return Err(ActorError::Aborted),
+                _ = self.control.wait_for_request(run_id) => {
+                    return Err(ActorError::Interrupted)
+                }
+                result = compactor.compact(request) => result,
+            };
+            if self.control.set_phase(run_id, RunPhase::Boundary)? {
+                return Err(ActorError::Interrupted);
+            }
+            result
+        } else {
+            tokio::select! {
+                biased;
+                _ = wait_for_abort(&mut abort) => return Err(ActorError::Aborted),
+                result = compactor.compact(request) => result,
+            }
         };
         result.map_err(|error| {
             let message = error.to_string();

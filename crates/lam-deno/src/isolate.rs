@@ -147,9 +147,9 @@ impl IsolateBuilder {
 
 /// Thread-safe control which interrupts the currently installed V8 isolate.
 ///
-/// Interrupting execution poisons that isolate generation. Callers must stop
-/// using and drop the associated [`Isolate`]; Lam's actor runtime does this as
-/// part of its forceful abort path.
+/// Interrupting execution poisons that isolate generation. Callers must either
+/// drop the associated [`Isolate`] or replace the generation through
+/// [`Isolate::restart_after_interruption`] before evaluating more code.
 #[derive(Clone)]
 pub struct IsolateInterrupt {
     current: Arc<Mutex<Option<deno_core::v8::IsolateHandle>>>,
@@ -170,6 +170,11 @@ impl IsolateInterrupt {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(handle) = current.as_ref() {
             handle.terminate_execution();
+            // Termination can race with an async host operation completing:
+            // V8 may consume the first request before JavaScript resumes. The
+            // queued interrupt closes that handoff without targeting a later
+            // isolate generation.
+            handle.request_interrupt(terminate_on_interrupt, std::ptr::null_mut());
         }
     }
 
@@ -186,6 +191,17 @@ impl IsolateInterrupt {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
     }
+}
+
+#[allow(unsafe_code)]
+unsafe extern "C" fn terminate_on_interrupt(
+    isolate: deno_core::v8::UnsafeRawIsolatePtr,
+    _data: *mut std::ffi::c_void,
+) {
+    // SAFETY: V8 invokes interrupt callbacks on the owning isolate thread and
+    // supplies the live isolate pointer for the duration of this callback.
+    let isolate = unsafe { deno_core::v8::Isolate::ref_from_raw_isolate_ptr(&isolate) };
+    isolate.terminate_execution();
 }
 
 /// A persistent, serially evaluated TypeScript isolate.
@@ -293,27 +309,12 @@ impl Isolate {
         let previous_generation = self.generation;
         let new_generation = previous_generation.saturating_add(1);
 
-        // A terminated V8 isolate is never made reusable. Drop it before starting
-        // the replacement so no stale async ops or heap state survive.
-        self.interrupt.clear();
-        drop(self.kernel.take());
-        self.console.clear();
-
-        match Kernel::new(
-            Arc::clone(&self.registry),
-            self.console.clone(),
-            new_generation,
-        ) {
-            Ok(mut kernel) => {
-                self.interrupt.replace(kernel.isolate_handle());
-                self.kernel = Some(kernel);
-                self.generation = new_generation;
-                Err(EvalError::TimedOut {
-                    timeout_ms,
-                    previous_generation,
-                    new_generation,
-                })
-            }
+        match self.replace_generation(new_generation) {
+            Ok(()) => Err(EvalError::TimedOut {
+                timeout_ms,
+                previous_generation,
+                new_generation,
+            }),
             Err(error) => Err(EvalError::RestartFailed {
                 timeout_ms,
                 previous_generation,
@@ -321,6 +322,41 @@ impl Isolate {
                 message: error.to_string(),
             }),
         }
+    }
+
+    /// Replaces a generation terminated by an out-of-band host interruption.
+    ///
+    /// The evaluation future using the old generation must already have been
+    /// dropped. On success, returns the fresh usable isolate generation.
+    pub fn restart_after_interruption(&mut self) -> Result<u64, EvalError> {
+        let previous_generation = self.generation;
+        let new_generation = previous_generation.saturating_add(1);
+        match self.replace_generation(new_generation) {
+            Ok(()) => Ok(new_generation),
+            Err(error) => Err(EvalError::InterruptionRestartFailed {
+                previous_generation,
+                attempted_generation: new_generation,
+                message: error.to_string(),
+            }),
+        }
+    }
+
+    fn replace_generation(&mut self, new_generation: u64) -> Result<(), IsolateBuildError> {
+        // A terminated V8 isolate is never made reusable. Drop it before starting
+        // the replacement so no stale async ops or heap state survive.
+        self.interrupt.clear();
+        drop(self.kernel.take());
+        self.console.clear();
+
+        let mut kernel = Kernel::new(
+            Arc::clone(&self.registry),
+            self.console.clone(),
+            new_generation,
+        )?;
+        self.interrupt.replace(kernel.isolate_handle());
+        self.kernel = Some(kernel);
+        self.generation = new_generation;
+        Ok(())
     }
 }
 

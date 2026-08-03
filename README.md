@@ -154,8 +154,15 @@ projections derive pending work and the effective context.
 linear `Actor` retains runtime lifecycle and event-stream ownership.
 `ActorRef::send` returns after durable admission. Steering messages join the
 active run at its next boundary; queued messages wait for that run to finish.
+`ActorHandle::interrupt` recoverably closes live work with an atomic,
+model-visible terminal boundary while leaving the actor usable for a new run.
 Recovery creates a fresh isolate, preserves the complete journal, and inserts
 a model-visible notice when an interrupted eval may have had partial effects.
+
+A recoverable interruption drops incomplete provider or compactor output,
+replaces an isolate interrupted during eval, and records an explicit failed
+eval result when needed. A completion already committed at the journal
+boundary wins the race.
 
 ### Provider-native history
 

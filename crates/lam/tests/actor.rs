@@ -2,10 +2,10 @@
 
 mod support;
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier, mpsc};
 use std::task::Poll;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use lam::{
     Actor, ActorError, CompactionArtifact, CompactionConfig, CompactionOutput, CompactionPlan,
@@ -38,6 +38,41 @@ impl Compactor for InvalidCutCompactor {
                 strategy: "invalid-cut".to_owned(),
                 covers_through: ContextSequence::new(2),
                 output: CompactionOutput::Artifact(CompactionArtifact::summary("invalid")),
+                source: None,
+                metadata: ModelResponseMetadata::default(),
+            })
+        })
+    }
+}
+
+struct InterruptibleCompactor {
+    started: mpsc::Sender<()>,
+    dropped: Arc<AtomicBool>,
+    calls: AtomicUsize,
+}
+
+struct DropFlag(Arc<AtomicBool>);
+
+impl Drop for DropFlag {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+impl Compactor for InterruptibleCompactor {
+    fn compact<'a>(&'a self, request: &'a CompactionRequest) -> lam::CompactionFuture<'a> {
+        let first = self.calls.fetch_add(1, Ordering::AcqRel) == 0;
+        let covers_through = request.units.last().unwrap().covers_through();
+        Box::pin(async move {
+            if first {
+                let _drop_flag = DropFlag(Arc::clone(&self.dropped));
+                let _ = self.started.send(());
+                return std::future::pending().await;
+            }
+            Ok(CompactionPlan {
+                strategy: "interruption-retry".to_owned(),
+                covers_through,
+                output: CompactionOutput::Artifact(CompactionArtifact::summary("resumed")),
                 source: None,
                 metadata: ModelResponseMetadata::default(),
             })
@@ -792,6 +827,57 @@ async fn threshold_compaction_is_transparent_and_emits_run_events() {
         state.context()[1].entry.transition,
         ContextTransition::Compaction { .. }
     ));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn interruption_drops_automatic_compaction_and_keeps_the_actor_resumable() {
+    let (started_sender, started_receiver) = mpsc::channel();
+    let dropped = Arc::new(AtomicBool::new(false));
+    let provider = ScriptedProvider::new([output("resumed")]);
+    let config = CompactionConfig::default()
+        .context_window_tokens(400)
+        .trigger_at(ContextAmount::Tokens(100))
+        .retain(ContextAmount::Tokens(0))
+        .summary_reserve_tokens(50);
+    let mut actor = Lam::builder(Model::new(provider, ScriptedCodec))
+        .compactor(InterruptibleCompactor {
+            started: started_sender,
+            dropped: Arc::clone(&dropped),
+            calls: AtomicUsize::new(0),
+        })
+        .compaction_config(config)
+        .build()
+        .actor("compaction-interruption")
+        .build()
+        .await
+        .expect("fixture actor should build");
+    let handle = actor.handle();
+    let interrupt_thread = std::thread::spawn(move || {
+        started_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("automatic compaction should start");
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(handle.interrupt())
+            .expect("interruption should become durable")
+            .expect("one run should be active")
+    });
+
+    let started_at = Instant::now();
+    assert_eq!(
+        actor.call("x".repeat(600)).await.unwrap_err(),
+        ActorError::Interrupted
+    );
+    let receipt = interrupt_thread
+        .join()
+        .expect("interrupt thread should finish");
+    assert!(started_at.elapsed() < Duration::from_secs(3));
+    assert_eq!(receipt.isolate_state, lam::IsolateState::Retained);
+    assert!(dropped.load(Ordering::Acquire));
+
+    assert_eq!(actor.call("continue").await.unwrap(), "resumed");
+    actor.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "current_thread")]

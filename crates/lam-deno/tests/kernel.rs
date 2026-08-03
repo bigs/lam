@@ -4,9 +4,10 @@ use std::future::poll_fn;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
+    mpsc,
 };
 use std::task::Poll;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use lam_deno::{
     ConsoleEntry, ConsoleLevel, EvalError, EvalOptions, EvalValue, Isolate, IsolateBuildError,
@@ -461,6 +462,65 @@ async fn timeout_discards_and_replaces_the_isolate() {
         .await
         .expect("replacing one isolate must not disturb its sibling");
     assert_eq!(json_result(sibling_state.result), json!(42));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn host_interruption_crosses_an_async_builtin_handoff() {
+    let (started_sender, started_receiver) = mpsc::channel();
+    let started = Namespace::new("test.control", "Interruption synchronization.").function(
+        "started",
+        "Signals that JavaScript is about to resume.",
+        move |_context, (): ()| {
+            let started_sender = started_sender.clone();
+            async move {
+                let _ = started_sender.send(());
+                Ok::<(), Never>(())
+            }
+        },
+    );
+    let mut isolate = Isolate::builder()
+        .namespace(started)
+        .default_timeout(Duration::from_secs(5))
+        .max_timeout(Duration::from_secs(5))
+        .build()
+        .await
+        .expect("test isolate should initialize");
+    let interrupt = isolate.interrupt_handle();
+    let stopper = std::thread::spawn(move || {
+        started_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("builtin should signal before JavaScript resumes");
+        interrupt.terminate();
+    });
+
+    let started_at = Instant::now();
+    isolate
+        .eval("await test.control.started(); while (true) {}")
+        .await
+        .expect_err("the host interruption should stop resumed JavaScript");
+    stopper.join().expect("interrupt thread should finish");
+    assert!(
+        started_at.elapsed() < Duration::from_secs(2),
+        "host interruption should not wait for the eval timeout"
+    );
+
+    let previous_generation = isolate.generation();
+    assert_eq!(
+        isolate
+            .restart_after_interruption()
+            .expect("a fresh isolate should start"),
+        previous_generation + 1
+    );
+    assert_eq!(
+        json_result(
+            isolate
+                .eval("lam.result(42)")
+                .await
+                .expect("the replacement isolate should be usable")
+                .result
+        ),
+        json!(42)
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]

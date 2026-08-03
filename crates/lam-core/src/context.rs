@@ -35,6 +35,13 @@ pub enum ContextTransition {
         /// Run which requested the evaluation.
         run_id: RunId,
     },
+    /// A host-requested terminal boundary which abandons the active run.
+    Interrupted {
+        /// Run closed by the interruption.
+        run_id: RunId,
+        /// Pending messages incorporated before the run was closed.
+        consumed_message_ids: Vec<MessageId>,
+    },
     /// A logical replacement view over an earlier context prefix.
     Compaction {
         /// Latest context entry replaced by this view.
@@ -49,9 +56,10 @@ impl ContextTransition {
     #[must_use]
     pub const fn run_id(&self) -> Option<&RunId> {
         match self {
-            Self::Messages { run_id, .. } | Self::Model { run_id, .. } | Self::Eval { run_id } => {
-                Some(run_id)
-            }
+            Self::Messages { run_id, .. }
+            | Self::Model { run_id, .. }
+            | Self::Eval { run_id }
+            | Self::Interrupted { run_id, .. } => Some(run_id),
             Self::Compaction { run_id, .. } => run_id.as_ref(),
         }
     }
@@ -61,6 +69,10 @@ impl ContextTransition {
     pub fn consumed_message_ids(&self) -> &[MessageId] {
         match self {
             Self::Messages {
+                consumed_message_ids,
+                ..
+            }
+            | Self::Interrupted {
                 consumed_message_ids,
                 ..
             } => consumed_message_ids,

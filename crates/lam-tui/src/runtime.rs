@@ -466,6 +466,10 @@ fn session_history(
             ContextTransition::Messages {
                 consumed_message_ids,
                 ..
+            }
+            | ContextTransition::Interrupted {
+                consumed_message_ids,
+                ..
             } => {
                 for message_id in consumed_message_ids {
                     let Some(message) = state.message(message_id) else {

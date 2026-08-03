@@ -19,11 +19,16 @@ into derived views such as:
 
 - admission-ordered pending and eligible messages;
 - the complete raw context history;
-- active/completed run progress;
+- active/completed/interrupted run progress;
 - the selected model and latest compatible compaction boundary.
 
 Context transitions consume their source messages atomically. There is no
 second mutable inbox table or delivery record to reconcile.
+
+`ContextTransition::Interrupted` is a terminal run boundary distinct from
+ordinary completion. `ActorState::validate_batch` previews every event in an
+atomic batch in order, allowing a runtime to admit a host notice, record an
+interrupted eval result, and close the run in one compare-and-append operation.
 
 ## `JournalStore`
 

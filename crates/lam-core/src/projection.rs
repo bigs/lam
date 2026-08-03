@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
     ACTOR_EVENT_SCHEMA_VERSION, ActorEvent, ActorEventData, ContextEntry, ContextSequence,
-    ContextTransition, DeliveryMode, JournalPage, MessageEnvelope, MessageError, MessageId,
-    ModelDescriptor, ModelId, ModelSelection, Revision, RunId, RunProgress, StoredEvent,
+    ContextTransition, DeliveryMode, EventBatch, JournalPage, MessageEnvelope, MessageError,
+    MessageId, ModelDescriptor, ModelId, ModelSelection, Revision, RunId, RunProgress, StoredEvent,
 };
 
 /// One admitted message as viewed through the actor projection.
@@ -29,7 +29,7 @@ pub struct ProjectedContextEntry {
 }
 
 /// Pure current-state projection of one actor journal.
-#[derive(Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ActorState {
     revision: Revision,
     messages: Vec<AdmittedMessage>,
@@ -38,6 +38,7 @@ pub struct ActorState {
     model_descriptors: BTreeMap<ModelId, ModelDescriptor>,
     active_run: Option<RunId>,
     completed_runs: BTreeSet<RunId>,
+    interrupted_runs: BTreeSet<RunId>,
 }
 
 impl ActorState {
@@ -105,6 +106,12 @@ impl ActorState {
     #[must_use]
     pub fn is_run_completed(&self, run_id: &RunId) -> bool {
         self.completed_runs.contains(run_id)
+    }
+
+    /// Reports whether a durable interruption closed `run_id`.
+    #[must_use]
+    pub fn is_run_interrupted(&self, run_id: &RunId) -> bool {
+        self.interrupted_runs.contains(run_id)
     }
 
     /// Finds the newest compaction marker accepted by `compatible`.
@@ -213,6 +220,25 @@ impl ActorState {
         Ok(ActorEvent::model_selected(selection))
     }
 
+    /// Validates an atomic event batch against each preceding event in order.
+    ///
+    /// This is required when later events depend on state established earlier
+    /// in the same compare-and-append operation.
+    pub fn validate_batch(&self, batch: &EventBatch) -> Result<(), StateError> {
+        let mut preview = self.clone();
+        let mut revision = self.revision;
+        for event in batch.iter() {
+            revision = revision
+                .checked_advance(1)
+                .ok_or(StateError::RevisionExhausted)?;
+            preview.apply_stored_event(StoredEvent {
+                revision,
+                event: event.clone(),
+            })?;
+        }
+        Ok(())
+    }
+
     fn apply_stored_event(&mut self, stored: StoredEvent) -> Result<(), StateError> {
         let schema_version = stored.event.schema_version();
         if schema_version == 0 || schema_version > ACTOR_EVENT_SCHEMA_VERSION {
@@ -306,14 +332,7 @@ impl ActorState {
 
         match &entry.transition {
             ContextTransition::Messages { run_id, .. } => {
-                let active = self.active_run.is_some();
-                for message in &mut self.messages {
-                    if message.consumed_at.is_none()
-                        && (!active || message.envelope.delivery() == DeliveryMode::Steer)
-                    {
-                        message.consumed_at = Some(sequence);
-                    }
-                }
+                self.consume_eligible_messages(sequence);
                 if self.active_run.is_none() {
                     self.active_run = Some(run_id.clone());
                 }
@@ -324,6 +343,11 @@ impl ActorState {
             } => {
                 self.active_run = None;
                 self.completed_runs.insert(run_id.clone());
+            }
+            ContextTransition::Interrupted { run_id, .. } => {
+                self.consume_eligible_messages(sequence);
+                self.active_run = None;
+                self.interrupted_runs.insert(run_id.clone());
             }
             ContextTransition::Model {
                 progress: RunProgress::Continue,
@@ -339,6 +363,17 @@ impl ActorState {
             entry,
         });
         Ok(())
+    }
+
+    fn consume_eligible_messages(&mut self, sequence: ContextSequence) {
+        let active = self.active_run.is_some();
+        for message in &mut self.messages {
+            if message.consumed_at.is_none()
+                && (!active || message.envelope.delivery() == DeliveryMode::Steer)
+            {
+                message.consumed_at = Some(sequence);
+            }
+        }
     }
 
     fn validate_context_entry(&self, entry: &ContextEntry) -> Result<ContextSequence, StateError> {
@@ -366,6 +401,13 @@ impl ActorState {
                 run_id,
                 progress: RunProgress::Complete,
             } => self.validate_terminal_run(run_id)?,
+            ContextTransition::Interrupted {
+                run_id,
+                consumed_message_ids,
+            } => {
+                self.validate_message_batch(consumed_message_ids)?;
+                self.validate_active_run(run_id)?;
+            }
             ContextTransition::Compaction {
                 covers_through,
                 run_id,
@@ -408,6 +450,11 @@ impl ActorState {
                 run_id: run_id.clone(),
             });
         }
+        if self.interrupted_runs.contains(run_id) {
+            return Err(StateError::RunAlreadyInterrupted {
+                run_id: run_id.clone(),
+            });
+        }
         match &self.active_run {
             Some(active) if active != run_id => Err(StateError::RunMismatch {
                 expected: active.clone(),
@@ -421,17 +468,7 @@ impl ActorState {
     }
 
     fn validate_terminal_run(&self, run_id: &RunId) -> Result<(), StateError> {
-        let Some(active) = &self.active_run else {
-            return Err(StateError::TerminalWithoutActiveRun {
-                run_id: run_id.clone(),
-            });
-        };
-        if active != run_id {
-            return Err(StateError::RunMismatch {
-                expected: active.clone(),
-                actual: run_id.clone(),
-            });
-        }
+        self.validate_active_run(run_id)?;
         let pending_steers = self
             .pending_messages()
             .filter(|message| message.envelope.delivery() == DeliveryMode::Steer)
@@ -444,6 +481,21 @@ impl ActorState {
                 message_ids: pending_steers,
             })
         }
+    }
+
+    fn validate_active_run(&self, run_id: &RunId) -> Result<(), StateError> {
+        let Some(active) = &self.active_run else {
+            return Err(StateError::TerminalWithoutActiveRun {
+                run_id: run_id.clone(),
+            });
+        };
+        if active != run_id {
+            return Err(StateError::RunMismatch {
+                expected: active.clone(),
+                actual: run_id.clone(),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -526,6 +578,12 @@ pub enum StateError {
     #[error("run `{run_id}` is already complete")]
     RunAlreadyCompleted {
         /// Completed run.
+        run_id: RunId,
+    },
+    /// An intermediate entry attempted to resume an interrupted run.
+    #[error("run `{run_id}` was interrupted")]
+    RunAlreadyInterrupted {
+        /// Interrupted run.
         run_id: RunId,
     },
     /// A non-message entry attempted to begin a run.

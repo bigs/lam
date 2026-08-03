@@ -155,6 +155,7 @@ pub(crate) async fn append_batch<S>(
 where
     S: JournalStore,
 {
+    state.validate_batch(&batch).map_err(state_error)?;
     let expected = state.revision();
     let mut revision = expected;
     let events = batch

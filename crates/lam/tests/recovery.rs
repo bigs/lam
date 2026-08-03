@@ -2,16 +2,17 @@
 
 mod support;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use lam::{
-    Actor, ActorError, ActorEvent, ActorId, ActorRef, AppendOutcome, ContextEntry,
-    ContextTransition, DeliveryMode, EncodedPayload, EventBatch, InterruptedEvalOutcome,
-    IsolateState, JournalStore, Lam, MessageEnvelope, MessageId, MessageSource, Model,
-    ModelDescriptor, ModelEventSink, ModelProvider, Namespace, Never, Revision, RunId, RunProgress,
-    RuntimeEvent, SYSTEM_NOTICE_CODEC_ID, SYSTEM_NOTICE_CODEC_VERSION, SystemNotice, Timestamp,
+    Actor, ActorError, ActorEvent, ActorId, ActorRef, AppendOutcome, CodecId, CodecRef,
+    ContextEntry, ContextTransition, DeliveryMode, EncodedPayload, EventBatch,
+    InterruptedEvalOutcome, IsolateState, JournalStore, Lam, MessageEnvelope, MessageId,
+    MessageSource, Model, ModelDescriptor, ModelEventSink, ModelProvider, Namespace, Never,
+    Revision, RunId, RunProgress, RuntimeEvent, SYSTEM_NOTICE_CODEC_ID,
+    SYSTEM_NOTICE_CODEC_VERSION, SystemNotice, Timestamp,
 };
 use lam_redb::RedbStore;
 use serde_json::json;
@@ -46,6 +47,38 @@ struct DropFlag(Arc<AtomicBool>);
 impl Drop for DropFlag {
     fn drop(&mut self) {
         self.0.store(true, Ordering::Release);
+    }
+}
+
+#[derive(Clone)]
+struct InterruptibleProvider {
+    started: mpsc::Sender<()>,
+    dropped: Arc<AtomicBool>,
+    calls: Arc<AtomicUsize>,
+}
+
+impl ModelProvider for InterruptibleProvider {
+    type Error = ScriptError;
+
+    fn invoke(
+        &self,
+        _request: EncodedPayload,
+        _events: ModelEventSink,
+    ) -> impl Future<Output = Result<EncodedPayload, Self::Error>> + Send {
+        let started = self.started.clone();
+        let dropped = Arc::clone(&self.dropped);
+        let first = self.calls.fetch_add(1, Ordering::AcqRel) == 0;
+        async move {
+            if first {
+                let _drop_flag = DropFlag(dropped);
+                let _ = started.send(());
+                return std::future::pending().await;
+            }
+            Ok(EncodedPayload::new(
+                CodecRef::new(CodecId::new("test/scripted").unwrap(), 1),
+                json!({ "kind": "output", "value": "resumed" }),
+            ))
+        }
     }
 }
 
@@ -427,6 +460,179 @@ async fn abort_drops_an_in_flight_provider_future() {
         dropped.load(Ordering::Acquire),
         "cancellation must drop the provider future"
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn interruption_drops_provider_work_and_keeps_the_actor_resumable() {
+    let (started_sender, started_receiver) = mpsc::channel();
+    let dropped = Arc::new(AtomicBool::new(false));
+    let provider = InterruptibleProvider {
+        started: started_sender,
+        dropped: Arc::clone(&dropped),
+        calls: Arc::new(AtomicUsize::new(0)),
+    };
+    let mut actor = Lam::builder(Model::new(provider, ScriptedCodec))
+        .build()
+        .actor("provider-interruption")
+        .build()
+        .await
+        .expect("fixture actor should build");
+    let actor_ref = actor.actor_ref();
+    let handle = actor.handle();
+    let interrupt_thread = std::thread::spawn(move || {
+        started_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("provider request should start");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let steered = runtime
+            .block_on(handle.send("late steer", DeliveryMode::Steer))
+            .expect("steering message should become durable");
+        let interrupted = runtime
+            .block_on(handle.interrupt())
+            .expect("interruption should become durable")
+            .expect("one run should be active");
+        (interrupted, steered)
+    });
+
+    assert_eq!(
+        actor.call("begin").await.unwrap_err(),
+        ActorError::Interrupted
+    );
+    let (receipt, steered) = interrupt_thread
+        .join()
+        .expect("interrupt thread should finish");
+    assert_eq!(receipt.isolate_state, IsolateState::Retained);
+    assert_eq!(receipt.interrupted_eval_outcome, None);
+    assert!(dropped.load(Ordering::Acquire));
+
+    let state = actor_ref.state().await.expect("state should project");
+    assert!(state.is_run_interrupted(&receipt.run_id));
+    assert!(state.active_run().is_none());
+    let ContextTransition::Interrupted {
+        consumed_message_ids,
+        ..
+    } = &state.context().last().unwrap().entry.transition
+    else {
+        panic!("the run should end at an interruption boundary");
+    };
+    assert_eq!(
+        consumed_message_ids,
+        &[steered.message_id, receipt.notice_message_id.clone()]
+    );
+
+    assert_eq!(actor.call("continue").await.unwrap(), "resumed");
+    assert!(actor.interrupt().await.unwrap().is_none());
+    actor.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn interruption_restarts_active_eval_and_records_its_failure_atomically() {
+    let directory = tempfile::tempdir().expect("temporary directory should exist");
+    let path = directory.path().join("interrupted.redb");
+    let (started_sender, started_receiver) = mpsc::channel();
+    let started = Namespace::new("test.control", "Interruption synchronization.").function(
+        "started",
+        "Signals that eval entered the isolate.",
+        move |_context, (): ()| {
+            let started_sender = started_sender.clone();
+            async move {
+                let _ = started_sender.send(());
+                Ok::<(), Never>(())
+            }
+        },
+    );
+    let provider = ScriptedProvider::new([
+        eval("await test.control.started(); while (true) {}"),
+        output("resumed"),
+    ]);
+    let mut actor = build_actor(
+        RedbStore::create(&path).expect("store should open"),
+        provider,
+        [started],
+    )
+    .await;
+    let actor_ref = actor.actor_ref();
+    let handle = actor.handle();
+    let interrupt_thread = std::thread::spawn(move || {
+        started_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("eval should enter the isolate");
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(handle.interrupt())
+            .expect("interruption should become durable")
+            .expect("one run should be active")
+    });
+
+    let started_at = Instant::now();
+    assert_eq!(
+        actor.call("begin").await.unwrap_err(),
+        ActorError::Interrupted
+    );
+    let receipt = interrupt_thread
+        .join()
+        .expect("interrupt thread should finish");
+    assert!(
+        started_at.elapsed() < Duration::from_secs(3),
+        "interruption took {:?}: {receipt:?}",
+        started_at.elapsed()
+    );
+    assert_eq!(receipt.isolate_state, IsolateState::Reset);
+    assert_eq!(
+        receipt.interrupted_eval_outcome,
+        Some(InterruptedEvalOutcome::FailureRecorded)
+    );
+
+    let state = actor_ref.state().await.expect("state should project");
+    assert_eq!(state.context().len(), 4);
+    assert!(matches!(
+        state.context()[2].entry.transition,
+        ContextTransition::Eval { .. }
+    ));
+    assert_eq!(
+        state.context()[2].entry.payload.value["error"]["kind"],
+        json!("interrupted")
+    );
+    assert_eq!(
+        state.context()[2].entry.payload.value["error"]["effects_may_have_completed"],
+        json!(true)
+    );
+    assert!(matches!(
+        state.context()[3].entry.transition,
+        ContextTransition::Interrupted { .. }
+    ));
+    let notice = state
+        .message(&receipt.notice_message_id)
+        .expect("notice should remain queryable");
+    assert!(matches!(
+        notice.envelope.payload().decode::<SystemNotice>().unwrap(),
+        SystemNotice::RunInterrupted {
+            isolate_state: IsolateState::Reset,
+            interrupted_eval_outcome: Some(InterruptedEvalOutcome::FailureRecorded),
+            ..
+        }
+    ));
+
+    assert_eq!(actor.call("continue").await.unwrap(), "resumed");
+    actor.shutdown().await.unwrap();
+    drop(actor_ref);
+
+    let reopened = build_actor(
+        RedbStore::open(&path).expect("store should reopen"),
+        ScriptedProvider::new([]),
+        [],
+    )
+    .await;
+    let reopened_state = reopened.actor_ref().state().await.unwrap();
+    assert!(reopened_state.is_run_interrupted(&receipt.run_id));
+    assert!(matches!(
+        reopened_state.context()[3].entry.transition,
+        ContextTransition::Interrupted { .. }
+    ));
+    reopened.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "current_thread")]
