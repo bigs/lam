@@ -1143,12 +1143,31 @@ async fn chat_adapter_drives_a_complete_lam_eval_loop() {
             "id": "chat_done",
             "choices": [{
                 "index": 0,
-                "delta": { "role": "assistant", "content": "42" },
+                "delta": {
+                    "role": "assistant",
+                    "content": "42",
+                    "reasoning_content": null,
+                    "tool_calls": null
+                },
                 "finish_reason": "stop"
             }]
         })
     );
-    let server = MockServer::start_sequence("text/event-stream", vec![first_chunks, second_chunks]);
+    let third_chunks = format!(
+        "data: {}\n\ndata: [DONE]\n\n",
+        json!({
+            "id": "chat_follow_up",
+            "choices": [{
+                "index": 0,
+                "delta": { "role": "assistant", "content": "ready" },
+                "finish_reason": "stop"
+            }]
+        })
+    );
+    let server = MockServer::start_sequence(
+        "text/event-stream",
+        vec![first_chunks, second_chunks, third_chunks],
+    );
     let model = ChatCompletions::builder("accounts/test/model")
         .api_key("test-key")
         .base_url(format!("{}/inference/v1", server.origin))
@@ -1166,10 +1185,15 @@ async fn chat_adapter_drives_a_complete_lam_eval_loop() {
         .await
         .expect("run completes");
     assert_eq!(answer, "42");
+    let follow_up: String = actor
+        .call("are you ready for another request?")
+        .await
+        .expect("follow-up run completes");
+    assert_eq!(follow_up, "ready");
     actor.shutdown().await.expect("actor shuts down");
 
     let requests = server.finish_all();
-    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.len(), 3);
     assert_eq!(requests[1].body["reasoning_history"], "preserved");
     let messages = requests[1].body["messages"].as_array().unwrap();
     assert!(
@@ -1194,6 +1218,12 @@ async fn chat_adapter_drives_a_complete_lam_eval_loop() {
             },
         })
     );
+    let follow_up_messages = requests[2].body["messages"].as_array().unwrap();
+    assert_eq!(follow_up_messages[4]["role"], "assistant");
+    assert_eq!(follow_up_messages[4]["content"], "42");
+    assert!(follow_up_messages[4].get("reasoning_content").is_none());
+    assert!(follow_up_messages[4].get("tool_calls").is_none());
+    assert_eq!(follow_up_messages[5]["role"], "user");
 }
 
 fn user_message(text: &str) -> ProjectedContextEntry {

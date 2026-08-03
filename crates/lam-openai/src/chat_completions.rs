@@ -710,7 +710,7 @@ fn encode_context(context: &[ProjectedContextEntry]) -> Result<Vec<Value>, Codec
                 native.push(json!({ "role": role, "content": message.text }));
             }
         } else if is_codec(payload, CHAT_RESPONSE_CODEC_ID, CODEC_VERSION) {
-            let (_, message, _) = response_message(payload)?;
+            let (_, mut message, _) = response_message(payload)?;
             let calls = tool_calls(&message)?;
             if calls.len() > 1 {
                 return Err(CodecError::InvalidPayload {
@@ -720,6 +720,7 @@ fn encode_context(context: &[ProjectedContextEntry]) -> Result<Vec<Value>, Codec
             if let Some(call) = calls.first() {
                 pending_eval = Some(call.id.clone());
             }
+            omit_null_request_fields(&mut message);
             native.push(message);
         } else if is_codec(payload, LAM_EVAL_CODEC_ID, LAM_CODEC_VERSION) {
             let tool_call_id = pending_eval
@@ -739,6 +740,17 @@ fn encode_context(context: &[ProjectedContextEntry]) -> Result<Vec<Value>, Codec
         });
     }
     Ok(native)
+}
+
+fn omit_null_request_fields(message: &mut Value) {
+    let Some(message) = message.as_object_mut() else {
+        return;
+    };
+    for field in ["tool_calls", "reasoning_content", "reasoning", "thinking"] {
+        if message.get(field).is_some_and(Value::is_null) {
+            message.remove(field);
+        }
+    }
 }
 
 fn compaction_replacement_codec() -> CodecRef {
@@ -1138,6 +1150,7 @@ mod tests {
                     "delta": {
                         "role": "assistant",
                         "content": "complete response",
+                        "reasoning_content": null,
                         "tool_calls": null
                     }
                 }]
@@ -1153,6 +1166,7 @@ mod tests {
 
         let message = assemble_message(&chunks).expect("null tool_calls is valid");
         assert_eq!(message["content"], "complete response");
+        assert!(message["reasoning_content"].is_null());
         assert!(message["tool_calls"].is_null());
     }
 
