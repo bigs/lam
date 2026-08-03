@@ -12,6 +12,8 @@ use crate::runtime::{
     AgentHistory, Command, CommandResult, CompletedCall, HistoryEntry, HistoryKind,
 };
 
+const MOUSE_SCROLL_LINES: usize = 3;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Focus {
     Conversation,
@@ -90,6 +92,10 @@ pub(crate) struct App {
     pub(crate) selected_entry: Option<usize>,
     pub(crate) conversation_offset: usize,
     pub(crate) follow_conversation_tail: bool,
+    pub(crate) selection_drives_viewport: bool,
+    pub(crate) conversation_ranges: Vec<(usize, usize)>,
+    pub(crate) conversation_viewport_height: usize,
+    pub(crate) conversation_total_lines: usize,
     pub(crate) suggestion_index: usize,
     pub(crate) busy: bool,
     pub(crate) status: String,
@@ -110,6 +116,7 @@ struct AgentConversation {
     selected_entry: Option<usize>,
     conversation_offset: usize,
     follow_conversation_tail: bool,
+    selection_drives_viewport: bool,
     status: String,
     parent: Option<String>,
     model: Option<String>,
@@ -188,6 +195,10 @@ impl App {
             selected_entry,
             conversation_offset: 0,
             follow_conversation_tail: true,
+            selection_drives_viewport: true,
+            conversation_ranges: Vec::new(),
+            conversation_viewport_height: 1,
+            conversation_total_lines: 0,
             suggestion_index: 0,
             busy: false,
             status: root.status,
@@ -348,6 +359,7 @@ impl App {
                 self.focus = Focus::Conversation;
                 self.selected_entry = self.entries.len().checked_sub(1);
                 self.follow_conversation_tail = true;
+                self.selection_drives_viewport = true;
                 None
             }
             KeyCode::Up if !suggestions.is_empty() => {
@@ -445,10 +457,12 @@ impl App {
             KeyCode::Home => {
                 self.selected_entry = (!self.entries.is_empty()).then_some(0);
                 self.follow_conversation_tail = false;
+                self.selection_drives_viewport = true;
             }
             KeyCode::End => {
                 self.selected_entry = self.entries.len().checked_sub(1);
                 self.follow_conversation_tail = true;
+                self.selection_drives_viewport = true;
             }
             KeyCode::Enter | KeyCode::Char(' ') => self.toggle_selected(),
             _ => {}
@@ -630,12 +644,10 @@ impl App {
     pub(crate) fn handle_mouse(&mut self, mouse: MouseEvent) {
         match mouse.kind {
             MouseEventKind::ScrollUp => {
-                self.focus = Focus::Conversation;
-                self.move_selection(-1);
+                self.scroll_conversation(-1);
             }
             MouseEventKind::ScrollDown => {
-                self.focus = Focus::Conversation;
-                self.move_selection(1);
+                self.scroll_conversation(1);
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 if let Some((_, _, index)) = self
@@ -646,6 +658,7 @@ impl App {
                     self.focus = Focus::Conversation;
                     self.selected_entry = Some(*index);
                     self.follow_conversation_tail = *index + 1 == self.entries.len();
+                    self.selection_drives_viewport = true;
                     self.toggle_selected();
                 }
             }
@@ -1120,6 +1133,7 @@ impl App {
     }
 
     fn move_selection(&mut self, amount: isize) {
+        self.selection_drives_viewport = true;
         if self.entries.is_empty() {
             self.selected_entry = None;
             return;
@@ -1130,6 +1144,46 @@ impl App {
             .min(self.entries.len() - 1);
         self.selected_entry = Some(selected);
         self.follow_conversation_tail = selected + 1 == self.entries.len() && amount > 0;
+    }
+
+    fn scroll_conversation(&mut self, direction: isize) {
+        self.focus = Focus::Conversation;
+        self.selection_drives_viewport = false;
+        let viewport = self.conversation_viewport_height.max(1);
+        let maximum = self.conversation_total_lines.saturating_sub(viewport);
+        self.conversation_offset = if direction < 0 {
+            self.conversation_offset.saturating_sub(MOUSE_SCROLL_LINES)
+        } else {
+            self.conversation_offset
+                .saturating_add(MOUSE_SCROLL_LINES)
+                .min(maximum)
+        };
+        self.follow_conversation_tail = direction > 0 && self.conversation_offset == maximum;
+        self.keep_selection_in_view(direction, viewport);
+    }
+
+    fn keep_selection_in_view(&mut self, direction: isize, viewport: usize) {
+        let visible_start = self.conversation_offset;
+        let visible_end = visible_start.saturating_add(viewport);
+        let is_visible = |index: usize| {
+            self.conversation_ranges
+                .get(index)
+                .is_some_and(|(start, end)| *end >= visible_start && *start < visible_end)
+        };
+        if self.selected_entry.is_some_and(is_visible) {
+            return;
+        }
+        let mut visible = self
+            .conversation_ranges
+            .iter()
+            .enumerate()
+            .filter(|(_, (start, end))| *end >= visible_start && *start < visible_end)
+            .map(|(index, _)| index);
+        self.selected_entry = if direction < 0 {
+            visible.next_back()
+        } else {
+            visible.next()
+        };
     }
 
     fn toggle_selected(&mut self) {
@@ -1202,6 +1256,7 @@ impl App {
             selected_entry: self.selected_entry,
             conversation_offset: self.conversation_offset,
             follow_conversation_tail: self.follow_conversation_tail,
+            selection_drives_viewport: self.selection_drives_viewport,
             status: std::mem::take(&mut self.status),
             parent: self.current_parent.take(),
             model: self.current_model.take(),
@@ -1215,6 +1270,7 @@ impl App {
         self.selected_entry = next.selected_entry;
         self.conversation_offset = next.conversation_offset;
         self.follow_conversation_tail = next.follow_conversation_tail;
+        self.selection_drives_viewport = next.selection_drives_viewport;
         self.status = next.status;
         self.current_parent = next.parent;
         self.current_model = next.model;
@@ -1248,6 +1304,7 @@ impl AgentConversation {
             selected_entry: None,
             conversation_offset: 0,
             follow_conversation_tail: true,
+            selection_drives_viewport: true,
             status: status.to_owned(),
             parent,
             model: None,
@@ -1264,6 +1321,7 @@ impl AgentConversation {
             entries,
             conversation_offset: 0,
             follow_conversation_tail: true,
+            selection_drives_viewport: true,
             status: history.status,
             parent: history.parent,
             model: history.model,
@@ -1840,6 +1898,75 @@ mod tests {
 
         app.push_entry(EntryKind::System, "Latest", "third");
         assert_eq!(app.selected_entry, app.entries.len().checked_sub(1));
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_within_one_oversized_entry() {
+        let mut app = app();
+        app.push_entry(EntryKind::System, "Older", "first");
+        app.push_expanded_entry(EntryKind::Assistant, "Agent", "long response");
+        app.focus = Focus::Conversation;
+        app.selected_entry = Some(2);
+        app.conversation_ranges = vec![(0, 1), (2, 9), (10, 109)];
+        app.conversation_viewport_height = 10;
+        app.conversation_total_lines = 110;
+        app.conversation_offset = 100;
+        app.follow_conversation_tail = true;
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        assert_eq!(app.conversation_offset, 97);
+        assert_eq!(app.selected_entry, Some(2));
+        assert!(!app.follow_conversation_tail);
+        assert!(!app.selection_drives_viewport);
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        assert_eq!(app.conversation_offset, 100);
+        assert!(app.follow_conversation_tail);
+    }
+
+    #[test]
+    fn mouse_selection_follows_the_visible_viewport_but_keyboard_drives_it() {
+        let mut app = app();
+        app.push_entry(EntryKind::System, "Middle", "second");
+        app.push_entry(EntryKind::System, "Latest", "third");
+        app.focus = Focus::Conversation;
+        app.selected_entry = Some(2);
+        app.conversation_ranges = vec![(0, 9), (10, 19), (20, 29)];
+        app.conversation_viewport_height = 10;
+        app.conversation_total_lines = 30;
+        app.conversation_offset = 20;
+        app.follow_conversation_tail = true;
+        let wheel_up = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        for _ in 0..4 {
+            app.handle_mouse(wheel_up);
+        }
+
+        assert_eq!(app.conversation_offset, 8);
+        assert_eq!(app.selected_entry, Some(1));
+        assert!(!app.selection_drives_viewport);
+
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+
+        assert_eq!(app.selected_entry, Some(0));
+        assert!(app.selection_drives_viewport);
     }
 
     #[test]

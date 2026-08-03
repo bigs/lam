@@ -135,14 +135,18 @@ fn render_conversation(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 
     let viewport = usize::from(inner.height);
     let total = lines.len();
-    let selected_start = app
-        .selected_entry
-        .and_then(|selected| ranges.get(selected))
-        .map(|(start, _)| *start);
+    app.conversation_ranges.clone_from(&ranges);
+    app.conversation_viewport_height = viewport;
+    app.conversation_total_lines = total;
+    let selected_start = app.selection_drives_viewport.then(|| {
+        app.selected_entry
+            .and_then(|selected| ranges.get(selected))
+            .map(|(start, _)| *start)
+    });
     let offset = viewport_offset(
         app.conversation_offset,
         app.focus == Focus::Input || app.follow_conversation_tail,
-        selected_start,
+        selected_start.flatten(),
         total,
         viewport,
     );
