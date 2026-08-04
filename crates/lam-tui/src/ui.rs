@@ -6,7 +6,9 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use tui_markdown::{Options as MarkdownOptions, StyleSheet, from_str_with_options};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{App, ConversationEntry, EntryKind, EntryLayout, Focus, LayoutKey, Suggestion};
+use crate::app::{
+    App, ConversationEntry, EntryKind, EntryLayout, Focus, Hitbox, LayoutKey, Suggestion,
+};
 
 const ACCENT: Color = Color::Rgb(105, 210, 190);
 const DIM: Color = Color::Rgb(112, 118, 128);
@@ -205,7 +207,16 @@ fn render_conversation(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         if visible_start <= visible_end {
             let y_start = inner.y.saturating_add(to_u16(visible_start - offset));
             let y_end = inner.y.saturating_add(to_u16(visible_end - offset));
-            app.hitboxes.push((y_start, y_end, index));
+            // The header is the entry's first layout row and the only row
+            // that toggles expand/collapse. It is clickable only while it
+            // remains inside the viewport window; body clicks just select.
+            let header = (start >= offset).then_some(y_start);
+            app.hitboxes.push(Hitbox {
+                top: y_start,
+                bottom: y_end,
+                header,
+                entry: index,
+            });
         }
     }
 }

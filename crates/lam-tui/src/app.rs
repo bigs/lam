@@ -76,6 +76,18 @@ pub(crate) struct LayoutKey {
     pub(crate) body_len: usize,
 }
 
+/// One entry's visible click target in terminal rows: the row span the mouse
+/// can hit, the header row that toggles expand/collapse (the entry's first
+/// layout line, `None` when scrolled out of the viewport), and the entry
+/// index the click selects.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Hitbox {
+    pub(crate) top: u16,
+    pub(crate) bottom: u16,
+    pub(crate) header: Option<u16>,
+    pub(crate) entry: usize,
+}
+
 impl ConversationEntry {
     fn run_id(&self) -> Option<&str> {
         self.model_run.as_deref().or(self.tool_run.as_deref())
@@ -153,7 +165,9 @@ pub(crate) struct App {
     pub(crate) busy: bool,
     pub(crate) status: String,
     pub(crate) should_exit: bool,
-    pub(crate) hitboxes: Vec<(u16, u16, usize)>,
+    /// Visible click targets for the conversation, one per entry with at
+    /// least one row in the viewport.
+    pub(crate) hitboxes: Vec<Hitbox>,
     pub(crate) current_agent: String,
     /// Durably admitted user messages not yet consumed into model-visible
     /// context, shown above the input bar until the runner delivers them at
@@ -874,16 +888,20 @@ impl App {
                 self.scroll_conversation(1);
             }
             MouseEventKind::Down(MouseButton::Left) => {
-                if let Some((_, _, index)) = self
+                if let Some(hitbox) = self
                     .hitboxes
                     .iter()
-                    .find(|(start, end, _)| mouse.row >= *start && mouse.row <= *end)
+                    .find(|hitbox| mouse.row >= hitbox.top && mouse.row <= hitbox.bottom)
                 {
                     self.focus = Focus::Conversation;
-                    self.selected_entry = Some(*index);
-                    self.follow_conversation_tail = *index + 1 == self.entries.len();
+                    self.selected_entry = Some(hitbox.entry);
+                    self.follow_conversation_tail = hitbox.entry + 1 == self.entries.len();
                     self.selection_drives_viewport = true;
-                    self.toggle_selected();
+                    // Only the header line toggles expand/collapse; clicking
+                    // a body row just moves focus and selection.
+                    if hitbox.header == Some(mouse.row) {
+                        self.toggle_selected();
+                    }
                 }
             }
             _ => {}
@@ -2104,7 +2122,7 @@ mod tests {
     use lam_agents::{ActorAddress, AgentOutcome, AgentSystemEvent};
 
     use super::{
-        App, EntryKind, Focus, InputBuffer, SessionChoice, SessionView, partial_eval_intent,
+        App, EntryKind, Focus, Hitbox, InputBuffer, SessionChoice, SessionView, partial_eval_intent,
     };
     use crate::config::ModelChoice;
     use crate::runtime::{
@@ -3813,7 +3831,12 @@ mod tests {
             address: child.clone(),
             parent: Some(ActorAddress::new("/root").unwrap()),
         });
-        app.hitboxes = vec![(4, 4, tool)];
+        app.hitboxes = vec![Hitbox {
+            top: 4,
+            bottom: 4,
+            header: Some(4),
+            entry: tool,
+        }];
         app.busy = true;
 
         assert!(!app.apply_agent_event(AgentSystemEvent::Run {
@@ -3823,7 +3846,15 @@ mod tests {
                 delta: ModelDelta::Text("streaming in the background".to_owned()),
             },
         }));
-        assert_eq!(app.hitboxes, [(4, 4, tool)]);
+        assert_eq!(
+            app.hitboxes,
+            [Hitbox {
+                top: 4,
+                bottom: 4,
+                header: Some(4),
+                entry: tool
+            }]
+        );
 
         app.handle_mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
@@ -3834,6 +3865,86 @@ mod tests {
 
         assert_eq!(app.selected_entry, Some(tool));
         assert!(app.entries[tool].expanded);
+    }
+
+    #[test]
+    fn body_click_selects_without_collapsing() {
+        let mut app = app();
+        app.push_entry(EntryKind::System, "Expanded", "first line\nsecond line");
+        let entry = app.entries.len() - 1;
+        app.entries[entry].expanded = true;
+        app.hitboxes = vec![Hitbox {
+            top: 2,
+            bottom: 4,
+            header: Some(2),
+            entry,
+        }];
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        assert_eq!(app.focus, Focus::Conversation);
+        assert_eq!(app.selected_entry, Some(entry));
+        assert!(app.entries[entry].expanded);
+    }
+
+    #[test]
+    fn header_click_toggles_expand_and_collapse() {
+        let mut app = app();
+        app.push_entry(EntryKind::System, "Expanded", "body");
+        let entry = app.entries.len() - 1;
+        app.entries[entry].expanded = true;
+        app.hitboxes = vec![Hitbox {
+            top: 2,
+            bottom: 2,
+            header: Some(2),
+            entry,
+        }];
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(!app.entries[entry].expanded);
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(app.entries[entry].expanded);
+    }
+
+    #[test]
+    fn body_click_with_scrolled_off_header_does_not_toggle() {
+        let mut app = app();
+        app.push_entry(EntryKind::System, "Expanded", "first line\nsecond line");
+        let entry = app.entries.len() - 1;
+        app.entries[entry].expanded = true;
+        // The header is above the viewport; only body rows are clickable.
+        app.hitboxes = vec![Hitbox {
+            top: 2,
+            bottom: 3,
+            header: None,
+            entry,
+        }];
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        assert_eq!(app.selected_entry, Some(entry));
+        assert!(app.entries[entry].expanded);
     }
 
     #[test]
