@@ -239,10 +239,13 @@ runtime stack.
 
 ```bash
 cargo fmt --all --check
-cargo clippy --workspace --all-targets --offline -- -D warnings
-cargo test --workspace --all-targets --offline
-cargo rustdoc --workspace --offline -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --all-targets
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 ```
+
+Add `--offline` to the clippy, test, and doc commands when dependencies are
+already fetched.
 
 The default suite is deterministic and does not require network access. Ignored
 live tests use `OPENAI_API_KEY` or `FIREWORKS_API_KEY` and make bounded provider
