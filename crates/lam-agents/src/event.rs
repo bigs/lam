@@ -81,6 +81,14 @@ impl AgentSystemEvents {
     pub async fn next(&mut self) -> Option<AgentSystemEvent> {
         self.receiver.recv().await
     }
+
+    /// Returns the next addressed event only if one is already queued.
+    ///
+    /// Subscribers that render can drain every ready event between frames so
+    /// a burst costs one redraw instead of one per event.
+    pub fn try_next(&mut self) -> Option<AgentSystemEvent> {
+        self.receiver.try_recv().ok()
+    }
 }
 
 impl Stream for AgentSystemEvents {

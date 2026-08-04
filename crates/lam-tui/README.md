@@ -100,7 +100,10 @@ or raw SSE payloads.
 
 ## Interaction
 
-- Type a message and press Enter to call the root coding agent.
+- Type a message and press Enter to send it to the root coding agent. Every
+  message is admitted as a durable steer: if the root is idle it starts a new
+  run, and if the root is mid-run it is delivered at the next model boundary
+  (after the pending tool result, or immediately after the terminal output).
 - Type `/` to open command completion. `/new`, `/session`, `/agents`, `/compact`,
   `/model`, `/effort`, `/exit`, and its `/quit` alias are available. `/model`
   opens models grouped by provider; `/effort` lists the active model's
@@ -123,6 +126,10 @@ or raw SSE payloads.
 - Expanded user, agent, and reasoning rows render Markdown as it streams;
   collapsed previews remain compact plain text.
 - Mouse wheel navigation and click-to-expand are supported.
+- Until a sent message is delivered, it appears as a one-line pending preview
+  directly above the input bar (with a `+N more` marker when several are
+  queued). At the moment the runner consumes it, its row enters the
+  conversation at its exact journal position, like any other user message.
 - While the root is working, press Escape twice within 1.5 seconds to
   recoverably stop its complete agent tree. The first physical press shows a
   confirmation above the input; key repeat cannot confirm it, and any other

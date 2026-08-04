@@ -6,11 +6,12 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use tui_markdown::{Options as MarkdownOptions, StyleSheet, from_str_with_options};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{App, ConversationEntry, EntryKind, Focus, Suggestion};
+use crate::app::{App, ConversationEntry, EntryKind, EntryLayout, Focus, LayoutKey, Suggestion};
 
 const ACCENT: Color = Color::Rgb(105, 210, 190);
 const DIM: Color = Color::Rgb(112, 118, 128);
 const PANEL: Color = Color::Rgb(31, 35, 41);
+const MAX_PENDING_STEER_ROWS: usize = 3;
 
 #[derive(Clone, Copy)]
 struct MarkdownStyle;
@@ -119,30 +120,36 @@ fn render_conversation(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         height: area.height,
     };
     let width = usize::from(inner.width.max(1));
-    let mut lines = Vec::new();
+
+    // Pass 1: refresh stale row layouts and measure. Committed rows lay out
+    // once and are pure integer work afterwards, so this walk stays cheap on
+    // long sessions.
+    let selected_index = (app.focus == Focus::Conversation)
+        .then_some(app.selected_entry)
+        .flatten();
     let mut ranges = Vec::with_capacity(app.entries.len());
+    let mut total = 0usize;
     let mut previous_kind = None;
-    for (index, entry) in app.entries.iter().enumerate() {
+    for (index, entry) in app.entries.iter_mut().enumerate() {
         if needs_message_spacing(previous_kind, Some(entry.kind)) {
-            lines.push(Line::default());
+            total += 1;
         }
-        let start = lines.len();
-        entry_lines(
-            entry,
-            width,
-            app.focus == Focus::Conversation && app.selected_entry == Some(index),
-            &mut lines,
-        );
-        let end = lines.len().saturating_sub(1);
-        ranges.push((start, end));
+        ensure_entry_layout(entry, width, selected_index == Some(index));
+        let height = entry
+            .layout
+            .as_ref()
+            .expect("the layout was just ensured")
+            .lines
+            .len();
+        ranges.push((total, total + height.saturating_sub(1)));
+        total += height;
         previous_kind = Some(entry.kind);
     }
     if needs_message_spacing(previous_kind, None) {
-        lines.push(Line::default());
+        total += 1;
     }
 
     let viewport = usize::from(inner.height);
-    let total = lines.len();
     app.conversation_ranges.clone_from(&ranges);
     app.conversation_viewport_height = viewport;
     app.conversation_total_lines = total;
@@ -159,8 +166,37 @@ fn render_conversation(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         viewport,
     );
     app.conversation_offset = offset;
-    let paragraph = Paragraph::new(Text::from(lines)).scroll((to_u16(offset), 0));
-    frame.render_widget(paragraph, inner);
+
+    // Pass 2: materialize only the lines inside the viewport window.
+    let window_end = offset.saturating_add(viewport);
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(viewport);
+    let mut cursor = 0usize;
+    let mut previous_kind = None;
+    for entry in &app.entries {
+        if cursor >= window_end {
+            break;
+        }
+        if needs_message_spacing(previous_kind, Some(entry.kind)) {
+            if cursor >= offset {
+                lines.push(Line::default());
+            }
+            cursor += 1;
+        }
+        let cached = &entry
+            .layout
+            .as_ref()
+            .expect("pass 1 ensured every layout")
+            .lines;
+        let height = cached.len();
+        if cursor.saturating_add(height) > offset && cursor < window_end {
+            let from = offset.saturating_sub(cursor);
+            let to = (window_end - cursor).min(height);
+            lines.extend(cached[from..to].iter().cloned());
+        }
+        cursor += height;
+        previous_kind = Some(entry.kind);
+    }
+    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
 
     app.hitboxes.clear();
     for (index, (start, end)) in ranges.into_iter().enumerate() {
@@ -172,6 +208,39 @@ fn render_conversation(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             app.hitboxes.push((y_start, y_end, index));
         }
     }
+}
+
+/// Rebuilds the row's cached layout if anything it depends on changed.
+fn ensure_entry_layout(entry: &mut ConversationEntry, width: usize, selected: bool) {
+    let key = LayoutKey {
+        width,
+        expanded: entry.expanded,
+        selected,
+        dimmed: is_dimmed(entry, selected),
+        title_len: entry.title.len(),
+        body_len: entry.body.len(),
+    };
+    if entry
+        .layout
+        .as_ref()
+        .is_some_and(|layout| layout.key == key)
+    {
+        return;
+    }
+    let mut lines = Vec::new();
+    entry_lines(entry, width, selected, &mut lines);
+    entry.layout = Some(EntryLayout { key, lines });
+}
+
+/// Tool and reasoning rows are ambient detail: they render faint once the
+/// stream moves past them. The row a run is actively writing and the
+/// selected row stay at full intensity for reading.
+fn is_dimmed(entry: &ConversationEntry, selected: bool) -> bool {
+    matches!(
+        entry.kind,
+        EntryKind::ToolCall | EntryKind::ToolResult | EntryKind::Reasoning
+    ) && !selected
+        && !entry.streaming
 }
 
 fn needs_message_spacing(previous: Option<EntryKind>, next: Option<EntryKind>) -> bool {
@@ -215,29 +284,22 @@ fn entry_lines(
     let (marker, color) = entry_style(entry.kind);
     let selection = if selected { "│" } else { " " };
     let disclosure = if entry.expanded { "▾" } else { "▸" };
-    // Tool and reasoning rows are ambient detail: render them faint once the
-    // stream moves past them. The row a run is actively writing and the
-    // selected row stay at full intensity for reading.
-    let dimmed = matches!(
-        entry.kind,
-        EntryKind::ToolCall | EntryKind::ToolResult | EntryKind::Reasoning
-    ) && !selected
-        && !entry.streaming;
+    let dimmed = is_dimmed(entry, selected);
     let style = if selected {
         Style::default().bg(PANEL)
     } else {
         Style::default()
-    };
-    let body = if renders_markdown(entry.kind) {
-        markdown_preview(&entry.body)
-    } else {
-        one_line(&entry.body)
     };
     let title_width = UnicodeWidthStr::width(entry.title.as_str());
     let fixed = 10 + title_width;
     let preview = if entry.expanded || entry.kind == EntryKind::ToolCall {
         String::new()
     } else {
+        let body = if renders_markdown(entry.kind) {
+            markdown_preview(&entry.body)
+        } else {
+            one_line(&entry.body)
+        };
         elide_end(&body, width.saturating_sub(fixed))
     };
     lines.push(
@@ -628,17 +690,30 @@ fn render_shelf(frame: &mut Frame<'_>, area: Rect, app: &mut App, suggestions: &
     let input_width = usize::from(inner.width.saturating_sub(4).max(1));
     app.input_width = input_width;
     let input_rows = app.input.rows(input_width);
-    let warning_height = u16::from(app.interruption_warning().is_some());
-    let palette_height = inner
-        .height
-        .saturating_sub(to_u16(input_rows.len()))
-        .saturating_sub(warning_height);
-    let [palette_area, warning_area, input_area] = Layout::vertical([
-        Constraint::Length(palette_height),
-        Constraint::Length(warning_height),
+
+    // Allocate by priority: the input keeps every row it needs, then the
+    // warning, then pending steers, and the palette takes the remainder.
+    let inner_height = usize::from(inner.height);
+    let input_height = input_rows.len().clamp(1, inner_height.max(1));
+    let remaining = inner_height.saturating_sub(input_height);
+    let warning_height = usize::from(app.interruption_warning().is_some()).min(remaining);
+    let remaining = remaining.saturating_sub(warning_height);
+    let steer_height = app
+        .pending_steers
+        .len()
+        .min(MAX_PENDING_STEER_ROWS)
+        .min(remaining);
+    let palette_height = remaining.saturating_sub(steer_height);
+    let [palette_area, steer_area, warning_area, input_area] = Layout::vertical([
+        Constraint::Length(to_u16(palette_height)),
+        Constraint::Length(to_u16(steer_height)),
+        Constraint::Length(to_u16(warning_height)),
         Constraint::Min(1),
     ])
     .areas(inner);
+    if steer_height > 0 {
+        render_pending_steers(frame, steer_area, app);
+    }
     if !suggestions.is_empty() && palette_area.height > 0 {
         render_palette(frame, palette_area, suggestions, app.suggestion_index);
     }
@@ -680,6 +755,48 @@ fn render_shelf(frame: &mut Frame<'_>, area: Rect, app: &mut App, suggestions: &
             cursor_y,
         ));
     }
+}
+
+fn render_pending_steers(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let prefix_width = UnicodeWidthStr::width("   pending steer  ");
+    let preview_width = usize::from(area.width).saturating_sub(prefix_width);
+    let capacity = usize::from(area.height);
+    let pending = app.pending_steers.len();
+    // When the list does not fit, the last row becomes a "+N more" marker so
+    // truncation is never silent.
+    let shown = if pending > capacity {
+        capacity.saturating_sub(1)
+    } else {
+        pending
+    };
+    let mut lines = app
+        .pending_steers
+        .iter()
+        .take(shown)
+        .map(|steer| {
+            Line::from(vec![
+                Span::styled("   ", Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    "pending steer",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("  ", Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    elide_end(&one_line(&steer.text), preview_width),
+                    Style::default().fg(Color::Gray),
+                ),
+            ])
+        })
+        .collect::<Vec<_>>();
+    if pending > shown {
+        lines.push(Line::from(Span::styled(
+            format!("   +{} more queued", pending - shown),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 fn render_palette(frame: &mut Frame<'_>, area: Rect, suggestions: &[Suggestion], selected: usize) {
@@ -735,7 +852,8 @@ fn shelf_height(area: Rect, app: &App, suggestions: &[Suggestion]) -> u16 {
         .0;
     let palette_rows = suggestions.len() + provider_headers;
     let warning_rows = usize::from(app.interruption_warning().is_some());
-    let desired = 1 + input_rows + palette_rows + warning_rows;
+    let steer_rows = app.pending_steers.len().min(MAX_PENDING_STEER_ROWS);
+    let desired = 1 + input_rows + steer_rows + palette_rows + warning_rows;
     let maximum = usize::from((area.height * 2 / 5).max(3));
     to_u16(desired.clamp(2, maximum))
 }
@@ -842,9 +960,16 @@ mod tests {
     };
     use crate::app::{App, EntryKind, Focus, SessionChoice, SessionView};
     use crate::config::ModelChoice;
-    use crate::runtime::{AgentHistory, HistoryEntry, HistoryKind};
+    use crate::runtime::{AgentHistory, CommittedRow, HistoryEntry, HistoryKind};
 
     fn test_app(history: Vec<HistoryEntry>) -> App {
+        let history = history
+            .into_iter()
+            .map(|entry| CommittedRow {
+                entry,
+                run_id: None,
+            })
+            .collect();
         App::new(
             "/tmp/project".to_owned(),
             "/tmp/providers.toml".to_owned(),
@@ -883,7 +1008,11 @@ mod tests {
 
     #[test]
     fn markdown_preserves_inline_styles_in_ratatui_spans() {
-        let lines = markdown_lines("A **bold** word and `code`.", 80, Style::default().fg(Color::Gray));
+        let lines = markdown_lines(
+            "A **bold** word and `code`.",
+            80,
+            Style::default().fg(Color::Gray),
+        );
         let spans = lines
             .iter()
             .flat_map(|line| line.spans.iter())
@@ -1013,7 +1142,11 @@ mod tests {
 
     #[test]
     fn incomplete_streamed_code_fence_renders_its_content() {
-        let lines = markdown_lines("Working…\n\n```rust\nlet answer = 42;", 80, Style::default().fg(Color::Gray));
+        let lines = markdown_lines(
+            "Working…\n\n```rust\nlet answer = 42;",
+            80,
+            Style::default().fg(Color::Gray),
+        );
         let rendered = lines.iter().map(ToString::to_string).collect::<String>();
 
         assert!(rendered.contains("Working…"));
@@ -1162,11 +1295,92 @@ mod tests {
     fn text_modifier(buffer: &ratatui::buffer::Buffer, needle: &str) -> Modifier {
         let cells = buffer.content();
         let symbols: Vec<&str> = cells.iter().map(|cell| cell.symbol()).collect();
-        let needle: Vec<String> = needle.chars().map(|character| character.to_string()).collect();
+        let needle: Vec<String> = needle
+            .chars()
+            .map(|character| character.to_string())
+            .collect();
         let index = symbols
             .windows(needle.len())
             .position(|window| window == needle.as_slice())
             .expect("the needle is rendered");
         cells[index].modifier
+    }
+
+    fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn layout_cache_reuses_untouched_rows_and_rebuilds_grown_ones() {
+        let mut app = test_app(vec![
+            HistoryEntry {
+                kind: HistoryKind::System,
+                title: "Static".to_owned(),
+                body: "unchanged content".to_owned(),
+            },
+            HistoryEntry {
+                kind: HistoryKind::Assistant,
+                title: "/root".to_owned(),
+                body: "growing".to_owned(),
+            },
+        ]);
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let static_lines = app.entries[0].layout.as_ref().unwrap().lines.as_ptr();
+        let grown_before = app.entries[1].layout.as_ref().unwrap().key.clone();
+
+        app.entries[1].body.push_str(" and growing");
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        assert_eq!(
+            app.entries[0].layout.as_ref().unwrap().lines.as_ptr(),
+            static_lines,
+            "an untouched row keeps its cached layout allocation"
+        );
+        let grown_after = &app.entries[1].layout.as_ref().unwrap().key;
+        assert!(
+            grown_after.body_len > grown_before.body_len,
+            "a grown row rebuilds its layout"
+        );
+        assert!(buffer_text(&terminal).contains("and growing"));
+    }
+
+    #[test]
+    fn viewport_materializes_only_the_visible_window() {
+        let rows = (0..80)
+            .map(|index| HistoryEntry {
+                kind: HistoryKind::System,
+                title: format!("row-{index}"),
+                body: format!("body {index}"),
+            })
+            .collect::<Vec<_>>();
+        let mut app = test_app(rows);
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        // Following the tail shows the newest rows and not the oldest.
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let tail = buffer_text(&terminal);
+        assert!(tail.contains("row-79"));
+        assert!(!tail.contains("row-2 "));
+
+        // A detached viewport shows the middle of the scrollback.
+        app.follow_conversation_tail = false;
+        app.selection_drives_viewport = false;
+        app.focus = Focus::Conversation;
+        app.conversation_offset = 40;
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let middle = buffer_text(&terminal);
+        assert!(middle.contains("row-41"));
+        assert!(!middle.contains("row-79"));
+        assert!(!middle.contains("row-2 "));
     }
 }

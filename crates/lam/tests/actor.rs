@@ -1309,6 +1309,84 @@ async fn steering_wins_the_terminal_race_without_repeating_the_first_request() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn steer_admitted_during_an_eval_is_delivered_at_the_tool_result_boundary() {
+    let eval_started = Arc::new(tokio::sync::Notify::new());
+    let steer_admitted = Arc::new(tokio::sync::Notify::new());
+    let provider = ScriptedProvider::new([eval("await acme.sync.block(1)"), output(json!("done"))]);
+    let sync = Namespace::new("acme.sync", "Test synchronization.").function(
+        "block",
+        "Blocks until the steer is admitted.",
+        {
+            let eval_started = Arc::clone(&eval_started);
+            let steer_admitted = Arc::clone(&steer_admitted);
+            move |_context, _input: i64| {
+                let eval_started = Arc::clone(&eval_started);
+                let steer_admitted = Arc::clone(&steer_admitted);
+                async move {
+                    eval_started.notify_one();
+                    steer_admitted.notified().await;
+                    Ok::<_, Never>(1)
+                }
+            }
+        },
+    );
+    let mut actor = build_actor(provider.clone(), [sync]).await;
+    let actor_ref = actor.actor_ref();
+
+    let mut run = actor.call("start");
+    wait_for_model_start(&mut run).await;
+    eval_started.notified().await;
+    let receipt = actor_ref
+        .send("also do this", DeliveryMode::Steer)
+        .await
+        .expect("steering should become durable");
+    steer_admitted.notify_one();
+    assert_eq!(run.await.expect("run should complete"), "done");
+
+    // The steer enters model-visible context directly after the eval
+    // outcome, and the next model request already contains it.
+    assert_eq!(provider.requests().len(), 2);
+    let second_request = provider.requests()[1].value.to_string();
+    assert!(
+        second_request.contains("also do this"),
+        "the request after the tool result must contain the steer: {second_request}"
+    );
+    let state = actor_ref.state().await.expect("state should project");
+    let transitions = state
+        .context()
+        .iter()
+        .map(|entry| &entry.entry.transition)
+        .collect::<Vec<_>>();
+    assert!(matches!(transitions[0], ContextTransition::Messages { .. }));
+    assert!(matches!(
+        transitions[1],
+        ContextTransition::Model {
+            progress: RunProgress::Continue,
+            ..
+        }
+    ));
+    assert!(matches!(transitions[2], ContextTransition::Eval { .. }));
+    let ContextTransition::Messages {
+        consumed_message_ids,
+        ..
+    } = transitions[3]
+    else {
+        panic!("the steer must be delivered directly after the eval result: {transitions:?}");
+    };
+    assert_eq!(
+        consumed_message_ids,
+        std::slice::from_ref(&receipt.message_id)
+    );
+    assert!(matches!(
+        transitions[4],
+        ContextTransition::Model {
+            progress: RunProgress::Complete,
+            ..
+        }
+    ));
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn queued_message_allows_completion_then_starts_later_work() {
     let gate = Arc::new(Barrier::new(2));
     let provider = ScriptedProvider::new([

@@ -23,7 +23,7 @@ use crate::notice::system_notice_codec;
 use crate::recovery::{has_pending_eval, has_recoverable_work};
 use crate::runtime_journal::{
     AppendAttempt, admit_message, append_batch, append_context, append_event, load_state,
-    state_error,
+    refresh_state, state_error,
 };
 use crate::{
     ActorError, EvalOutcome, InterruptedEvalOutcome, InterruptionReceipt, IsolateState,
@@ -396,17 +396,20 @@ where
                             std::iter::repeat_with(EvalOutcome::parallel_tool_call_rejected)
                                 .take(rejected_eval_calls),
                         );
-                        for outcome in &outcomes {
+                        // Commit before emitting: like every other boundary
+                        // event, EvalCompleted reports a durable fact, so
+                        // subscribers may render from the journal on receipt.
+                        state = self.append_eval_outcomes(state, &run_id, &outcomes).await?;
+                        for outcome in outcomes {
                             emit(
                                 &self.run_events,
                                 events,
                                 RunEvent::EvalCompleted {
                                     run_id: run_id.clone(),
-                                    outcome: outcome.clone(),
+                                    outcome,
                                 },
                             );
                         }
-                        state = self.append_eval_outcomes(state, &run_id, &outcomes).await?;
                     }
                     ModelDirective::Output(value) => {
                         match self
@@ -463,6 +466,20 @@ where
             Ok(_) => Ok(None),
         };
         self.control.finish(&run_id, control_result);
+        // Wake-driven runs have no per-call channel to report through, so a
+        // failure would otherwise be invisible to actor-event subscribers.
+        if events.is_none()
+            && let Err(error) = &result
+            && !matches!(error, ActorError::Aborted | ActorError::Interrupted)
+        {
+            emit(
+                &self.run_events,
+                None,
+                RunEvent::Failed {
+                    message: error.to_string(),
+                },
+            );
+        }
         result
     }
 
@@ -586,6 +603,10 @@ where
         run_id: &RunId,
         events: Option<&mpsc::Sender<RunEvent>>,
     ) -> Result<ActorState, ActorError> {
+        // Refresh from the journal head first: mail admitted since the last
+        // append is otherwise invisible until a CAS collision, and this is
+        // the boundary where a steer must become model-visible.
+        let state = refresh_state(self.store.as_ref(), &self.actor_id, state).await?;
         if state.eligible_messages().next().is_none() {
             return Ok(state);
         }

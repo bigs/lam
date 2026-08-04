@@ -4,16 +4,14 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use lam::{
-    ActorError, ActorEventData, ActorId, ActorState, CompactionArtifact, CompactionRecord,
-    ContextTransition, EncodedPayload, InterruptedEvalOutcome, IsolateState, JournalStore, Lam,
-    LamBuilder, MemStore, MessageSource, Model, ModelCodec, ModelDelta, ModelDescriptor,
-    ModelDirective, ModelRequestConfig, ModelResponseMetadata, ModelResponseProjection,
-    ProjectedContextEntry, Revision, SYSTEM_NOTICE_CODEC_ID, SystemNotice,
+    ActorEventData, ActorId, ActorState, CompactionArtifact, CompactionRecord, ContextEntry,
+    ContextTransition, DeliveryMode, EncodedPayload, InterruptedEvalOutcome, IsolateState,
+    JournalStore, Lam, LamBuilder, MemStore, MessageId, MessageSource, Model, ModelCodec,
+    ModelDelta, ModelDescriptor, ModelDirective, ModelRequestConfig, ModelResponseMetadata,
+    ModelResponseProjection, ProjectedContextEntry, Revision, RunProgress, SYSTEM_NOTICE_CODEC_ID,
+    SystemNotice,
 };
-use lam_agents::{
-    Agent, AgentSystem, AgentSystemError, AgentSystemEvents, AgentTreeInterruptionReceipt,
-    SubagentConfig, SubagentConfigBuilder,
-};
+use lam_agents::{Agent, AgentSystem, AgentSystemEvents, SubagentConfig, SubagentConfigBuilder};
 use lam_code::{CodingPack, FilesystemAccess, LocalCommandRunner};
 use lam_openai::chat_completions::{
     ChatCompletions, ChatCompletionsCodec, ChatCompletionsProvider,
@@ -35,6 +33,13 @@ pub(crate) struct Runtime {
     pub(crate) agents: Vec<AgentHistory>,
     effort_controls: Vec<EffortControl>,
     history_models: Arc<[ConfiguredModel]>,
+    store: Arc<RedbStore>,
+    /// One transcript projector per journaled actor. The projector is the
+    /// TUI's only source of committed transcript content: it folds journal
+    /// pages incrementally and renders each committed context entry through
+    /// the same renderer the session-restore path uses, so the live view and
+    /// the reload view agree by construction.
+    projectors: BTreeMap<String, Projector>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -50,11 +55,11 @@ pub(crate) struct AgentHistory {
     pub(crate) model: Option<String>,
     pub(crate) status: String,
     pub(crate) run_completed: bool,
-    pub(crate) history: Vec<HistoryEntry>,
+    pub(crate) history: Vec<CommittedRow>,
 }
 
 impl AgentHistory {
-    pub(crate) fn root(history: Vec<HistoryEntry>) -> Self {
+    pub(crate) fn root(history: Vec<CommittedRow>) -> Self {
         Self {
             address: "/root".to_owned(),
             parent: None,
@@ -85,21 +90,32 @@ pub(crate) struct HistoryEntry {
 
 #[derive(Clone, Debug)]
 pub(crate) enum Command {
-    Call(String),
+    /// A user message. Always admitted as a durable steer: if a run is
+    /// active it is delivered at the next model boundary, otherwise the
+    /// runner wakes and starts a new run with it.
+    Message(String),
     Interrupt,
     Compact,
-    SwitchModel { index: usize, registry_id: String },
-    SetEffort { index: usize, effort: String },
+    SwitchModel {
+        index: usize,
+        registry_id: String,
+    },
+    SetEffort {
+        index: usize,
+        effort: String,
+    },
     New,
     LoadSession(u64),
     RefreshSessions,
 }
 
+/// Command results carry state transitions only. Transcript content always
+/// comes from the journal projectors, never from a command result.
 #[derive(Debug)]
 pub(crate) enum CommandResult {
-    Call(Result<CompletedCall, String>),
-    CallInterrupted,
-    Interrupt(Result<Option<InterruptedTree>, String>),
+    Message(Result<SentMessage, String>),
+    /// Whether the interruption found a run to stop.
+    Interrupt(Result<bool, String>),
     Compact(Result<String, String>),
     SwitchModel {
         index: usize,
@@ -112,22 +128,46 @@ pub(crate) enum CommandResult {
     },
 }
 
+/// Receipt for a durably admitted user message.
 #[derive(Debug)]
-pub(crate) struct CompletedCall {
-    pub(crate) output: String,
+pub(crate) struct SentMessage {
+    /// Durable identity of the admitted mailbox message.
+    pub(crate) message_id: String,
+    /// The user's message text.
+    pub(crate) text: String,
+}
+
+/// One committed transcript row rendered from a journal context entry.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CommittedRow {
+    pub(crate) entry: HistoryEntry,
+    /// Run which produced the row, for model- and eval-derived rows. The
+    /// view uses it to replace the matching streaming overlay rows.
     pub(crate) run_id: Option<String>,
 }
 
-#[derive(Debug)]
-pub(crate) struct InterruptedTree {
-    pub(crate) agents: Vec<AgentHistory>,
-    pub(crate) runs: Vec<InterruptedRun>,
+/// Everything one incremental fold committed, in journal order.
+#[derive(Debug, Default)]
+pub(crate) struct FoldOutcome {
+    pub(crate) rows: Vec<CommittedRow>,
+    /// Run id of every model turn committed by this fold, in order. Each one
+    /// supersedes the oldest streaming overlay segment for that run.
+    pub(crate) model_turns: Vec<String>,
+    /// Mailbox messages consumed into context by this fold.
+    pub(crate) consumed_message_ids: Vec<String>,
+    /// The actor's active run after the fold, if any.
+    pub(crate) active_run: Option<String>,
+    /// Runs this fold observed reaching a terminal or interrupted entry.
+    /// Streaming deltas for these runs are stale and must be ignored.
+    pub(crate) dead_runs: Vec<String>,
+    /// Whether the fold ended on an interruption boundary.
+    pub(crate) interrupted: bool,
 }
 
-#[derive(Debug)]
-pub(crate) struct InterruptedRun {
-    pub(crate) address: String,
-    pub(crate) run_id: String,
+struct Projector {
+    actor_id: ActorId,
+    /// `None` only while a fold is in flight or after a poisoned fold.
+    state: Option<ActorState>,
 }
 
 impl Runtime {
@@ -163,9 +203,6 @@ impl Runtime {
             .build()
             .map_err(|error| RuntimeError::CodingPack(error.to_string()))?;
         let store = RedbStore::open(&session.database_path).map_err(RuntimeError::Journal)?;
-        let stored_actors = load_stored_actors(&store)
-            .await
-            .map_err(RuntimeError::AgentSystem)?;
         let system = AgentSystem::builder(store)
             .worker_threads(default_worker_threads())
             .max_agents(64)
@@ -206,12 +243,44 @@ impl Runtime {
             .host_with_subagents(root_builder.build().actor("/root"), children)
             .await
             .map_err(|error| RuntimeError::AgentSystem(error.to_string()))?;
-        let state = root
-            .state()
-            .await
+
+        let history_models: Arc<[ConfiguredModel]> = models.into();
+        let store = system.state_store();
+        let mut actor_ids = store
+            .actor_ids()
             .map_err(|error| RuntimeError::AgentSystem(error.to_string()))?;
-        let selected_model_id = state
-            .selected_model()
+        if !actor_ids.iter().any(|actor| actor.as_str() == "/root") {
+            actor_ids.push(ActorId::new("/root").expect("the root actor ID is valid"));
+        }
+        let mut projectors = BTreeMap::new();
+        let mut agents = Vec::new();
+        for actor in actor_ids {
+            let address = actor.as_str().to_owned();
+            let mut projector = Projector {
+                actor_id: actor,
+                state: Some(ActorState::new()),
+            };
+            let outcome = fold_projector(store.as_ref(), &history_models, &address, &mut projector)
+                .await
+                .map_err(RuntimeError::AgentSystem)?;
+            let state = projector
+                .state
+                .as_ref()
+                .expect("a successful fold always restores the projector state");
+            agents.push(agent_history(
+                &address,
+                state,
+                outcome.rows,
+                address != "/root",
+            ));
+            projectors.insert(address, projector);
+        }
+        agents.sort_by(|left, right| left.address.cmp(&right.address));
+
+        let selected_model_id = projectors
+            .get("/root")
+            .and_then(|projector| projector.state.as_ref())
+            .and_then(ActorState::selected_model)
             .expect("actor initialization establishes a model selection")
             .model_id
             .as_str()
@@ -221,13 +290,6 @@ impl Runtime {
             .iter()
             .position(|model| model.registry_id == selected_model_id)
             .expect("runtime registration mirrors the validated model list");
-        let mut agents = stored_actors
-            .into_iter()
-            .filter(|(actor, _)| actor.as_str() != "/root")
-            .map(|(actor, state)| agent_history(actor.as_str(), &state, &models, true))
-            .collect::<Vec<_>>();
-        agents.push(agent_history("/root", &state, &models, false));
-        agents.sort_by(|left, right| left.address.cmp(&right.address));
 
         Ok(Self {
             system,
@@ -237,8 +299,57 @@ impl Runtime {
             selected_model,
             agents,
             effort_controls,
-            history_models: models.into(),
+            history_models,
+            store,
+            projectors,
         })
+    }
+
+    /// Folds any newly committed journal events for the actor and returns the
+    /// rendered rows in journal order. Creates the projector on first contact
+    /// so freshly spawned children fold from revision zero.
+    pub(crate) async fn fold(&mut self, address: &str) -> Result<FoldOutcome, String> {
+        if !self.projectors.contains_key(address) {
+            let actor_id = ActorId::new(address).map_err(|error| error.to_string())?;
+            self.projectors.insert(
+                address.to_owned(),
+                Projector {
+                    actor_id,
+                    state: Some(ActorState::new()),
+                },
+            );
+        }
+        let projector = self
+            .projectors
+            .get_mut(address)
+            .expect("the projector was just ensured");
+        fold_projector(
+            self.store.as_ref(),
+            &self.history_models,
+            address,
+            projector,
+        )
+        .await
+    }
+
+    /// Addresses with a live transcript projector.
+    pub(crate) fn projected_addresses(&self) -> Vec<String> {
+        self.projectors.keys().cloned().collect()
+    }
+
+    /// Whether the message has already been consumed into model-visible
+    /// context, according to the projector's folded state. Callers must fold
+    /// first; folds and receipt handling share the main loop, so the answer
+    /// is race-free.
+    pub(crate) fn is_consumed(&self, address: &str, message_id: &str) -> bool {
+        let Ok(message_id) = MessageId::new(message_id) else {
+            return false;
+        };
+        self.projectors
+            .get(address)
+            .and_then(|projector| projector.state.as_ref())
+            .and_then(|state| state.message(&message_id))
+            .is_some_and(|message| message.consumed_at.is_some())
     }
 
     pub(crate) fn selected_effort(&self) -> String {
@@ -248,56 +359,30 @@ impl Runtime {
     pub(crate) fn execute(&self, command: Command, output: mpsc::UnboundedSender<CommandResult>) {
         let root = self.root.clone();
         let effort_controls = self.effort_controls.clone();
-        let history_models = Arc::clone(&self.history_models);
-        let store = self.system.state_store();
         tokio::spawn(async move {
             let result = match command {
-                Command::Call(input) => match root.call(input).await {
-                    Ok(output) => {
-                        let run_id = root.state().await.ok().and_then(|state| {
-                            state
-                                .context()
-                                .last()
-                                .and_then(|projected| projected.entry.transition.run_id())
-                                .map(ToString::to_string)
-                        });
-                        tracing::debug!(
-                            target: "lam_tui::runtime",
-                            event = "tui.call_completed",
-                            actor_id = "/root",
-                            run_id = ?run_id,
-                            output_bytes = output.len(),
-                            "root call completed"
-                        );
-                        CommandResult::Call(Ok(CompletedCall { output, run_id }))
-                    }
-                    Err(AgentSystemError::Actor(ActorError::Interrupted)) => {
-                        tracing::debug!(
-                            target: "lam_tui::runtime",
-                            event = "tui.call_interrupted",
-                            actor_id = "/root",
-                            "root call was interrupted"
-                        );
-                        CommandResult::CallInterrupted
-                    }
-                    Err(error) => {
-                        tracing::error!(
-                            target: "lam_tui::runtime",
-                            event = "tui.call_failed",
-                            actor_id = "/root",
-                            "root call failed"
-                        );
-                        CommandResult::Call(Err(error.to_string()))
-                    }
-                },
+                Command::Message(input) => {
+                    let result = match root.send(input.clone(), DeliveryMode::Steer).await {
+                        Ok(receipt) => {
+                            tracing::debug!(
+                                target: "lam_tui::runtime",
+                                event = "tui.message_admitted",
+                                actor_id = "/root",
+                                message_id = %receipt.message_id,
+                                "user message durably admitted"
+                            );
+                            Ok(SentMessage {
+                                message_id: receipt.message_id.to_string(),
+                                text: input,
+                            })
+                        }
+                        Err(error) => Err(error.to_string()),
+                    };
+                    CommandResult::Message(result)
+                }
                 Command::Interrupt => {
                     let result = match root.interrupt().await {
-                        Ok(Some(receipt)) => {
-                            interrupted_tree(store.as_ref(), &history_models, &receipt)
-                                .await
-                                .map(Some)
-                        }
-                        Ok(None) => Ok(None),
+                        Ok(receipt) => Ok(receipt.is_some()),
                         Err(error) => Err(error.to_string()),
                     };
                     CommandResult::Interrupt(result)
@@ -615,93 +700,191 @@ fn historical_tool_call(address: &str, name: &str, arguments: String) -> History
     }
 }
 
-fn session_history(
+/// Renders one committed context entry into transcript rows. This is the
+/// single renderer for all transcript content: session restore and live
+/// folds both pass through it, so the two views agree by construction.
+fn render_context_entry(
     address: &str,
+    entry: &ContextEntry,
     state: &ActorState,
     models: &[ConfiguredModel],
 ) -> Vec<HistoryEntry> {
     let mut history = Vec::new();
-    for projected in state.context() {
-        let entry = &projected.entry;
-        match &entry.transition {
-            ContextTransition::Messages {
-                consumed_message_ids,
-                ..
-            }
-            | ContextTransition::Interrupted {
-                consumed_message_ids,
-                ..
-            } => {
-                for message_id in consumed_message_ids {
-                    let Some(message) = state.message(message_id) else {
-                        continue;
-                    };
-                    if matches!(message.envelope.source(), MessageSource::Host { .. })
-                        && let Some(entry) = runtime_notice(message.envelope.payload())
-                    {
-                        history.push(entry);
-                        continue;
-                    }
-                    let (kind, title) = match message.envelope.source() {
-                        MessageSource::User { .. } => (HistoryKind::User, "You".to_owned()),
-                        MessageSource::Host { component } => {
-                            (HistoryKind::System, component.as_str().to_owned())
-                        }
-                        MessageSource::Actor { actor_id } => {
-                            (HistoryKind::System, actor_id.as_str().to_owned())
-                        }
-                    };
-                    history.push(HistoryEntry {
-                        kind,
-                        title,
-                        body: display_json(&message.envelope.payload().value),
-                    });
+    match &entry.transition {
+        ContextTransition::Messages {
+            consumed_message_ids,
+            ..
+        }
+        | ContextTransition::Interrupted {
+            consumed_message_ids,
+            ..
+        } => {
+            for message_id in consumed_message_ids {
+                let Some(message) = state.message(message_id) else {
+                    continue;
+                };
+                if matches!(message.envelope.source(), MessageSource::Host { .. })
+                    && let Some(entry) = runtime_notice(message.envelope.payload())
+                {
+                    history.push(entry);
+                    continue;
                 }
-            }
-            ContextTransition::Model { .. } => {
-                let projection = models
-                    .iter()
-                    .find_map(|configured| configured.model.project_response(&entry.payload));
-                match projection {
-                    Some(projection) => {
-                        append_model_projection(&mut history, address, projection);
+                let (kind, title) = match message.envelope.source() {
+                    MessageSource::User { .. } => (HistoryKind::User, "You".to_owned()),
+                    MessageSource::Host { component } => {
+                        (HistoryKind::System, component.as_str().to_owned())
                     }
-                    None => history.push(HistoryEntry {
-                        kind: HistoryKind::System,
-                        title: "Historical model output".to_owned(),
-                        body: display_json(&entry.payload.value),
-                    }),
-                }
-            }
-            ContextTransition::Eval { .. } => history.push(HistoryEntry {
-                kind: HistoryKind::ToolResult,
-                title: format!("{address} · eval result"),
-                body: display_json(&entry.payload.value),
-            }),
-            ContextTransition::Compaction { .. } => {
-                let body = CompactionRecord::decode(&entry.payload)
-                    .ok()
-                    .flatten()
-                    .and_then(|record| record.artifact)
-                    .map_or_else(
-                        || display_json(&entry.payload.value),
-                        |artifact| artifact.summary,
-                    );
+                    MessageSource::Actor { actor_id } => {
+                        (HistoryKind::System, actor_id.as_str().to_owned())
+                    }
+                };
                 history.push(HistoryEntry {
-                    kind: HistoryKind::System,
-                    title: "Compact".to_owned(),
-                    body,
+                    kind,
+                    title,
+                    body: display_json(&message.envelope.payload().value),
                 });
             }
+        }
+        ContextTransition::Model { .. } => {
+            let projection = models
+                .iter()
+                .find_map(|configured| configured.model.project_response(&entry.payload));
+            match projection {
+                Some(projection) => {
+                    append_model_projection(&mut history, address, projection);
+                }
+                None => history.push(HistoryEntry {
+                    kind: HistoryKind::System,
+                    title: "Historical model output".to_owned(),
+                    body: display_json(&entry.payload.value),
+                }),
+            }
+        }
+        ContextTransition::Eval { .. } => history.push(HistoryEntry {
+            kind: HistoryKind::ToolResult,
+            title: format!("{address} · eval result"),
+            body: display_json(&entry.payload.value),
+        }),
+        ContextTransition::Compaction { .. } => {
+            let body = CompactionRecord::decode(&entry.payload)
+                .ok()
+                .flatten()
+                .and_then(|record| record.artifact)
+                .map_or_else(
+                    || display_json(&entry.payload.value),
+                    |artifact| artifact.summary,
+                );
+            history.push(HistoryEntry {
+                kind: HistoryKind::System,
+                title: "Compact".to_owned(),
+                body,
+            });
         }
     }
     history
 }
 
+const PROJECTOR_PAGE: NonZeroUsize = NonZeroUsize::new(256).expect("256 is nonzero");
+
+/// Folds every journal event past the projector's revision and renders the
+/// newly committed context entries in journal order.
+async fn fold_projector(
+    store: &RedbStore,
+    models: &[ConfiguredModel],
+    address: &str,
+    projector: &mut Projector,
+) -> Result<FoldOutcome, String> {
+    let mut outcome = FoldOutcome::default();
+    let mut state = projector.state.take().ok_or_else(|| {
+        format!("the transcript projector for {address} is poisoned by an earlier fold failure")
+    })?;
+    loop {
+        let page = match store
+            .read(&projector.actor_id, state.revision(), PROJECTOR_PAGE)
+            .await
+        {
+            Ok(page) => page,
+            Err(error) => {
+                projector.state = Some(state);
+                return Err(error.to_string());
+            }
+        };
+        let head = page.head;
+        if page.events.is_empty() {
+            break;
+        }
+        let entries =
+            page.events
+                .iter()
+                .filter_map(|stored| match stored.event.data() {
+                    ActorEventData::ContextAppended { entry } => Some(entry.clone()),
+                    ActorEventData::MessageAdmitted { .. }
+                    | ActorEventData::ModelSelected { .. } => None,
+                })
+                .collect::<Vec<_>>();
+        state = state.fold_page(page).map_err(|error| error.to_string())?;
+        for entry in &entries {
+            accumulate_entry(&mut outcome, address, entry, &state, models);
+        }
+        if state.revision() >= head {
+            break;
+        }
+    }
+    outcome.active_run = state.active_run().map(ToString::to_string);
+    outcome.interrupted = state.context().last().is_some_and(|entry| {
+        matches!(
+            entry.entry.transition,
+            ContextTransition::Interrupted { .. }
+        )
+    });
+    projector.state = Some(state);
+    Ok(outcome)
+}
+
+fn accumulate_entry(
+    outcome: &mut FoldOutcome,
+    address: &str,
+    entry: &ContextEntry,
+    state: &ActorState,
+    models: &[ConfiguredModel],
+) {
+    match &entry.transition {
+        ContextTransition::Model { run_id, progress } => {
+            outcome.model_turns.push(run_id.to_string());
+            if *progress == RunProgress::Complete {
+                outcome.dead_runs.push(run_id.to_string());
+            }
+        }
+        ContextTransition::Interrupted { run_id, .. } => {
+            outcome.dead_runs.push(run_id.to_string());
+        }
+        ContextTransition::Eval { .. }
+        | ContextTransition::Messages { .. }
+        | ContextTransition::Compaction { .. } => {}
+    }
+    for message_id in entry.transition.consumed_message_ids() {
+        outcome.consumed_message_ids.push(message_id.to_string());
+    }
+    let run_id = match &entry.transition {
+        ContextTransition::Model { run_id, .. } | ContextTransition::Eval { run_id } => {
+            Some(run_id.to_string())
+        }
+        ContextTransition::Messages { .. }
+        | ContextTransition::Interrupted { .. }
+        | ContextTransition::Compaction { .. } => None,
+    };
+    for row in render_context_entry(address, entry, state, models) {
+        outcome.rows.push(CommittedRow {
+            entry: row,
+            run_id: run_id.clone(),
+        });
+    }
+}
+
 fn agent_history(
     address: &str,
     state: &ActorState,
-    models: &[ConfiguredModel],
+    history: Vec<CommittedRow>,
     restored_child: bool,
 ) -> AgentHistory {
     let active = state.active_run().is_some();
@@ -732,59 +915,7 @@ fn agent_history(
             "Ready".to_owned()
         },
         run_completed: !active,
-        history: session_history(address, state, models),
-    }
-}
-
-async fn load_stored_actors(store: &RedbStore) -> Result<Vec<(ActorId, ActorState)>, String> {
-    let actor_ids = store.actor_ids().map_err(|error| error.to_string())?;
-    let mut actors = Vec::with_capacity(actor_ids.len());
-    for actor in actor_ids {
-        let state = load_actor_state(store, &actor).await?;
-        actors.push((actor, state));
-    }
-    Ok(actors)
-}
-
-async fn interrupted_tree(
-    store: &RedbStore,
-    models: &[ConfiguredModel],
-    receipt: &AgentTreeInterruptionReceipt,
-) -> Result<InterruptedTree, String> {
-    let mut agents = Vec::with_capacity(receipt.actors.len());
-    let mut runs = Vec::new();
-    for actor in &receipt.actors {
-        let actor_id = ActorId::new(actor.address.as_str()).map_err(|error| error.to_string())?;
-        let state = load_actor_state(store, &actor_id).await?;
-        agents.push(agent_history(
-            actor.address.as_str(),
-            &state,
-            models,
-            actor.address != receipt.root,
-        ));
-        if let Some(interruption) = &actor.interruption {
-            runs.push(InterruptedRun {
-                address: actor.address.to_string(),
-                run_id: interruption.run_id.to_string(),
-            });
-        }
-    }
-    Ok(InterruptedTree { agents, runs })
-}
-
-async fn load_actor_state(store: &RedbStore, actor: &ActorId) -> Result<ActorState, String> {
-    const PAGE_SIZE: NonZeroUsize = NonZeroUsize::new(256).expect("256 is nonzero");
-    let mut state = ActorState::new();
-    loop {
-        let page = store
-            .read(actor, state.revision(), PAGE_SIZE)
-            .await
-            .map_err(|error| error.to_string())?;
-        let head = page.head;
-        state = state.fold_page(page).map_err(|error| error.to_string())?;
-        if state.revision() == head {
-            return Ok(state);
-        }
+        history,
     }
 }
 
@@ -994,20 +1125,147 @@ mod tests {
     use std::path::Path;
 
     use lam::{
-        ActorEvent, ActorId, AppendOutcome, CodecId, CodecRef, DeliveryMode, EncodedPayload,
-        EventBatch, InterruptionReason, IsolateState, JournalStore, MessageEnvelope, MessageId,
-        MessageSource, ModelDelta, ModelDirective, ModelResponseProjection, Revision, RunId,
+        ActorEvent, ActorId, ActorState, AppendOutcome, CodecId, CodecRef, ContextEntry,
+        ContextTransition, DeliveryMode, EncodedPayload, EventBatch, InterruptionReason,
+        IsolateState, JournalStore, MessageEnvelope, MessageId, MessageSource, ModelDelta,
+        ModelDirective, ModelResponseProjection, Revision, RunId, RunProgress,
         SYSTEM_NOTICE_CODEC_ID, SYSTEM_NOTICE_CODEC_VERSION, SystemNotice, Timestamp,
     };
     use lam_redb::RedbStore;
     use serde_json::json;
 
     use super::{
-        EffortControl, HistoryKind, append_model_projection, coding_instruction,
-        first_user_message, insert_json_path, runtime_notice,
+        EffortControl, HistoryKind, Projector, append_model_projection, coding_instruction,
+        first_user_message, fold_projector, insert_json_path, runtime_notice,
     };
     use crate::config::ModelChoice;
     use crate::session::Session;
+
+    fn context_entry(transition: ContextTransition) -> ActorEvent {
+        ActorEvent::context_appended(ContextEntry {
+            transition,
+            payload: EncodedPayload::lam_json(json!("payload")).unwrap(),
+            recorded_at: Timestamp::from_unix_millis(1),
+        })
+    }
+
+    fn user_message(id: &str, text: &str) -> ActorEvent {
+        ActorEvent::message_admitted(
+            MessageEnvelope::new(
+                MessageId::new(id).unwrap(),
+                MessageSource::User { principal: None },
+                DeliveryMode::Steer,
+                EncodedPayload::lam_json(json!(text)).unwrap(),
+                Timestamp::from_unix_millis(1),
+            )
+            .unwrap(),
+        )
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn projector_folds_incrementally_and_renders_journal_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = RedbStore::create(directory.path().join("session.redb")).unwrap();
+        let actor = ActorId::new("/root").unwrap();
+        let run = RunId::new("run-1").unwrap();
+
+        let appended = store
+            .append(
+                &actor,
+                Revision::ZERO,
+                EventBatch::new(
+                    user_message("m-1", "start the task"),
+                    vec![
+                        context_entry(ContextTransition::Messages {
+                            run_id: run.clone(),
+                            consumed_message_ids: vec![MessageId::new("m-1").unwrap()],
+                        }),
+                        context_entry(ContextTransition::Model {
+                            run_id: run.clone(),
+                            progress: RunProgress::Continue,
+                        }),
+                        context_entry(ContextTransition::Eval {
+                            run_id: run.clone(),
+                        }),
+                    ],
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(appended, AppendOutcome::Appended { .. }));
+
+        let mut projector = Projector {
+            actor_id: actor.clone(),
+            state: Some(ActorState::new()),
+        };
+        let outcome = fold_projector(&store, &[], "/root", &mut projector)
+            .await
+            .unwrap();
+        let kinds = outcome
+            .rows
+            .iter()
+            .map(|row| row.entry.kind)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            [
+                HistoryKind::User,
+                HistoryKind::System,
+                HistoryKind::ToolResult
+            ]
+        );
+        assert_eq!(outcome.rows[0].entry.body, "start the task");
+        assert_eq!(outcome.rows[2].run_id.as_deref(), Some("run-1"));
+        assert_eq!(outcome.consumed_message_ids, ["m-1"]);
+        assert_eq!(outcome.active_run.as_deref(), Some("run-1"));
+        assert_eq!(outcome.model_turns, ["run-1"]);
+        assert!(outcome.dead_runs.is_empty());
+        assert!(!outcome.interrupted);
+
+        let appended = store
+            .append(
+                &actor,
+                Revision::new(4),
+                EventBatch::new(
+                    user_message("m-2", "also do this"),
+                    vec![
+                        context_entry(ContextTransition::Messages {
+                            run_id: run.clone(),
+                            consumed_message_ids: vec![MessageId::new("m-2").unwrap()],
+                        }),
+                        context_entry(ContextTransition::Model {
+                            run_id: run.clone(),
+                            progress: RunProgress::Complete,
+                        }),
+                    ],
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(appended, AppendOutcome::Appended { .. }));
+
+        // The second fold returns only the newly committed rows.
+        let outcome = fold_projector(&store, &[], "/root", &mut projector)
+            .await
+            .unwrap();
+        let kinds = outcome
+            .rows
+            .iter()
+            .map(|row| row.entry.kind)
+            .collect::<Vec<_>>();
+        assert_eq!(kinds, [HistoryKind::User, HistoryKind::System]);
+        assert_eq!(outcome.rows[0].entry.body, "also do this");
+        assert_eq!(outcome.consumed_message_ids, ["m-2"]);
+        assert_eq!(outcome.active_run, None);
+        assert_eq!(outcome.dead_runs, ["run-1"]);
+
+        // A fold with nothing new commits nothing.
+        let outcome = fold_projector(&store, &[], "/root", &mut projector)
+            .await
+            .unwrap();
+        assert!(outcome.rows.is_empty());
+        assert!(outcome.consumed_message_ids.is_empty());
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn session_preview_reads_the_first_user_message() {

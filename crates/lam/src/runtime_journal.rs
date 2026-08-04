@@ -19,13 +19,29 @@ pub(crate) async fn load_state<S>(store: &S, actor_id: &ActorId) -> Result<Actor
 where
     S: JournalStore,
 {
-    let mut state = ActorState::new();
+    refresh_state(store, actor_id, ActorState::new()).await
+}
+
+/// Folds any journal events past the state's revision. Unlike [`load_state`],
+/// this never replays from revision zero, so it is cheap enough to call at
+/// every delivery boundary.
+pub(crate) async fn refresh_state<S>(
+    store: &S,
+    actor_id: &ActorId,
+    mut state: ActorState,
+) -> Result<ActorState, ActorError>
+where
+    S: JournalStore,
+{
     loop {
         let page = store
             .read(actor_id, state.revision(), JOURNAL_PAGE_SIZE)
             .await
             .map_err(journal_error)?;
         let head = page.head;
+        if page.events.is_empty() {
+            return Ok(state);
+        }
         state = state.fold_page(page).map_err(state_error)?;
         if state.revision() == head {
             return Ok(state);

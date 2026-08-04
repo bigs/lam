@@ -20,6 +20,8 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use lam::RunEvent;
+use lam_agents::{AgentOutcome, AgentSystemEvent};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use thiserror::Error;
@@ -30,6 +32,14 @@ use crate::config::LoadedConfig;
 use crate::diagnostics::DiagnosticLog;
 use crate::runtime::{Command, CommandResult, Runtime, RuntimePreferences};
 use crate::session::{Session, SessionCatalog};
+
+/// Minimum interval between frames (~60fps). Rendering is decoupled from
+/// event arrival: all queued events are applied between frames.
+const FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
+
+/// Bound on events applied between frames so a runaway producer cannot
+/// starve rendering entirely.
+const MAX_EVENTS_PER_FRAME: usize = 1024;
 
 fn main() -> ExitCode {
     match tokio_main() {
@@ -99,113 +109,184 @@ async fn tokio_main() -> Result<(), AppError> {
     let (command_results, mut command_receiver) = mpsc::unbounded_channel::<CommandResult>();
 
     let mut redraw = true;
-    while !app.should_exit {
-        if redraw {
+    let mut next_frame = tokio::time::Instant::now();
+    'main: while !app.should_exit {
+        if redraw && tokio::time::Instant::now() >= next_frame {
             terminal
                 .terminal
                 .draw(|frame| ui::render(frame, &mut app))
                 .map_err(AppError::Terminal)?;
             redraw = false;
+            next_frame = tokio::time::Instant::now() + FRAME_INTERVAL;
         }
         let interruption_deadline = app.interruption_deadline();
-        tokio::select! {
+        // Resolve the select into a plain value first so the handlers below
+        // can borrow both `app` and `runtime` freely — in particular to fold
+        // the journal projectors, which need `&mut runtime`.
+        let mut tick = tokio::select! {
             terminal_event = terminal_receiver.recv() => {
-                let Some(terminal_event) = terminal_event else {
-                    break;
-                };
-                match terminal_event.map_err(AppError::Terminal)? {
-                    Event::Key(key) => {
-                        if let Some(command) = app.handle_key(key) {
-                            match command {
-                                session_command @ (Command::New | Command::LoadSession(_)) => {
-                                    let preferences = matches!(session_command, Command::New)
-                                        .then(|| app.runtime_preferences());
-                                    let claimed = match session_command {
-                                        Command::New => sessions
-                                            .create(&cwd)
-                                            .map(|(session, lease)| (session, lease, false)),
-                                        Command::LoadSession(id) => sessions
-                                            .select(id, &cwd)
-                                            .map(|(session, lease)| (session, lease, true)),
-                                        _ => unreachable!("session commands were matched above"),
-                                    };
-                                    let (session, next_lease, resumed) = match claimed {
-                                        Ok(claimed) => claimed,
-                                        Err(error) => {
-                                            app.session_change_failed(error.to_string());
-                                            redraw = true;
-                                            continue;
-                                        }
-                                    };
-                                    let choices = reconcile_session_choices(
-                                        &sessions,
-                                        &cwd,
-                                        &app.sessions,
-                                        (!resumed).then_some(session.id),
-                                    ).await?;
-                                    terminal
-                                        .terminal
-                                        .draw(|frame| ui::render(frame, &mut app))
-                                        .map_err(AppError::Terminal)?;
-                                    runtime
-                                        .system
-                                        .shutdown()
-                                        .await
-                                        .map_err(|error| AppError::Shutdown(error.to_string()))?;
-                                    drop(runtime);
-                                    drop(session_lease);
-                                    session_lease = next_lease;
-                                    if let Some(diagnostics) = &diagnostics {
-                                        diagnostics
-                                            .activate(&session)
-                                            .map_err(AppError::Diagnostics)?;
-                                    }
-                                    (runtime, app) = open_session(
-                                        &config,
-                                        &cwd,
-                                        session,
-                                        resumed,
-                                        &config_path,
-                                        choices,
-                                        preferences.as_ref(),
-                                    )
-                                    .await?;
-                                }
-                                Command::RefreshSessions => {
-                                    match reconcile_session_choices(
-                                        &sessions,
-                                        &cwd,
-                                        &app.sessions,
-                                        None,
-                                    ).await {
-                                        Ok(choices) => app.replace_sessions(choices),
-                                        Err(error) => app.session_change_failed(error.to_string()),
-                                    }
-                                }
-                                command => runtime.execute(command, command_results.clone()),
-                            }
-                        }
-                    }
-                    Event::Mouse(mouse) => app.handle_mouse(mouse),
-                    Event::Paste(text) => app.handle_paste(&text),
-                    Event::Resize(_, _) | Event::FocusGained | Event::FocusLost => {}
+                match terminal_event {
+                    Some(terminal_event) => Tick::Terminal(terminal_event),
+                    None => break,
                 }
-                redraw = true;
             }
             event = runtime.events.next() => {
-                if let Some(event) = event {
-                    redraw |= app.apply_agent_event(event);
+                match event {
+                    Some(event) => Tick::Agent(event),
+                    None => Tick::Idle,
                 }
             }
             result = command_receiver.recv() => {
-                if let Some(result) = result {
-                    app.apply_command_result(result);
-                    redraw = true;
+                match result {
+                    Some(result) => Tick::Command(result),
+                    None => Tick::Idle,
                 }
             }
-            () = wait_for_interruption_deadline(interruption_deadline), if interruption_deadline.is_some() => {
-                redraw |= app.expire_interruption(std::time::Instant::now());
+            () = wait_for_interruption_deadline(interruption_deadline), if interruption_deadline.is_some() => Tick::Deadline,
+            () = tokio::time::sleep_until(next_frame), if redraw => Tick::Frame,
+        };
+        // Apply the awaited event plus everything else already queued, then
+        // draw once: a burst costs one frame instead of one frame per event.
+        for _ in 0..MAX_EVENTS_PER_FRAME {
+            match tick {
+                Tick::Terminal(terminal_event) => {
+                    match terminal_event.map_err(AppError::Terminal)? {
+                        Event::Key(key) => {
+                            if let Some(command) = app.handle_key(key) {
+                                match command {
+                                    session_command @ (Command::New | Command::LoadSession(_)) => {
+                                        let preferences = matches!(session_command, Command::New)
+                                            .then(|| app.runtime_preferences());
+                                        let claimed = match session_command {
+                                            Command::New => sessions
+                                                .create(&cwd)
+                                                .map(|(session, lease)| (session, lease, false)),
+                                            Command::LoadSession(id) => sessions
+                                                .select(id, &cwd)
+                                                .map(|(session, lease)| (session, lease, true)),
+                                            _ => {
+                                                unreachable!("session commands were matched above")
+                                            }
+                                        };
+                                        let (session, next_lease, resumed) = match claimed {
+                                            Ok(claimed) => claimed,
+                                            Err(error) => {
+                                                app.session_change_failed(error.to_string());
+                                                redraw = true;
+                                                continue 'main;
+                                            }
+                                        };
+                                        let choices = reconcile_session_choices(
+                                            &sessions,
+                                            &cwd,
+                                            &app.sessions,
+                                            (!resumed).then_some(session.id),
+                                        )
+                                        .await?;
+                                        terminal
+                                            .terminal
+                                            .draw(|frame| ui::render(frame, &mut app))
+                                            .map_err(AppError::Terminal)?;
+                                        runtime.system.shutdown().await.map_err(|error| {
+                                            AppError::Shutdown(error.to_string())
+                                        })?;
+                                        drop(runtime);
+                                        drop(session_lease);
+                                        session_lease = next_lease;
+                                        if let Some(diagnostics) = &diagnostics {
+                                            diagnostics
+                                                .activate(&session)
+                                                .map_err(AppError::Diagnostics)?;
+                                        }
+                                        (runtime, app) = open_session(
+                                            &config,
+                                            &cwd,
+                                            session,
+                                            resumed,
+                                            &config_path,
+                                            choices,
+                                            preferences.as_ref(),
+                                        )
+                                        .await?;
+                                        // The runtime and app were replaced; do
+                                        // not keep draining against them.
+                                        redraw = true;
+                                        continue 'main;
+                                    }
+                                    Command::RefreshSessions => {
+                                        match reconcile_session_choices(
+                                            &sessions,
+                                            &cwd,
+                                            &app.sessions,
+                                            None,
+                                        )
+                                        .await
+                                        {
+                                            Ok(choices) => app.replace_sessions(choices),
+                                            Err(error) => {
+                                                app.session_change_failed(error.to_string())
+                                            }
+                                        }
+                                    }
+                                    command => runtime.execute(command, command_results.clone()),
+                                }
+                            }
+                        }
+                        Event::Mouse(mouse) => app.handle_mouse(mouse),
+                        Event::Paste(text) => app.handle_paste(&text),
+                        Event::Resize(_, _) | Event::FocusGained | Event::FocusLost => {}
+                    }
+                    redraw = true;
+                }
+                Tick::Agent(event) => {
+                    // Fold the owning actor's journal before applying the event:
+                    // committed rows always render from the journal, in journal
+                    // order, and the event itself carries only streaming deltas
+                    // and status.
+                    if let Some(address) = fold_address(&event) {
+                        redraw |= fold_and_apply(&mut runtime, &mut app, &address).await;
+                    }
+                    redraw |= app.apply_agent_event(event);
+                }
+                Tick::Command(result) => {
+                    match result {
+                        CommandResult::Message(Ok(sent)) => {
+                            // Fold first: if the delivery already committed, the
+                            // row is rendered and the receipt registers nothing.
+                            fold_and_apply(&mut runtime, &mut app, "/root").await;
+                            let consumed = runtime.is_consumed("/root", &sent.message_id);
+                            app.apply_message_receipt(sent, consumed);
+                        }
+                        CommandResult::Message(Err(error)) => app.apply_message_error(error),
+                        CommandResult::Interrupt(result) => {
+                            for address in runtime.projected_addresses() {
+                                fold_and_apply(&mut runtime, &mut app, &address).await;
+                            }
+                            app.apply_interrupt_result(result);
+                        }
+                        other => app.apply_command_result(other),
+                    }
+                    redraw = true;
+                }
+                Tick::Deadline => {
+                    redraw |= app.expire_interruption(std::time::Instant::now());
+                }
+                Tick::Frame | Tick::Idle => {}
             }
+            if app.should_exit {
+                break;
+            }
+            // Refill from whatever is already queued, input first so
+            // interaction stays ordered ahead of streaming noise.
+            tick = if let Ok(terminal_event) = terminal_receiver.try_recv() {
+                Tick::Terminal(terminal_event)
+            } else if let Some(event) = runtime.events.try_next() {
+                Tick::Agent(event)
+            } else if let Ok(result) = command_receiver.try_recv() {
+                Tick::Command(result)
+            } else {
+                break;
+            };
         }
     }
 
@@ -221,6 +302,50 @@ async fn tokio_main() -> Result<(), AppError> {
 async fn wait_for_interruption_deadline(deadline: Option<std::time::Instant>) {
     if let Some(deadline) = deadline {
         tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+    }
+}
+
+enum Tick {
+    Terminal(io::Result<Event>),
+    Agent(AgentSystemEvent),
+    Command(CommandResult),
+    Deadline,
+    /// A throttled redraw came due; the frame renders at the top of the loop.
+    Frame,
+    Idle,
+}
+
+/// Which actor's journal to fold before applying the event. Streaming deltas
+/// commit nothing, so they skip the fold; every other event marks a point
+/// where the journal may have advanced.
+fn fold_address(event: &AgentSystemEvent) -> Option<String> {
+    match event {
+        AgentSystemEvent::Run {
+            event: RunEvent::ModelDelta { .. },
+            ..
+        } => None,
+        AgentSystemEvent::Run { address, .. }
+        | AgentSystemEvent::Hosted { address, .. }
+        | AgentSystemEvent::Retired { address, .. }
+        | AgentSystemEvent::ActorRuntime { address, .. } => Some(address.to_string()),
+        AgentSystemEvent::Outcome { outcome } => Some(
+            match outcome {
+                AgentOutcome::Completed { address, .. }
+                | AgentOutcome::Failed { address, .. }
+                | AgentOutcome::Cancelled { address, .. } => address,
+            }
+            .to_string(),
+        ),
+    }
+}
+
+async fn fold_and_apply(runtime: &mut Runtime, app: &mut App, address: &str) -> bool {
+    match runtime.fold(address).await {
+        Ok(outcome) => app.apply_fold(address, outcome),
+        Err(error) => {
+            app.fold_failed(address, error);
+            true
+        }
     }
 }
 
@@ -408,7 +533,7 @@ impl Drop for TerminalSession {
 
 fn print_help() {
     println!(
-        "lam-agent — a minimal TypeScript coding agent\n\nUSAGE:\n    lam-agent [--config PATH] [--debug-log]\n\nOPTIONS:\n    --config PATH  Read providers from PATH instead of ~/.lam/providers.toml\n    --debug-log    Append metadata-only diagnostics beside the session journal\n    -h, --help     Show this help\n    -V, --version  Show the version\n\nLam resumes the latest durable session for the current directory. Inside the TUI,\ntype / for commands, including /new for a fresh session and /session to restore\nan earlier one. Tab switches focus between the input shelf and conversation;\narrows select transcript rows; Enter expands the selected row. While the root is\nworking, press Escape twice within 1.5 seconds to stop its complete agent tree."
+        "lam-agent — a minimal TypeScript coding agent\n\nUSAGE:\n    lam-agent [--config PATH] [--debug-log]\n\nOPTIONS:\n    --config PATH  Read providers from PATH instead of ~/.lam/providers.toml\n    --debug-log    Append metadata-only diagnostics beside the session journal\n    -h, --help     Show this help\n    -V, --version  Show the version\n\nLam resumes the latest durable session for the current directory. Inside the TUI,\ntype / for commands, including /new for a fresh session and /session to restore\nan earlier one. Tab switches focus between the input shelf and conversation;\narrows select transcript rows; Enter expands the selected row. While the root is\nworking, a submitted message is queued above the input as a pending steer and is delivered at the next model boundary. Press Escape twice within 1.5 seconds to stop its complete agent tree."
     );
 }
 

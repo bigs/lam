@@ -10,11 +10,11 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::config::ModelChoice;
 use crate::runtime::{
-    AgentHistory, Command, CommandResult, CompletedCall, HistoryEntry, HistoryKind,
-    InterruptedTree, RuntimePreferences,
+    AgentHistory, Command, CommandResult, CommittedRow, FoldOutcome, HistoryKind,
+    RuntimePreferences, SentMessage,
 };
 
-const MOUSE_SCROLL_LINES: usize = 3;
+const MOUSE_SCROLL_LINES: usize = 2;
 const INTERRUPTION_ARM_WINDOW: Duration = Duration::from_millis(1_500);
 const INTERRUPTION_WARNING: &str = "Press Esc again to stop the current run";
 
@@ -49,6 +49,37 @@ pub(crate) struct ConversationEntry {
     tool_run: Option<String>,
     tool_index: Option<usize>,
     tool_name: String,
+    /// Which streaming turn produced this overlay row. `None` for committed
+    /// rows. A committed model turn replaces the oldest overlay turn of its
+    /// run, so segmentation must survive fold lag.
+    overlay_turn: Option<u64>,
+    /// Cached visual layout, rebuilt only when [`LayoutKey`] changes. Bodies
+    /// and titles are append-only, so their lengths are sound dirty signals.
+    pub(crate) layout: Option<EntryLayout>,
+}
+
+/// One row's laid-out lines, valid while its key matches the row's state.
+#[derive(Clone, Debug)]
+pub(crate) struct EntryLayout {
+    pub(crate) key: LayoutKey,
+    pub(crate) lines: Vec<ratatui::text::Line<'static>>,
+}
+
+/// Everything the visual layout of a row depends on.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LayoutKey {
+    pub(crate) width: usize,
+    pub(crate) expanded: bool,
+    pub(crate) selected: bool,
+    pub(crate) dimmed: bool,
+    pub(crate) title_len: usize,
+    pub(crate) body_len: usize,
+}
+
+impl ConversationEntry {
+    fn run_id(&self) -> Option<&str> {
+        self.model_run.as_deref().or(self.tool_run.as_deref())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -57,6 +88,15 @@ pub(crate) struct Suggestion {
     pub(crate) detail: String,
     pub(crate) replacement: String,
     pub(crate) provider: Option<String>,
+}
+
+/// One user message admitted as a durable steer of the active root run.
+#[derive(Clone, Debug)]
+pub(crate) struct PendingSteer {
+    /// Durable identity used to match the message against delivery events.
+    pub(crate) message_id: String,
+    /// The user's message text.
+    pub(crate) text: String,
 }
 
 pub(crate) struct SessionView {
@@ -115,16 +155,27 @@ pub(crate) struct App {
     pub(crate) should_exit: bool,
     pub(crate) hitboxes: Vec<(u16, u16, usize)>,
     pub(crate) current_agent: String,
+    /// Durably admitted user messages not yet consumed into model-visible
+    /// context, shown above the input bar until the runner delivers them at
+    /// a model boundary.
+    pub(crate) pending_steers: Vec<PendingSteer>,
     input_history: Option<InputHistory>,
     current_parent: Option<String>,
     current_model: Option<String>,
     inactive_agents: BTreeMap<String, AgentConversation>,
-    output_fallback: Option<OutputFallback>,
-    root_run_completed: bool,
-    completed_run_id: Option<String>,
-    ignored_run_ids: BTreeSet<String>,
+    /// Boundary between pinned rows (committed journal rows and local system
+    /// rows, in arrival order) and the streaming overlay at the tail.
+    committed_len: usize,
+    /// Counts streaming turns for the current agent; overlay rows are tagged
+    /// with the turn that produced them.
+    overlay_turn: u64,
+    /// Runs that reached a terminal, failed, or interrupted entry. Late
+    /// streaming events for these runs are stale and are ignored.
+    dead_runs: BTreeSet<String>,
     root_run_active: bool,
-    call_in_progress: bool,
+    /// A blocking command (compact, model switch, session change) awaits its
+    /// result. Messages are never blocking; they queue as steers.
+    command_in_flight: bool,
     interruption_deadline: Option<Instant>,
     interruption_in_progress: bool,
 }
@@ -138,16 +189,9 @@ struct AgentConversation {
     status: String,
     parent: Option<String>,
     model: Option<String>,
-    output_fallback: Option<OutputFallback>,
-    run_completed: bool,
-    completed_run_id: Option<String>,
-    ignored_run_ids: BTreeSet<String>,
-}
-
-struct OutputFallback {
-    entry_index: usize,
-    output: String,
-    streamed: String,
+    committed_len: usize,
+    overlay_turn: u64,
+    dead_runs: BTreeSet<String>,
 }
 
 impl App {
@@ -181,21 +225,13 @@ impl App {
             });
         let root = agents.remove(root_index);
         let root_run_active = !root.run_completed;
-        let mut entries = history_entries(root.history);
-        entries.push(ConversationEntry {
-            kind: EntryKind::System,
-            title: "Ready".to_owned(),
-            body: ready_message,
-            expanded: false,
-            pending_tool: false,
-            streaming: false,
-            model_owner: None,
-            model_run: None,
-            tool_owner: None,
-            tool_run: None,
-            tool_index: None,
-            tool_name: String::new(),
-        });
+        let mut entries = conversation_from_rows(root.history);
+        entries.push(pinned_entry(
+            EntryKind::System,
+            "Ready".to_owned(),
+            ready_message,
+        ));
+        let committed_len = entries.len();
         let selected_entry = entries.len().checked_sub(1);
         let mut selected_efforts = models
             .iter()
@@ -237,16 +273,16 @@ impl App {
             should_exit: false,
             hitboxes: Vec::new(),
             current_agent: root.address,
+            pending_steers: Vec::new(),
             input_history: None,
             current_parent: root.parent,
             current_model: root.model,
             inactive_agents,
-            output_fallback: None,
-            root_run_completed: root.run_completed,
-            completed_run_id: None,
-            ignored_run_ids: BTreeSet::new(),
+            committed_len,
+            overlay_turn: 0,
+            dead_runs: BTreeSet::new(),
             root_run_active,
-            call_in_progress: false,
+            command_in_flight: false,
             interruption_deadline: None,
             interruption_in_progress: false,
         }
@@ -293,7 +329,7 @@ impl App {
     }
 
     pub(crate) fn session_change_failed(&mut self, error: impl Into<String>) {
-        self.busy = false;
+        self.finish_command();
         self.push_error("Session change failed", error.into());
     }
 
@@ -628,8 +664,32 @@ impl App {
             }
             return None;
         }
+        if !input.starts_with('/') {
+            // A plain message is never blocking: it is durably admitted as a
+            // steer, delivered at the next model boundary if a run is active,
+            // and starts a new run otherwise. Its row renders when the
+            // journal commits the delivery.
+            if self.interruption_in_progress {
+                self.status = "Wait for the interruption to finish".to_owned();
+                return None;
+            }
+            self.input = InputBuffer::default();
+            self.input_history = None;
+            self.suggestion_index = 0;
+            if let Some(session) = self
+                .sessions
+                .iter_mut()
+                .find(|session| session.id == self.session_id && session.preview.is_none())
+            {
+                session.preview = Some(input.clone());
+            }
+            self.with_agent("/root", |app| {
+                app.status = "Sending…".to_owned();
+            });
+            return Some(Command::Message(input));
+        }
         if self.busy {
-            self.status = "Wait for the current root operation to finish".to_owned();
+            self.status = "Wait for the current operation to finish".to_owned();
             return None;
         }
         self.input = InputBuffer::default();
@@ -638,13 +698,11 @@ impl App {
         self.switch_agent("/root");
         match input.as_str() {
             "/compact" => {
-                self.busy = true;
-                self.status = "Compacting context…".to_owned();
+                self.begin_command("Compacting context…");
                 Some(Command::Compact)
             }
             "/new" => {
-                self.busy = true;
-                self.status = "Starting a new session…".to_owned();
+                self.begin_command("Starting a new session…");
                 Some(Command::New)
             }
             "/model" => {
@@ -682,8 +740,7 @@ impl App {
                     self.status = format!("Already using session #{id}");
                     return None;
                 }
-                self.busy = true;
-                self.status = format!("Loading session #{id}…");
+                self.begin_command(format!("Loading session #{id}…"));
                 Some(Command::LoadSession(id))
             }
             _ if input.starts_with("/effort ") => {
@@ -707,8 +764,7 @@ impl App {
                     self.status = format!("Already using {effort} reasoning effort");
                     return None;
                 }
-                self.busy = true;
-                self.status = format!("Switching reasoning effort to {effort}…");
+                self.begin_command(format!("Switching reasoning effort to {effort}…"));
                 Some(Command::SetEffort {
                     index: model_index,
                     effort: effort.to_owned(),
@@ -728,38 +784,38 @@ impl App {
                     self.status = format!("Already using {}", self.models[index].display_name);
                     return None;
                 }
-                self.busy = true;
-                self.status = format!("Switching to {}…", self.models[index].display_name);
+                self.begin_command(format!("Switching to {}…", self.models[index].display_name));
                 Some(Command::SwitchModel {
                     index,
                     registry_id: self.models[index].registry_id.clone(),
                 })
             }
-            _ if input.starts_with('/') => {
+            _ => {
                 self.push_error(
                     "Unknown command",
                     format!("`{input}` is not a Lam command."),
                 );
                 None
             }
-            _ => {
-                self.output_fallback = None;
-                self.root_run_completed = false;
-                self.completed_run_id = None;
-                if let Some(session) = self
-                    .sessions
-                    .iter_mut()
-                    .find(|session| session.id == self.session_id && session.preview.is_none())
-                {
-                    session.preview = Some(input.clone());
-                }
-                self.push_expanded_entry(EntryKind::User, "You", input.clone());
-                self.busy = true;
-                self.call_in_progress = true;
-                self.status = "Thinking…".to_owned();
-                Some(Command::Call(input))
-            }
         }
+    }
+
+    fn begin_command(&mut self, status: impl Into<String>) {
+        self.command_in_flight = true;
+        self.status = status.into();
+        self.recompute_busy();
+    }
+
+    fn finish_command(&mut self) {
+        self.command_in_flight = false;
+        self.recompute_busy();
+    }
+
+    /// `busy` gates blocking commands and drives the "working" title. It is
+    /// event-driven but corrected by every journal fold, so a dropped event
+    /// can only leave it stale until the next fold.
+    fn recompute_busy(&mut self) {
+        self.busy = self.command_in_flight || self.root_run_active || self.interruption_in_progress;
     }
 
     fn apply_suggestion(&mut self, suggestions: &[Suggestion]) {
@@ -899,147 +955,70 @@ impl App {
     }
 
     fn apply_run_event(&mut self, address: &str, event: RunEvent) {
-        if run_event_id(&event).is_some_and(|run_id| self.ignored_run_ids.contains(run_id.as_str()))
+        if is_streaming_event(&event)
+            && run_event_id(&event).is_some_and(|run_id| self.dead_runs.contains(run_id.as_str()))
         {
             return;
         }
         match event {
-            RunEvent::Started { run_id } => {
-                if self.is_completed_run(&run_id) {
-                    return;
-                }
-                self.output_fallback = None;
-                self.root_run_completed = false;
-                self.completed_run_id = None;
+            RunEvent::Started { .. } => {
                 self.status = format!("{address} is working…");
                 if address == "/root" {
                     self.root_run_active = true;
-                    self.busy = true;
+                    self.recompute_busy();
                     self.disarm_interruption();
                 }
             }
-            RunEvent::MessagesDelivered { run_id, .. } => {
-                if !self.is_completed_run(&run_id) {
-                    self.status = format!("{address} is working…");
-                }
+            RunEvent::MessagesDelivered { .. } => {
+                // The delivered rows render from the journal fold that
+                // preceded this event; only the status is event-driven.
+                self.status = format!("{address} is working…");
             }
-            RunEvent::ModelStarted { run_id } => {
-                if !self.is_completed_run(&run_id) {
-                    self.status = format!("{address} is thinking…");
-                }
+            RunEvent::ModelStarted { .. } => {
+                self.overlay_turn += 1;
+                self.status = format!("{address} is thinking…");
             }
             RunEvent::ModelDelta { run_id, delta } => match delta {
                 ModelDelta::Text(text) if text.is_empty() => {}
                 ModelDelta::Text(text) => {
-                    if !self.is_completed_run(&run_id) {
-                        self.append_delta(EntryKind::Assistant, address, &run_id, text);
-                        self.status = format!("{address} is responding…");
-                    }
+                    self.append_delta(EntryKind::Assistant, address, &run_id, text);
+                    self.status = format!("{address} is responding…");
                 }
                 ModelDelta::Reasoning(text) if text.is_empty() => {}
                 ModelDelta::Reasoning(text) => {
                     self.append_delta(EntryKind::Reasoning, address, &run_id, text);
-                    if !self.is_completed_run(&run_id) {
-                        self.status = format!("{address} is reasoning…");
-                    }
+                    self.status = format!("{address} is reasoning…");
                 }
                 ModelDelta::ToolCall(delta) => {
                     self.append_tool_delta(address, &run_id, delta);
-                    if !self.is_completed_run(&run_id) {
-                        self.status = format!("{address} is preparing a tool call…");
-                    }
+                    self.status = format!("{address} is preparing a tool call…");
                 }
             },
             RunEvent::ModelCompleted { .. } => {}
-            RunEvent::EvalStarted {
-                run_id, request, ..
-            } => {
-                let body = eval_request_body(&request);
-                let title = format!("{address} · {}", request.intent);
-                if let Some(index) = self.pending_tool_index(address, &run_id) {
-                    self.clear_streaming(&run_id);
-                    let entry = &mut self.entries[index];
-                    entry.streaming = true;
-                    entry.tool_name = "eval".to_owned();
-                    entry.title = title;
-                    entry.body = body;
-                } else {
-                    self.push_entry(EntryKind::ToolCall, title, body);
-                    if let Some(entry) = self.entries.last_mut() {
-                        entry.pending_tool = true;
-                        entry.tool_owner = Some(address.to_owned());
-                        entry.tool_run = Some(run_id.to_string());
-                        entry.tool_name = "eval".to_owned();
-                    }
-                    self.mark_last_streaming(&run_id);
-                }
-                if !self.is_completed_run(&run_id) {
-                    self.status = format!("{address} is evaluating TypeScript…");
-                }
+            RunEvent::EvalStarted { .. } => {
+                // The model turn that requested this eval committed before
+                // the event was emitted, so the fold that preceded this event
+                // already rendered the committed tool-call row.
+                self.status = format!("{address} is evaluating TypeScript…");
             }
-            RunEvent::EvalCompleted {
-                run_id, outcome, ..
-            } => {
-                let result = serde_json::to_string_pretty(&outcome)
-                    .unwrap_or_else(|_| format!("{outcome:?}"));
-                let tool_name = if let Some(entry) = self.pending_tool_mut(address, &run_id) {
-                    entry.pending_tool = false;
-                    entry.tool_name.clone()
-                } else {
-                    "eval".to_owned()
-                };
-                self.push_entry(
-                    EntryKind::ToolResult,
-                    format!("{address} · {tool_name} result"),
-                    result,
-                );
-                if let Some(entry) = self.entries.last_mut() {
-                    entry.tool_owner = Some(address.to_owned());
-                    entry.tool_run = Some(run_id.to_string());
-                }
-                self.mark_last_streaming(&run_id);
-                if !self.is_completed_run(&run_id) {
-                    self.status = format!("{address} finished eval");
-                }
+            RunEvent::EvalCompleted { .. } => {
+                // The durable eval outcome commits before this event is
+                // emitted, so the fold that preceded it has already rendered
+                // the committed result row.
+                self.status = format!("{address} finished eval");
             }
-            RunEvent::CompactionStarted { run_id, .. } => {
-                if !self.is_completed_run(&run_id) {
-                    self.status = format!("{address} is compacting context…");
-                }
+            RunEvent::CompactionStarted { .. } => {
+                self.status = format!("{address} is compacting context…");
             }
-            RunEvent::CompactionCompleted { covers_through, .. } => self.push_entry(
-                EntryKind::System,
-                "Context compacted",
-                format!(
-                    "{address} compacted through sequence {}.",
-                    covers_through.get()
-                ),
-            ),
-            RunEvent::CompactionFailed {
-                run_id, message, ..
-            } => {
-                let completed = self.is_completed_run(&run_id);
+            RunEvent::CompactionCompleted { .. } => {
+                // The compaction row renders from the journal fold.
+                self.status = format!("{address} compacted context");
+            }
+            RunEvent::CompactionFailed { message, .. } => {
                 self.push_error("Compaction failed", message);
-                if completed {
-                    self.status = if address == "/root" {
-                        "Ready".to_owned()
-                    } else {
-                        "Complete".to_owned()
-                    };
-                }
             }
             RunEvent::Completed { run_id } => {
-                self.root_run_completed = true;
-                self.completed_run_id = Some(run_id.to_string());
                 self.clear_streaming(&run_id);
-                if let Some(entry) = self
-                    .entries
-                    .iter_mut()
-                    .rev()
-                    .find(|entry| entry.kind == EntryKind::Assistant && entry.title == address)
-                {
-                    entry.expanded = true;
-                }
                 self.status = if address == "/root" {
                     "Ready".to_owned()
                 } else {
@@ -1048,9 +1027,7 @@ impl App {
                 if address == "/root" {
                     self.root_run_active = false;
                     self.disarm_interruption();
-                    if !self.call_in_progress && !self.interruption_in_progress {
-                        self.busy = false;
-                    }
+                    self.recompute_busy();
                 }
             }
             RunEvent::Failed { message } => {
@@ -1064,9 +1041,7 @@ impl App {
                 if address == "/root" {
                     self.root_run_active = false;
                     self.disarm_interruption();
-                    if !self.call_in_progress && !self.interruption_in_progress {
-                        self.busy = false;
-                    }
+                    self.recompute_busy();
                 }
             }
         }
@@ -1088,9 +1063,8 @@ impl App {
 
     fn apply_outcome(&mut self, outcome: AgentOutcome) {
         match outcome {
-            AgentOutcome::Completed { output, .. } => {
-                let _ = self.reconcile_root_output(output);
-                self.root_run_completed = true;
+            AgentOutcome::Completed { .. } => {
+                // The terminal output renders from the journal fold.
                 self.status = "Complete".to_owned();
             }
             AgentOutcome::Failed { address, error, .. } => {
@@ -1111,74 +1085,135 @@ impl App {
         }
     }
 
+    /// Applies one incremental journal fold to the owning agent's view. The
+    /// fold's rows are the only path by which transcript content enters the
+    /// view; events and command results carry state transitions only.
+    pub(crate) fn apply_fold(&mut self, address: &str, outcome: FoldOutcome) -> bool {
+        let affected = !outcome.rows.is_empty() && address == self.current_agent;
+        if address == "/root" {
+            if !outcome.consumed_message_ids.is_empty() {
+                self.pending_steers.retain(|steer| {
+                    !outcome
+                        .consumed_message_ids
+                        .iter()
+                        .any(|consumed| consumed == &steer.message_id)
+                });
+            }
+            self.root_run_active = outcome.active_run.is_some();
+            self.recompute_busy();
+        }
+        self.ensure_agent(address, parent_address(address), "Working…");
+        let owner = address.to_owned();
+        self.with_agent(address, move |app| {
+            let committed_runs = outcome
+                .rows
+                .iter()
+                .filter_map(|row| row.run_id.clone())
+                .collect::<BTreeSet<_>>();
+            app.apply_committed_rows(&owner, outcome.rows);
+            for run_id in &outcome.model_turns {
+                app.pop_overlay_model_segment(run_id);
+            }
+            for run_id in outcome.dead_runs {
+                app.purge_overlay_run(&run_id);
+                app.clear_streaming_run(&run_id);
+                app.dead_runs.insert(run_id);
+            }
+            // Keep the newest committed row of the still-active run at full
+            // intensity, exactly as if it were streaming: the run's cursor
+            // is there.
+            if let Some(active) = &outcome.active_run
+                && committed_runs.contains(active)
+            {
+                app.clear_streaming_run(active);
+                if let Some(entry) = app.entries[..app.committed_len]
+                    .iter_mut()
+                    .rev()
+                    .find(|entry| entry.run_id() == Some(active.as_str()))
+                {
+                    entry.streaming = true;
+                }
+            }
+            if outcome.interrupted {
+                app.status = "Interrupted".to_owned();
+            }
+        });
+        affected
+    }
+
+    /// Reports a failed transcript fold. The view keeps rendering; the next
+    /// successful fold catches up from the projector's revision.
+    pub(crate) fn fold_failed(&mut self, address: &str, error: String) {
+        self.push_error(format!("Transcript sync failed for {address}"), error);
+    }
+
+    /// Registers the durable receipt for a sent message. `consumed` reports
+    /// whether the projector has already folded the message into context —
+    /// in that case its row is already rendered and nothing is pending.
+    pub(crate) fn apply_message_receipt(&mut self, sent: SentMessage, consumed: bool) {
+        if consumed {
+            return;
+        }
+        self.pending_steers.push(PendingSteer {
+            message_id: sent.message_id,
+            text: sent.text,
+        });
+        self.with_agent("/root", |app| {
+            if !app.root_run_active {
+                return;
+            }
+            app.status = "Message queued — delivered at the next boundary".to_owned();
+        });
+    }
+
+    pub(crate) fn apply_message_error(&mut self, error: String) {
+        self.push_error("Could not send message", error);
+    }
+
+    pub(crate) fn apply_interrupt_result(&mut self, result: Result<bool, String>) {
+        self.interruption_in_progress = false;
+        self.disarm_interruption();
+        self.recompute_busy();
+        match result {
+            Ok(_) => {
+                self.with_agent("/root", |app| {
+                    app.status = if app.root_run_active {
+                        "/root is working…".to_owned()
+                    } else {
+                        "Ready".to_owned()
+                    };
+                });
+            }
+            Err(error) => self.push_error("Could not stop run", error),
+        }
+    }
+
     pub(crate) fn apply_command_result(&mut self, result: CommandResult) {
         let current = self.current_agent.clone();
         self.switch_agent("/root");
         match result {
-            CommandResult::Call(Ok(CompletedCall { output, run_id })) => {
-                self.call_in_progress = false;
-                self.root_run_active = false;
-                self.disarm_interruption();
-                if !self.interruption_in_progress {
-                    self.busy = false;
-                }
-                self.root_run_completed = true;
-                self.completed_run_id = if output.trim().is_empty() {
-                    run_id
-                } else {
-                    self.reconcile_root_output(output).or(run_id)
-                };
-                self.status = "Ready".to_owned();
+            CommandResult::Message(Ok(sent)) => {
+                // Main folds the root projector before routing here, so a
+                // missing consumed check can only under-report; the pending
+                // row is then cleared by the delivery fold.
+                self.apply_message_receipt(sent, false);
             }
-            CommandResult::Call(Err(error)) => {
-                self.call_in_progress = false;
-                self.root_run_active = false;
-                self.disarm_interruption();
-                if !self.interruption_in_progress {
-                    self.busy = false;
-                }
-                self.push_error("Agent failed", error);
-            }
-            CommandResult::CallInterrupted => {
-                self.call_in_progress = false;
-                self.root_run_active = false;
-                self.disarm_interruption();
-                if !self.interruption_in_progress {
-                    self.busy = false;
-                    self.status = "Ready".to_owned();
-                }
-            }
-            CommandResult::Interrupt(Ok(Some(tree))) => self.apply_interrupted_tree(tree),
-            CommandResult::Interrupt(Ok(None)) => {
-                self.interruption_in_progress = false;
-                self.disarm_interruption();
-                self.busy = self.root_run_active || self.call_in_progress;
-                self.status = if self.root_run_active {
-                    "/root is working…".to_owned()
-                } else {
-                    "Ready".to_owned()
-                };
-            }
-            CommandResult::Interrupt(Err(error)) => {
-                self.interruption_in_progress = false;
-                self.disarm_interruption();
-                self.busy = self.root_run_active || self.call_in_progress;
-                self.push_error("Could not stop run", error);
-            }
+            CommandResult::Message(Err(error)) => self.apply_message_error(error),
+            CommandResult::Interrupt(result) => self.apply_interrupt_result(result),
             CommandResult::Compact(Ok(message)) => {
-                self.busy = false;
+                self.finish_command();
                 self.push_entry(EntryKind::System, "Compact", message);
                 self.status = "Ready".to_owned();
             }
             CommandResult::Compact(Err(error)) => {
-                self.busy = false;
+                self.finish_command();
                 self.push_error("Compaction failed", error);
             }
             CommandResult::SwitchModel {
                 index,
                 result: Ok(message),
             } => {
-                self.busy = false;
+                self.finish_command();
                 self.selected_model = index;
                 self.current_model = Some(self.models[index].registry_id.clone());
                 self.push_entry(EntryKind::System, "Model", message);
@@ -1187,7 +1222,7 @@ impl App {
             CommandResult::SwitchModel {
                 result: Err(error), ..
             } => {
-                self.busy = false;
+                self.finish_command();
                 self.push_error("Model switch failed", error);
             }
             CommandResult::SetEffort {
@@ -1195,7 +1230,7 @@ impl App {
                 effort,
                 result: Ok(message),
             } => {
-                self.busy = false;
+                self.finish_command();
                 let effort_index = self.models[index]
                     .efforts
                     .iter()
@@ -1208,7 +1243,7 @@ impl App {
             CommandResult::SetEffort {
                 result: Err(error), ..
             } => {
-                self.busy = false;
+                self.finish_command();
                 self.push_error("Effort switch failed", error);
             }
         }
@@ -1217,57 +1252,114 @@ impl App {
         }
     }
 
-    fn apply_interrupted_tree(&mut self, tree: InterruptedTree) {
-        let InterruptedTree { agents, runs } = tree;
-        for history in agents {
-            let address = history.address.clone();
-            let interrupted_runs = runs
-                .iter()
-                .filter(|run| run.address == address)
-                .map(|run| run.run_id.clone())
-                .collect::<Vec<_>>();
-            self.ensure_agent(&address, history.parent.clone(), &history.status);
-            self.with_agent(&address, move |app| {
-                let entries = history_entries(history.history);
-                app.selected_entry = if entries.is_empty() {
-                    None
-                } else if app.follow_conversation_tail {
-                    entries.len().checked_sub(1)
-                } else {
-                    app.selected_entry
-                        .map(|selected| selected.min(entries.len() - 1))
-                };
-                app.entries = entries;
-                app.status = history.status;
-                app.current_parent = history.parent;
-                app.current_model = history.model;
-                app.output_fallback = None;
-                app.root_run_completed = history.run_completed;
-                app.completed_run_id = None;
-                app.ignored_run_ids.extend(interrupted_runs);
-            });
+    /// Inserts committed rows at the pinned boundary, pairing each committed
+    /// eval result with the first pending committed tool call of its run.
+    fn apply_committed_rows(&mut self, owner: &str, rows: Vec<CommittedRow>) {
+        for row in rows {
+            let mut entry = committed_entry(row);
+            match entry.kind {
+                EntryKind::Assistant | EntryKind::Reasoning => {
+                    entry.model_owner = Some(owner.to_owned());
+                }
+                EntryKind::ToolCall | EntryKind::ToolResult => {
+                    entry.tool_owner = Some(owner.to_owned());
+                }
+                EntryKind::User | EntryKind::System | EntryKind::Error => {}
+            }
+            if entry.kind == EntryKind::ToolResult
+                && let Some(run_id) = entry.tool_run.clone()
+                && let Some(pending) = self.entries[..self.committed_len].iter_mut().find(|entry| {
+                    entry.kind == EntryKind::ToolCall
+                        && entry.pending_tool
+                        && entry.tool_run.as_deref() == Some(run_id.as_str())
+                })
+            {
+                pending.pending_tool = false;
+            }
+            self.insert_pinned(entry);
         }
-        self.busy = false;
-        self.root_run_active = false;
-        self.call_in_progress = false;
-        self.interruption_in_progress = false;
-        self.disarm_interruption();
+    }
+
+    /// Removes the oldest streaming overlay segment for the run: a committed
+    /// model turn has replaced it with authoritative rows.
+    fn pop_overlay_model_segment(&mut self, run_id: &str) {
+        let oldest_turn = self.entries[self.committed_len..]
+            .iter()
+            .filter(|entry| entry.run_id() == Some(run_id) && entry.kind != EntryKind::ToolResult)
+            .filter_map(|entry| entry.overlay_turn)
+            .min();
+        let Some(turn) = oldest_turn else {
+            return;
+        };
+        self.remove_overlay_rows(|entry| {
+            entry.run_id() == Some(run_id)
+                && entry.kind != EntryKind::ToolResult
+                && entry.overlay_turn == Some(turn)
+        });
+    }
+
+    /// Drops every overlay row for a run that reached a terminal or
+    /// interrupted entry.
+    fn purge_overlay_run(&mut self, run_id: &str) {
+        self.remove_overlay_rows(|entry| entry.run_id() == Some(run_id));
+    }
+
+    fn remove_overlay_rows(&mut self, mut retire: impl FnMut(&ConversationEntry) -> bool) {
+        let mut index = self.committed_len;
+        while index < self.entries.len() {
+            if retire(&self.entries[index]) {
+                self.remove_entry(index);
+            } else {
+                index += 1;
+            }
+        }
+    }
+
+    fn remove_entry(&mut self, index: usize) {
+        self.entries.remove(index);
+        if index < self.committed_len {
+            self.committed_len -= 1;
+        }
+        if let Some(selected) = self.selected_entry {
+            self.selected_entry = if self.entries.is_empty() {
+                None
+            } else if selected > index {
+                Some(selected - 1)
+            } else {
+                Some(selected.min(self.entries.len() - 1))
+            };
+        }
+    }
+
+    /// Inserts a row at the pinned boundary, before any streaming overlay
+    /// rows, keeping pinned rows in arrival order.
+    fn insert_pinned(&mut self, entry: ConversationEntry) {
+        let index = self.committed_len;
+        self.entries.insert(index, entry);
+        self.committed_len += 1;
+        if let Some(selected) = self.selected_entry
+            && selected >= index
+        {
+            self.selected_entry = Some(selected + 1);
+        }
+        if self.focus == Focus::Input || self.follow_conversation_tail {
+            self.selected_entry = self.entries.len().checked_sub(1);
+        }
     }
 
     fn append_delta(&mut self, kind: EntryKind, address: &str, run_id: &RunId, delta: String) {
-        if kind == EntryKind::Assistant && self.suppress_fallback_delta(&delta) {
-            return;
-        }
         let title = if kind == EntryKind::Reasoning {
             format!("{address} · reasoning")
         } else {
             address.to_owned()
         };
+        let turn = self.overlay_turn;
         if let Some(entry) = self.entries.last_mut()
             && entry.kind == kind
             && entry.title == title
             && entry.model_owner.as_deref() == Some(address)
             && entry.model_run.as_deref() == Some(run_id.as_str())
+            && entry.overlay_turn == Some(turn)
         {
             entry.body.push_str(&delta);
             if kind == EntryKind::Assistant {
@@ -1275,23 +1367,28 @@ impl App {
             }
             entry.streaming = true;
         } else {
-            self.push_entry_with_expansion(kind, title, delta, kind == EntryKind::Assistant);
+            self.push_overlay_entry_with_expansion(
+                kind,
+                title,
+                delta,
+                kind == EntryKind::Assistant,
+            );
             if let Some(entry) = self.entries.last_mut() {
                 entry.model_owner = Some(address.to_owned());
                 entry.model_run = Some(run_id.to_string());
+                entry.overlay_turn = Some(turn);
             }
             self.mark_last_streaming(run_id);
         }
     }
 
-    fn is_completed_run(&self, run_id: &RunId) -> bool {
-        self.root_run_completed && self.completed_run_id.as_deref() == Some(run_id.as_str())
-    }
-
     /// Clears the streaming marker from every row owned by the run. Each
     /// run keeps at most one streaming row: the row it is actively writing.
     fn clear_streaming(&mut self, run_id: &RunId) {
-        let run_id = run_id.as_str();
+        self.clear_streaming_run(run_id.as_str());
+    }
+
+    fn clear_streaming_run(&mut self, run_id: &str) {
         for entry in &mut self.entries {
             if entry.model_run.as_deref() == Some(run_id)
                 || entry.tool_run.as_deref() == Some(run_id)
@@ -1310,62 +1407,13 @@ impl App {
         }
     }
 
-    fn reconcile_root_output(&mut self, output: String) -> Option<String> {
-        if let Some(entry) =
-            self.entries.iter_mut().rev().find(|entry| {
-                entry.kind == EntryKind::Assistant && entry.body.trim() == output.trim()
-            })
-        {
-            entry.expanded = true;
-            return entry.model_run.clone();
-        }
-
-        let streamed_entry = self.entries.iter().enumerate().rev().find(|(_, entry)| {
-            entry.kind == EntryKind::Assistant
-                && entry.title == self.current_agent
-                && output.starts_with(&entry.body)
-        });
-        let (entry_index, streamed, streamed_run_id) = if let Some((index, entry)) = streamed_entry
-        {
-            (index, entry.body.clone(), entry.model_run.clone())
-        } else {
-            self.push_entry(
-                EntryKind::Assistant,
-                self.current_agent.clone(),
-                String::new(),
-            );
-            (self.entries.len() - 1, String::new(), None)
-        };
-        self.entries[entry_index].body.clone_from(&output);
-        self.entries[entry_index].expanded = true;
-        self.output_fallback = Some(OutputFallback {
-            entry_index,
-            output,
-            streamed,
-        });
-        streamed_run_id
-    }
-
-    fn suppress_fallback_delta(&mut self, delta: &str) -> bool {
-        let Some(fallback) = self.output_fallback.as_mut() else {
-            return false;
-        };
-        fallback.streamed.push_str(delta);
-        if fallback.output.starts_with(&fallback.streamed) {
-            if let Some(entry) = self.entries.get_mut(fallback.entry_index) {
-                entry.body.clone_from(&fallback.output);
-            }
-            return true;
-        }
-        self.output_fallback = None;
-        false
-    }
-
     fn append_tool_delta(&mut self, address: &str, run_id: &RunId, delta: ToolCallDelta) {
+        let turn = self.overlay_turn;
         let existing = self
             .entries
             .iter()
             .enumerate()
+            .skip(self.committed_len)
             .rev()
             .find(|(_, entry)| {
                 entry.kind == EntryKind::ToolCall
@@ -1373,6 +1421,7 @@ impl App {
                     && entry.tool_owner.as_deref() == Some(address)
                     && entry.tool_run.as_deref() == Some(run_id.as_str())
                     && entry.tool_index == Some(delta.index)
+                    && entry.overlay_turn == Some(turn)
             })
             .map(|(index, _)| index);
         if let Some(index) = existing {
@@ -1394,39 +1443,18 @@ impl App {
         } else {
             format!("{address} · {name}")
         };
-        self.push_entry(EntryKind::ToolCall, title, delta.arguments);
+        let turn = self.overlay_turn;
+        self.push_overlay_entry(EntryKind::ToolCall, title, delta.arguments);
         if let Some(entry) = self.entries.last_mut() {
             entry.pending_tool = true;
             entry.tool_owner = Some(address.to_owned());
             entry.tool_run = Some(run_id.to_string());
             entry.tool_index = Some(delta.index);
             entry.tool_name = name;
+            entry.overlay_turn = Some(turn);
             update_streamed_eval_title(entry, address);
         }
         self.mark_last_streaming(run_id);
-    }
-
-    fn pending_tool_mut(
-        &mut self,
-        address: &str,
-        run_id: &RunId,
-    ) -> Option<&mut ConversationEntry> {
-        let index = self.pending_tool_index(address, run_id)?;
-        self.entries.get_mut(index)
-    }
-
-    fn pending_tool_index(&self, address: &str, run_id: &RunId) -> Option<usize> {
-        self.entries
-            .iter()
-            .enumerate()
-            .filter(|(_, entry)| {
-                entry.kind == EntryKind::ToolCall
-                    && entry.pending_tool
-                    && entry.tool_owner.as_deref() == Some(address)
-                    && entry.tool_run.as_deref() == Some(run_id.as_str())
-            })
-            .min_by_key(|(_, entry)| entry.tool_index.unwrap_or(usize::MAX))
-            .map(|(index, _)| index)
     }
 
     fn push_error(&mut self, title: impl Into<String>, body: impl Into<String>) {
@@ -1434,40 +1462,32 @@ impl App {
         self.status = "Error".to_owned();
     }
 
+    /// Pins a locally produced row (system notice, error) at the committed
+    /// boundary so it keeps its chronological position as later journal rows
+    /// and streaming rows arrive.
     fn push_entry(&mut self, kind: EntryKind, title: impl Into<String>, body: impl Into<String>) {
-        self.push_entry_with_expansion(kind, title, body, false);
+        self.insert_pinned(pinned_entry(kind, title.into(), body.into()));
     }
 
-    fn push_expanded_entry(
+    fn push_overlay_entry(
         &mut self,
         kind: EntryKind,
         title: impl Into<String>,
         body: impl Into<String>,
     ) {
-        self.push_entry_with_expansion(kind, title, body, true);
+        self.push_overlay_entry_with_expansion(kind, title, body, false);
     }
 
-    fn push_entry_with_expansion(
+    fn push_overlay_entry_with_expansion(
         &mut self,
         kind: EntryKind,
         title: impl Into<String>,
         body: impl Into<String>,
         expanded: bool,
     ) {
-        self.entries.push(ConversationEntry {
-            kind,
-            title: title.into(),
-            body: body.into(),
-            expanded,
-            pending_tool: false,
-            streaming: false,
-            model_owner: None,
-            model_run: None,
-            tool_owner: None,
-            tool_run: None,
-            tool_index: None,
-            tool_name: String::new(),
-        });
+        let mut entry = pinned_entry(kind, title.into(), body.into());
+        entry.expanded = expanded;
+        self.entries.push(entry);
         if self.focus == Focus::Input || self.follow_conversation_tail {
             self.selected_entry = self.entries.len().checked_sub(1);
         }
@@ -1601,10 +1621,9 @@ impl App {
             status: std::mem::take(&mut self.status),
             parent: self.current_parent.take(),
             model: self.current_model.take(),
-            output_fallback: self.output_fallback.take(),
-            run_completed: self.root_run_completed,
-            completed_run_id: self.completed_run_id.take(),
-            ignored_run_ids: std::mem::take(&mut self.ignored_run_ids),
+            committed_len: self.committed_len,
+            overlay_turn: self.overlay_turn,
+            dead_runs: std::mem::take(&mut self.dead_runs),
         };
         let previous_address = std::mem::replace(&mut self.current_agent, address.to_owned());
         self.inactive_agents.insert(previous_address, previous);
@@ -1616,10 +1635,9 @@ impl App {
         self.status = next.status;
         self.current_parent = next.parent;
         self.current_model = next.model;
-        self.output_fallback = next.output_fallback;
-        self.root_run_completed = next.run_completed;
-        self.completed_run_id = next.completed_run_id;
-        self.ignored_run_ids = next.ignored_run_ids;
+        self.committed_len = next.committed_len;
+        self.overlay_turn = next.overlay_turn;
+        self.dead_runs = next.dead_runs;
         true
     }
 
@@ -1655,17 +1673,17 @@ impl AgentConversation {
             status: status.to_owned(),
             parent,
             model: None,
-            output_fallback: None,
-            run_completed: false,
-            completed_run_id: None,
-            ignored_run_ids: BTreeSet::new(),
+            committed_len: 0,
+            overlay_turn: 0,
+            dead_runs: BTreeSet::new(),
         }
     }
 
     fn from_history(history: AgentHistory) -> Self {
-        let entries = history_entries(history.history);
+        let entries = conversation_from_rows(history.history);
         Self {
             selected_entry: entries.len().checked_sub(1),
+            committed_len: entries.len(),
             entries,
             conversation_offset: 0,
             follow_conversation_tail: true,
@@ -1673,16 +1691,31 @@ impl AgentConversation {
             status: history.status,
             parent: history.parent,
             model: history.model,
-            output_fallback: None,
-            run_completed: history.run_completed,
-            completed_run_id: None,
-            ignored_run_ids: BTreeSet::new(),
+            overlay_turn: 0,
+            dead_runs: BTreeSet::new(),
         }
     }
 }
 
-fn history_entries(history: Vec<HistoryEntry>) -> Vec<ConversationEntry> {
-    history.into_iter().map(historical_entry).collect()
+/// Renders committed rows into conversation entries, pairing each committed
+/// eval result with the first pending committed tool call of its run.
+fn conversation_from_rows(rows: Vec<CommittedRow>) -> Vec<ConversationEntry> {
+    let mut entries: Vec<ConversationEntry> = Vec::with_capacity(rows.len());
+    for row in rows {
+        let entry = committed_entry(row);
+        if entry.kind == EntryKind::ToolResult
+            && let Some(run_id) = entry.tool_run.as_deref()
+            && let Some(pending) = entries.iter_mut().find(|entry| {
+                entry.kind == EntryKind::ToolCall
+                    && entry.pending_tool
+                    && entry.tool_run.as_deref() == Some(run_id)
+            })
+        {
+            pending.pending_tool = false;
+        }
+        entries.push(entry);
+    }
+    entries
 }
 
 fn parent_address(address: &str) -> Option<String> {
@@ -1726,20 +1759,12 @@ fn agent_tree_label(address: &str) -> String {
     format!("{}└─ {name}", "  ".repeat(depth))
 }
 
-fn historical_entry(entry: HistoryEntry) -> ConversationEntry {
-    let kind = match entry.kind {
-        HistoryKind::User => EntryKind::User,
-        HistoryKind::Assistant => EntryKind::Assistant,
-        HistoryKind::Reasoning => EntryKind::Reasoning,
-        HistoryKind::ToolCall => EntryKind::ToolCall,
-        HistoryKind::ToolResult => EntryKind::ToolResult,
-        HistoryKind::System => EntryKind::System,
-    };
+fn pinned_entry(kind: EntryKind, title: String, body: String) -> ConversationEntry {
     ConversationEntry {
         kind,
-        title: entry.title,
-        body: entry.body,
-        expanded: matches!(kind, EntryKind::User | EntryKind::Assistant),
+        title,
+        body,
+        expanded: false,
         pending_tool: false,
         streaming: false,
         model_owner: None,
@@ -1748,15 +1773,37 @@ fn historical_entry(entry: HistoryEntry) -> ConversationEntry {
         tool_run: None,
         tool_index: None,
         tool_name: String::new(),
+        overlay_turn: None,
+        layout: None,
     }
 }
 
-fn eval_request_body(request: &lam::EvalRequest) -> String {
-    let timeout = request
-        .timeout
-        .map(|timeout| format!("\n\ntimeout: {:.1}s", timeout.as_secs_f64()))
-        .unwrap_or_default();
-    format!("{}{timeout}", request.source)
+fn committed_entry(row: CommittedRow) -> ConversationEntry {
+    let CommittedRow { entry, run_id } = row;
+    let kind = match entry.kind {
+        HistoryKind::User => EntryKind::User,
+        HistoryKind::Assistant => EntryKind::Assistant,
+        HistoryKind::Reasoning => EntryKind::Reasoning,
+        HistoryKind::ToolCall => EntryKind::ToolCall,
+        HistoryKind::ToolResult => EntryKind::ToolResult,
+        HistoryKind::System => EntryKind::System,
+    };
+    let mut converted = pinned_entry(kind, entry.title, entry.body);
+    converted.expanded = matches!(kind, EntryKind::User | EntryKind::Assistant);
+    match kind {
+        EntryKind::Assistant | EntryKind::Reasoning => converted.model_run = run_id,
+        EntryKind::ToolCall => {
+            converted.pending_tool = true;
+            converted.tool_run = run_id;
+        }
+        EntryKind::ToolResult => converted.tool_run = run_id,
+        EntryKind::User | EntryKind::System | EntryKind::Error => {}
+    }
+    converted
+}
+
+fn is_streaming_event(event: &RunEvent) -> bool {
+    !matches!(event, RunEvent::Completed { .. } | RunEvent::Failed { .. })
 }
 
 const STREAMED_INTENT_SCAN_LIMIT: usize = 16 * 1024;
@@ -2053,9 +2100,7 @@ mod tests {
     use crossterm::event::{
         KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
-    use lam::{
-        EvalOutcome, EvalOutput, EvalRequest, EvalValue, ModelDelta, RunEvent, RunId, ToolCallDelta,
-    };
+    use lam::{EvalOutcome, EvalOutput, EvalValue, ModelDelta, RunEvent, RunId, ToolCallDelta};
     use lam_agents::{ActorAddress, AgentOutcome, AgentSystemEvent};
 
     use super::{
@@ -2063,9 +2108,28 @@ mod tests {
     };
     use crate::config::ModelChoice;
     use crate::runtime::{
-        AgentHistory, Command, CommandResult, CompletedCall, HistoryEntry, HistoryKind,
-        InterruptedRun, InterruptedTree,
+        AgentHistory, Command, CommandResult, CommittedRow, FoldOutcome, HistoryEntry, HistoryKind,
+        SentMessage,
     };
+
+    fn committed(kind: HistoryKind, title: &str, body: &str, run_id: Option<&str>) -> CommittedRow {
+        CommittedRow {
+            entry: HistoryEntry {
+                kind,
+                title: title.to_owned(),
+                body: body.to_owned(),
+            },
+            run_id: run_id.map(str::to_owned),
+        }
+    }
+
+    fn fold_with_rows(rows: Vec<CommittedRow>, active_run: Option<&str>) -> FoldOutcome {
+        FoldOutcome {
+            rows,
+            active_run: active_run.map(str::to_owned),
+            ..FoldOutcome::default()
+        }
+    }
 
     fn app() -> App {
         App::new(
@@ -2317,34 +2381,28 @@ mod tests {
         });
         app.interruption_in_progress = true;
 
-        app.apply_command_result(CommandResult::Interrupt(Ok(Some(InterruptedTree {
-            agents: vec![AgentHistory {
-                address: "/root".to_owned(),
-                parent: None,
-                model: Some("openai/gpt-5".to_owned()),
-                status: "Ready".to_owned(),
-                run_completed: true,
-                history: vec![
-                    HistoryEntry {
-                        kind: HistoryKind::User,
-                        title: "You".to_owned(),
-                        body: "Do some work".to_owned(),
-                    },
-                    HistoryEntry {
-                        kind: HistoryKind::System,
-                        title: "Run interrupted".to_owned(),
-                        body: "The run was stopped.".to_owned(),
-                    },
+        // The interruption boundary commits: the fold renders the consumed
+        // message and the notice, and reports the run dead.
+        app.apply_fold(
+            "/root",
+            FoldOutcome {
+                rows: vec![
+                    committed(HistoryKind::User, "You", "Do some work", None),
+                    committed(
+                        HistoryKind::System,
+                        "Run interrupted",
+                        "The run was stopped.",
+                        None,
+                    ),
                 ],
-            }],
-            runs: vec![InterruptedRun {
-                address: "/root".to_owned(),
-                run_id: run_id.to_string(),
-            }],
-        }))));
+                dead_runs: vec![run_id.to_string()],
+                interrupted: true,
+                ..FoldOutcome::default()
+            },
+        );
+        app.apply_interrupt_result(Ok(true));
 
         assert!(!app.busy);
-        assert_eq!(app.status, "Ready");
         assert!(
             app.entries
                 .iter()
@@ -2369,6 +2427,430 @@ mod tests {
                 .iter()
                 .all(|entry| !entry.body.contains("late buffered"))
         );
+    }
+
+    #[test]
+    fn submission_during_active_run_queues_a_pending_message() {
+        let mut app = app();
+        app.root_run_active = true;
+        app.busy = true;
+        app.input.text = "one more thing".to_owned();
+        app.input.cursor = app.input.char_count();
+
+        let command = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(matches!(
+            command,
+            Some(Command::Message(input)) if input == "one more thing"
+        ));
+        assert!(app.input.text.is_empty());
+        assert!(app.busy);
+        assert!(
+            !app.entries
+                .iter()
+                .any(|entry| entry.body == "one more thing")
+        );
+
+        // The receipt registers a pending steer, not a conversation row.
+        app.apply_message_receipt(
+            SentMessage {
+                message_id: "steer-1".to_owned(),
+                text: "one more thing".to_owned(),
+            },
+            false,
+        );
+        assert_eq!(app.pending_steers.len(), 1);
+        assert_eq!(app.pending_steers[0].message_id, "steer-1");
+        assert!(
+            app.entries
+                .iter()
+                .all(|entry| entry.body != "one more thing")
+        );
+    }
+
+    #[test]
+    fn messages_submit_even_while_a_command_is_in_flight() {
+        let mut app = app();
+        app.command_in_flight = true;
+        app.busy = true;
+        app.input.text = "keep going".to_owned();
+        app.input.cursor = app.input.char_count();
+
+        let command = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(matches!(
+            command,
+            Some(Command::Message(input)) if input == "keep going"
+        ));
+    }
+
+    #[test]
+    fn commands_remain_blocked_while_the_root_is_busy() {
+        let mut app = app();
+        app.root_run_active = true;
+        app.busy = true;
+        app.input.text = "/compact".to_owned();
+        app.input.cursor = app.input.char_count();
+
+        let command = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(command.is_none());
+        assert_eq!(app.status, "Wait for the current operation to finish");
+        assert!(app.pending_steers.is_empty());
+    }
+
+    #[test]
+    fn messages_are_rejected_during_an_interruption() {
+        let mut app = app();
+        app.interruption_in_progress = true;
+        app.busy = true;
+        app.input.text = "too soon".to_owned();
+        app.input.cursor = app.input.char_count();
+
+        let command = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(command.is_none());
+        assert_eq!(app.status, "Wait for the interruption to finish");
+    }
+
+    #[test]
+    fn delivery_fold_moves_pending_messages_into_the_conversation() {
+        let mut app = app();
+        app.root_run_active = true;
+        app.busy = true;
+        app.apply_message_receipt(
+            SentMessage {
+                message_id: "steer-a".to_owned(),
+                text: "first steer".to_owned(),
+            },
+            false,
+        );
+        app.apply_message_receipt(
+            SentMessage {
+                message_id: "steer-b".to_owned(),
+                text: "second steer".to_owned(),
+            },
+            false,
+        );
+        assert_eq!(app.pending_steers.len(), 2);
+
+        app.apply_fold(
+            "/root",
+            FoldOutcome {
+                rows: vec![
+                    committed(HistoryKind::User, "You", "first steer", None),
+                    committed(HistoryKind::User, "You", "second steer", None),
+                ],
+                consumed_message_ids: vec!["steer-a".to_owned(), "steer-b".to_owned()],
+                active_run: Some("run-steer".to_owned()),
+                ..FoldOutcome::default()
+            },
+        );
+
+        assert!(app.pending_steers.is_empty());
+        let users = app
+            .entries
+            .iter()
+            .filter(|entry| entry.kind == EntryKind::User)
+            .map(|entry| entry.body.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(users, ["first steer", "second steer"]);
+    }
+
+    #[test]
+    fn receipt_after_delivery_fold_registers_nothing() {
+        let mut app = app();
+        app.root_run_active = true;
+        app.busy = true;
+
+        // The delivery fold won the race against the send receipt: the row
+        // is already rendered and the projector reports the message consumed.
+        app.apply_fold(
+            "/root",
+            FoldOutcome {
+                rows: vec![committed(HistoryKind::User, "You", "raced message", None)],
+                consumed_message_ids: vec!["steer-race".to_owned()],
+                active_run: Some("run-steer-race".to_owned()),
+                ..FoldOutcome::default()
+            },
+        );
+        assert!(app.pending_steers.is_empty());
+
+        app.apply_message_receipt(
+            SentMessage {
+                message_id: "steer-race".to_owned(),
+                text: "raced message".to_owned(),
+            },
+            true,
+        );
+
+        assert!(app.pending_steers.is_empty());
+        let raced = app
+            .entries
+            .iter()
+            .filter(|entry| entry.kind == EntryKind::User && entry.body == "raced message")
+            .count();
+        assert_eq!(
+            raced, 1,
+            "the message renders exactly once and never vanishes"
+        );
+    }
+
+    #[test]
+    fn interruption_fold_drops_consumed_steers_and_keeps_queued_ones() {
+        let mut app = app();
+        app.root_run_active = true;
+        app.busy = true;
+        app.apply_message_receipt(
+            SentMessage {
+                message_id: "steer-kept".to_owned(),
+                text: "still queued".to_owned(),
+            },
+            false,
+        );
+        app.apply_message_receipt(
+            SentMessage {
+                message_id: "steer-consumed".to_owned(),
+                text: "consumed by boundary".to_owned(),
+            },
+            false,
+        );
+        assert_eq!(app.pending_steers.len(), 2);
+        app.interruption_in_progress = true;
+
+        app.apply_fold(
+            "/root",
+            FoldOutcome {
+                rows: vec![committed(
+                    HistoryKind::User,
+                    "You",
+                    "consumed by boundary",
+                    None,
+                )],
+                consumed_message_ids: vec!["steer-consumed".to_owned()],
+                interrupted: true,
+                ..FoldOutcome::default()
+            },
+        );
+        app.apply_interrupt_result(Ok(true));
+
+        assert_eq!(app.pending_steers.len(), 1);
+        assert_eq!(app.pending_steers[0].message_id, "steer-kept");
+        assert!(app.entries.iter().any(|entry| {
+            entry.kind == EntryKind::User && entry.body == "consumed by boundary"
+        }));
+    }
+
+    #[test]
+    fn steered_message_renders_at_its_journal_position() {
+        let mut app = app();
+        let root = ActorAddress::new("/root").unwrap();
+        let run_id = RunId::new("run-1").unwrap();
+        app.apply_agent_event(AgentSystemEvent::Run {
+            address: root.clone(),
+            event: RunEvent::Started {
+                run_id: run_id.clone(),
+            },
+        });
+
+        // The eval result commits, then the steer delivery commits, exactly
+        // as journal order has it.
+        app.apply_fold(
+            "/root",
+            FoldOutcome {
+                rows: vec![
+                    committed(
+                        HistoryKind::ToolCall,
+                        "/root · Inspect",
+                        "1 + 1",
+                        Some("run-1"),
+                    ),
+                    committed(
+                        HistoryKind::ToolResult,
+                        "/root · eval result",
+                        "2",
+                        Some("run-1"),
+                    ),
+                ],
+                model_turns: vec!["run-1".to_owned()],
+                active_run: Some("run-1".to_owned()),
+                ..FoldOutcome::default()
+            },
+        );
+        app.apply_fold(
+            "/root",
+            FoldOutcome {
+                rows: vec![committed(
+                    HistoryKind::User,
+                    "You",
+                    "also check the tests",
+                    None,
+                )],
+                consumed_message_ids: vec!["steer-1".to_owned()],
+                active_run: Some("run-1".to_owned()),
+                ..FoldOutcome::default()
+            },
+        );
+        // The model's next turn responds to the steer.
+        app.apply_agent_event(AgentSystemEvent::Run {
+            address: root,
+            event: RunEvent::ModelDelta {
+                run_id,
+                delta: ModelDelta::Text("Good point, doing that now.".to_owned()),
+            },
+        });
+        // The send receipt arrives last; the projector reports it consumed.
+        app.apply_message_receipt(
+            SentMessage {
+                message_id: "steer-1".to_owned(),
+                text: "also check the tests".to_owned(),
+            },
+            true,
+        );
+
+        let tool_result = app
+            .entries
+            .iter()
+            .position(|entry| entry.kind == EntryKind::ToolResult)
+            .expect("the eval result renders");
+        let user = app
+            .entries
+            .iter()
+            .position(|entry| entry.kind == EntryKind::User && entry.body == "also check the tests")
+            .expect("the steer renders");
+        let response = app
+            .entries
+            .iter()
+            .position(|entry| {
+                entry.kind == EntryKind::Assistant && entry.body.contains("Good point")
+            })
+            .expect("the response renders");
+        assert!(
+            tool_result < user && user < response,
+            "journal order is eval result, steer, response: {tool_result} < {user} < {response}"
+        );
+        assert!(app.pending_steers.is_empty());
+    }
+
+    #[test]
+    fn committed_terminal_output_replaces_the_streamed_overlay_below_the_tool_calls() {
+        let mut app = app();
+        let root = ActorAddress::new("/root").unwrap();
+        let run_id = RunId::new("run-1").unwrap();
+        app.apply_agent_event(AgentSystemEvent::Run {
+            address: root.clone(),
+            event: RunEvent::Started {
+                run_id: run_id.clone(),
+            },
+        });
+
+        // Turn one streams a preamble, then commits with its tool call.
+        app.apply_agent_event(AgentSystemEvent::Run {
+            address: root.clone(),
+            event: RunEvent::ModelStarted {
+                run_id: run_id.clone(),
+            },
+        });
+        app.apply_agent_event(AgentSystemEvent::Run {
+            address: root.clone(),
+            event: RunEvent::ModelDelta {
+                run_id: run_id.clone(),
+                delta: ModelDelta::Text("I found the bug.".to_owned()),
+            },
+        });
+        app.apply_fold(
+            "/root",
+            FoldOutcome {
+                rows: vec![
+                    committed(
+                        HistoryKind::Assistant,
+                        "/root",
+                        "I found the bug.",
+                        Some("run-1"),
+                    ),
+                    committed(
+                        HistoryKind::ToolCall,
+                        "/root · first",
+                        "1 + 1",
+                        Some("run-1"),
+                    ),
+                ],
+                model_turns: vec!["run-1".to_owned()],
+                active_run: Some("run-1".to_owned()),
+                ..FoldOutcome::default()
+            },
+        );
+        // The eval result commits.
+        app.apply_fold(
+            "/root",
+            FoldOutcome {
+                rows: vec![committed(
+                    HistoryKind::ToolResult,
+                    "/root · eval result",
+                    "2",
+                    Some("run-1"),
+                )],
+                active_run: Some("run-1".to_owned()),
+                ..FoldOutcome::default()
+            },
+        );
+        // The terminal turn streams, commits, and the run completes.
+        app.apply_agent_event(AgentSystemEvent::Run {
+            address: root.clone(),
+            event: RunEvent::ModelStarted {
+                run_id: run_id.clone(),
+            },
+        });
+        app.apply_agent_event(AgentSystemEvent::Run {
+            address: root.clone(),
+            event: RunEvent::ModelDelta {
+                run_id: run_id.clone(),
+                delta: ModelDelta::Text("The fix is to flip the flag.".to_owned()),
+            },
+        });
+        app.apply_fold(
+            "/root",
+            FoldOutcome {
+                rows: vec![committed(
+                    HistoryKind::Assistant,
+                    "/root",
+                    "The fix is to flip the flag.",
+                    Some("run-1"),
+                )],
+                model_turns: vec!["run-1".to_owned()],
+                dead_runs: vec!["run-1".to_owned()],
+                ..FoldOutcome::default()
+            },
+        );
+        app.apply_agent_event(AgentSystemEvent::Run {
+            address: root,
+            event: RunEvent::Completed { run_id },
+        });
+
+        let final_row = app
+            .entries
+            .iter()
+            .position(|entry| {
+                entry.kind == EntryKind::Assistant && entry.body.contains("flip the flag")
+            })
+            .expect("the final output renders");
+        let last_tool = app
+            .entries
+            .iter()
+            .rposition(|entry| matches!(entry.kind, EntryKind::ToolCall | EntryKind::ToolResult))
+            .expect("tool rows render");
+        let duplicates = app
+            .entries
+            .iter()
+            .filter(|entry| entry.body.contains("flip the flag"))
+            .count();
+        assert_eq!(duplicates, 1, "the overlay is replaced, not duplicated");
+        assert!(
+            final_row > last_tool,
+            "the final output renders below the tool rows: {final_row} > {last_tool}"
+        );
+        assert!(!app.busy);
+        assert_eq!(app.status, "Ready");
     }
 
     #[test]
@@ -2400,8 +2882,16 @@ mod tests {
     #[test]
     fn vertical_input_navigation_uses_visual_rows_before_user_history() {
         let mut app = app();
-        app.push_expanded_entry(EntryKind::User, "You", "one");
-        app.push_expanded_entry(EntryKind::User, "You", "two");
+        app.apply_fold(
+            "/root",
+            fold_with_rows(
+                vec![
+                    committed(HistoryKind::User, "You", "one", None),
+                    committed(HistoryKind::User, "You", "two", None),
+                ],
+                None,
+            ),
+        );
         app.input_width = 4;
         app.input = InputBuffer::at_end("abcdef".to_owned());
 
@@ -2465,7 +2955,18 @@ mod tests {
     fn mouse_wheel_scrolls_within_one_oversized_entry() {
         let mut app = app();
         app.push_entry(EntryKind::System, "Older", "first");
-        app.push_expanded_entry(EntryKind::Assistant, "Agent", "long response");
+        app.apply_fold(
+            "/root",
+            fold_with_rows(
+                vec![committed(
+                    HistoryKind::Assistant,
+                    "Agent",
+                    "long response",
+                    None,
+                )],
+                None,
+            ),
+        );
         app.focus = Focus::Conversation;
         app.selected_entry = Some(2);
         app.conversation_ranges = vec![(0, 1), (2, 9), (10, 109)];
@@ -2481,7 +2982,7 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         });
 
-        assert_eq!(app.conversation_offset, 97);
+        assert_eq!(app.conversation_offset, 98);
         assert_eq!(app.selected_entry, Some(2));
         assert!(!app.follow_conversation_tail);
         assert!(!app.selection_drives_viewport);
@@ -2516,11 +3017,11 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         };
 
-        for _ in 0..4 {
+        for _ in 0..5 {
             app.handle_mouse(wheel_up);
         }
 
-        assert_eq!(app.conversation_offset, 8);
+        assert_eq!(app.conversation_offset, 10);
         assert_eq!(app.selected_entry, Some(1));
         assert!(!app.selection_drives_viewport);
 
@@ -2531,14 +3032,17 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_input_starts_a_call() {
+    fn ordinary_input_sends_a_message() {
         let mut app = app();
         app.input.text = "inspect the workspace".to_owned();
         app.input.cursor = app.input.char_count();
         let command = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(matches!(command, Some(Command::Call(input)) if input == "inspect the workspace"));
-        assert!(app.busy);
-        assert!(app.entries.last().unwrap().expanded);
+        assert!(
+            matches!(command, Some(Command::Message(input)) if input == "inspect the workspace")
+        );
+        // The message is not blocking and its row renders from the journal
+        // fold once the runner delivers it.
+        assert!(!app.busy);
         assert_eq!(
             app.sessions
                 .iter()
@@ -2572,21 +3076,14 @@ mod tests {
                 journal_path: "/tmp/session-00000007.redb".to_owned(),
                 resumed: true,
                 agents: vec![AgentHistory::root(vec![
-                    HistoryEntry {
-                        kind: HistoryKind::User,
-                        title: "You".to_owned(),
-                        body: "hello".to_owned(),
-                    },
-                    HistoryEntry {
-                        kind: HistoryKind::Assistant,
-                        title: "/root".to_owned(),
-                        body: "hi".to_owned(),
-                    },
-                    HistoryEntry {
-                        kind: HistoryKind::ToolCall,
-                        title: "/root · Calculate the result".to_owned(),
-                        body: "1 + 1".to_owned(),
-                    },
+                    committed(HistoryKind::User, "You", "hello", None),
+                    committed(HistoryKind::Assistant, "/root", "hi", Some("run-1")),
+                    committed(
+                        HistoryKind::ToolCall,
+                        "/root · Calculate the result",
+                        "1 + 1",
+                        Some("run-1"),
+                    ),
                 ])],
                 choices: vec![SessionChoice {
                     id: 7,
@@ -2611,19 +3108,22 @@ mod tests {
     }
 
     #[test]
-    fn eval_events_create_an_expandable_source_row() {
+    fn committed_tool_calls_render_as_pending_source_rows() {
         let mut app = app();
-        app.apply_agent_event(AgentSystemEvent::Run {
-            address: ActorAddress::new("/root").unwrap(),
-            event: RunEvent::EvalStarted {
-                run_id: RunId::new("run-1").unwrap(),
-                request: EvalRequest {
-                    intent: "Inspect the workspace files".to_owned(),
-                    source: "const files = await lam.fs.list({ path: '.' });".to_owned(),
-                    timeout: None,
-                },
+        app.apply_fold(
+            "/root",
+            FoldOutcome {
+                rows: vec![committed(
+                    HistoryKind::ToolCall,
+                    "/root · Inspect the workspace files",
+                    "const files = await lam.fs.list({ path: '.' });",
+                    Some("run-1"),
+                )],
+                model_turns: vec!["run-1".to_owned()],
+                active_run: Some("run-1".to_owned()),
+                ..FoldOutcome::default()
             },
-        });
+        );
         let tool = app.entries.last().unwrap();
         assert_eq!(tool.title, "/root · Inspect the workspace files");
         assert!(tool.body.contains("lam.fs.list"));
@@ -2664,20 +3164,51 @@ mod tests {
             "{\"intent\":\"Calculate the result\",\"source\":\"1 + 1\"}"
         );
 
-        app.apply_agent_event(AgentSystemEvent::Run {
-            address: address.clone(),
-            event: RunEvent::EvalStarted {
-                run_id: run_id.clone(),
-                request: EvalRequest {
-                    intent: "Calculate the result".to_owned(),
-                    source: "1 + 1".to_owned(),
-                    timeout: None,
-                },
+        // The model turn commits: the fold's authoritative tool-call row
+        // replaces the streamed overlay row.
+        app.apply_fold(
+            "/root",
+            FoldOutcome {
+                rows: vec![committed(
+                    HistoryKind::ToolCall,
+                    "/root · Calculate the result",
+                    "1 + 1",
+                    Some("run-1"),
+                )],
+                model_turns: vec!["run-1".to_owned()],
+                active_run: Some("run-1".to_owned()),
+                ..FoldOutcome::default()
             },
-        });
-        assert_eq!(app.entries.len(), 2, "eval start reuses the streamed row");
+        );
+        assert_eq!(
+            app.entries.len(),
+            2,
+            "the committed row replaces the streamed row"
+        );
         assert_eq!(app.entries[1].title, "/root · Calculate the result");
         assert_eq!(app.entries[1].body, "1 + 1");
+
+        // The durable eval outcome commits, pairing with the pending call;
+        // the EvalCompleted event that follows is status-only and must not
+        // add a duplicate row.
+        app.apply_fold(
+            "/root",
+            FoldOutcome {
+                rows: vec![committed(
+                    HistoryKind::ToolResult,
+                    "/root · eval result",
+                    "2",
+                    Some("run-1"),
+                )],
+                active_run: Some("run-1".to_owned()),
+                ..FoldOutcome::default()
+            },
+        );
+        assert_eq!(app.entries.len(), 3);
+        assert_eq!(app.entries[1].kind, EntryKind::ToolCall);
+        assert_eq!(app.entries[2].kind, EntryKind::ToolResult);
+        assert_eq!(app.entries[2].body, "2");
+        assert!(!app.entries[1].pending_tool);
 
         app.apply_agent_event(AgentSystemEvent::Run {
             address,
@@ -2691,10 +3222,12 @@ mod tests {
                 },
             },
         });
-        assert_eq!(app.entries.len(), 3);
-        assert_eq!(app.entries[1].kind, EntryKind::ToolCall);
-        assert_eq!(app.entries[2].kind, EntryKind::ToolResult);
-        assert!(!app.entries[1].pending_tool);
+        assert_eq!(
+            app.entries.len(),
+            3,
+            "the event adds no row: the committed result is already rendered"
+        );
+        assert_eq!(app.status, "/root finished eval");
 
         app.selected_entry = Some(1);
         app.toggle_selected();
@@ -2731,21 +3264,57 @@ mod tests {
             });
         }
 
-        app.apply_agent_event(AgentSystemEvent::Run {
-            address: address.clone(),
-            event: RunEvent::EvalStarted {
-                run_id: run_id.clone(),
-                request: EvalRequest {
-                    intent: "Commit the change".to_owned(),
-                    source: "await commit()".to_owned(),
-                    timeout: None,
-                },
+        // The turn commits with the executed request and the rejected
+        // sibling, replacing both streamed overlay rows.
+        app.apply_fold(
+            "/root",
+            FoldOutcome {
+                rows: vec![
+                    committed(
+                        HistoryKind::ToolCall,
+                        "/root · Commit the change",
+                        "await commit()",
+                        Some("run-parallel"),
+                    ),
+                    committed(
+                        HistoryKind::ToolCall,
+                        "/root · Inspect the styling",
+                        "await inspect()",
+                        Some("run-parallel"),
+                    ),
+                ],
+                model_turns: vec!["run-parallel".to_owned()],
+                active_run: Some("run-parallel".to_owned()),
+                ..FoldOutcome::default()
             },
-        });
+        );
         assert_eq!(app.entries[1].body, "await commit()");
         assert!(app.entries[1].pending_tool);
         assert!(app.entries[2].pending_tool);
 
+        // Both outcomes commit in one batch; the committed result rows pair
+        // with the pending calls in provider order.
+        app.apply_fold(
+            "/root",
+            FoldOutcome {
+                rows: vec![
+                    committed(
+                        HistoryKind::ToolResult,
+                        "/root · eval result",
+                        "\"committed\"",
+                        Some("run-parallel"),
+                    ),
+                    committed(
+                        HistoryKind::ToolResult,
+                        "/root · eval result",
+                        "Combine multiple actions in one eval program.",
+                        Some("run-parallel"),
+                    ),
+                ],
+                active_run: Some("run-parallel".to_owned()),
+                ..FoldOutcome::default()
+            },
+        );
         for outcome in [
             EvalOutcome::Success {
                 output: EvalOutput {
@@ -2766,6 +3335,7 @@ mod tests {
             });
         }
 
+        assert_eq!(app.entries.len(), 5, "the events add no rows");
         assert!(!app.entries[1].pending_tool);
         assert!(!app.entries[2].pending_tool);
         assert_eq!(app.entries[3].kind, EntryKind::ToolResult);
@@ -2808,17 +3378,22 @@ mod tests {
             assert!(!app.entries.last().unwrap().expanded);
         }
 
-        app.apply_agent_event(AgentSystemEvent::Run {
-            address,
-            event: RunEvent::EvalStarted {
-                run_id,
-                request: EvalRequest {
-                    intent: "Inspect the workspace".to_owned(),
-                    source: "await lam.dir()".to_owned(),
-                    timeout: None,
-                },
+        // The turn commits: the fold's authoritative row replaces the
+        // streamed one with the final intent and source.
+        app.apply_fold(
+            "/root",
+            FoldOutcome {
+                rows: vec![committed(
+                    HistoryKind::ToolCall,
+                    "/root · Inspect the workspace",
+                    "await lam.dir()",
+                    Some(run_id.as_str()),
+                )],
+                model_turns: vec![run_id.to_string()],
+                active_run: Some(run_id.to_string()),
+                ..FoldOutcome::default()
             },
-        });
+        );
         assert_eq!(
             app.entries.last().unwrap().title,
             "/root · Inspect the workspace"
@@ -2838,12 +3413,23 @@ mod tests {
     }
 
     #[test]
-    fn terminal_output_reconciles_with_late_stream_deltas() {
+    fn committed_terminal_output_supersedes_stream_deltas_in_either_order() {
+        // The terminal turn commits before any of its deltas render.
         let mut first_app = app();
-        first_app.apply_command_result(CommandResult::Call(Ok(CompletedCall {
-            output: "hello".to_owned(),
-            run_id: Some("run-1".to_owned()),
-        })));
+        first_app.apply_fold(
+            "/root",
+            FoldOutcome {
+                rows: vec![committed(
+                    HistoryKind::Assistant,
+                    "/root",
+                    "hello",
+                    Some("run-1"),
+                )],
+                model_turns: vec!["run-1".to_owned()],
+                dead_runs: vec!["run-1".to_owned()],
+                ..FoldOutcome::default()
+            },
+        );
         for text in ["hel", "lo"] {
             first_app.apply_agent_event(AgentSystemEvent::Run {
                 address: ActorAddress::new("/root").unwrap(),
@@ -2862,25 +3448,31 @@ mod tests {
         assert_eq!(visible[0].body, "hello");
         assert!(visible[0].expanded);
 
+        // The deltas render first; the commit replaces the overlay segment.
         let mut second_app = app();
-        second_app.apply_agent_event(AgentSystemEvent::Run {
-            address: ActorAddress::new("/root").unwrap(),
-            event: RunEvent::ModelDelta {
-                run_id: RunId::new("run-2").unwrap(),
-                delta: ModelDelta::Text("hel".to_owned()),
+        for text in ["hel", "lo"] {
+            second_app.apply_agent_event(AgentSystemEvent::Run {
+                address: ActorAddress::new("/root").unwrap(),
+                event: RunEvent::ModelDelta {
+                    run_id: RunId::new("run-2").unwrap(),
+                    delta: ModelDelta::Text(text.to_owned()),
+                },
+            });
+        }
+        second_app.apply_fold(
+            "/root",
+            FoldOutcome {
+                rows: vec![committed(
+                    HistoryKind::Assistant,
+                    "/root",
+                    "hello",
+                    Some("run-2"),
+                )],
+                model_turns: vec!["run-2".to_owned()],
+                dead_runs: vec!["run-2".to_owned()],
+                ..FoldOutcome::default()
             },
-        });
-        second_app.apply_command_result(CommandResult::Call(Ok(CompletedCall {
-            output: "hello".to_owned(),
-            run_id: Some("run-2".to_owned()),
-        })));
-        second_app.apply_agent_event(AgentSystemEvent::Run {
-            address: ActorAddress::new("/root").unwrap(),
-            event: RunEvent::ModelDelta {
-                run_id: RunId::new("run-2").unwrap(),
-                delta: ModelDelta::Text("lo".to_owned()),
-            },
-        });
+        );
         let visible = second_app
             .entries
             .iter()
@@ -3029,21 +3621,45 @@ mod tests {
         assert!(!app.entries[reasoning].streaming);
         assert!(app.entries[call].streaming);
 
-        app.apply_agent_event(AgentSystemEvent::Run {
-            address: address.clone(),
-            event: RunEvent::EvalCompleted {
-                run_id: run_id.clone(),
-                outcome: EvalOutcome::Success {
-                    output: EvalOutput {
-                        result: EvalValue::Json(serde_json::json!(2)),
-                        logs: Vec::new(),
-                    },
-                },
+        // The turn and its eval outcome commit: the streamed rows are
+        // replaced and the marker stays on the run's newest committed row.
+        app.apply_fold(
+            "/root",
+            FoldOutcome {
+                rows: vec![
+                    committed(
+                        HistoryKind::ToolCall,
+                        "/root · eval",
+                        "1 + 1",
+                        Some("run-1"),
+                    ),
+                    committed(
+                        HistoryKind::ToolResult,
+                        "/root · eval result",
+                        "2",
+                        Some("run-1"),
+                    ),
+                ],
+                model_turns: vec!["run-1".to_owned()],
+                active_run: Some("run-1".to_owned()),
+                ..FoldOutcome::default()
             },
-        });
-        let result = app.entries.len() - 1;
+        );
+        let call = app
+            .entries
+            .iter()
+            .position(|entry| entry.kind == EntryKind::ToolCall)
+            .unwrap();
+        let result = app
+            .entries
+            .iter()
+            .position(|entry| entry.kind == EntryKind::ToolResult)
+            .unwrap();
         assert!(!app.entries[call].streaming);
-        assert!(app.entries[result].streaming);
+        assert!(
+            app.entries[result].streaming,
+            "the run's newest committed row keeps full intensity"
+        );
 
         app.apply_agent_event(AgentSystemEvent::Run {
             address: address.clone(),
@@ -3064,11 +3680,11 @@ mod tests {
     }
 
     #[test]
-    fn completed_call_recovers_when_the_terminal_event_is_missing() {
+    fn terminal_fold_recovers_when_the_completed_event_is_dropped() {
         let mut app = app();
         let address = ActorAddress::new("/root").unwrap();
         let run_id = RunId::new("run-1").unwrap();
-        app.root_run_completed = false;
+        app.root_run_active = true;
         app.busy = true;
         app.status = "/root is responding…".to_owned();
         app.apply_agent_event(AgentSystemEvent::Run {
@@ -3079,13 +3695,24 @@ mod tests {
             },
         });
 
-        app.apply_command_result(CommandResult::Call(Ok(CompletedCall {
-            output: "Final answer".to_owned(),
-            run_id: Some(run_id.to_string()),
-        })));
+        // The terminal turn commits; the Completed event is lost in transit.
+        // The fold alone restores every invariant.
+        app.apply_fold(
+            "/root",
+            FoldOutcome {
+                rows: vec![committed(
+                    HistoryKind::Assistant,
+                    "/root",
+                    "Final answer",
+                    Some("run-1"),
+                )],
+                model_turns: vec!["run-1".to_owned()],
+                dead_runs: vec!["run-1".to_owned()],
+                ..FoldOutcome::default()
+            },
+        );
         assert!(!app.busy);
-        assert_eq!(app.status, "Ready");
-        assert!(app.root_run_completed);
+        assert!(!app.root_run_active);
         assert_eq!(app.entries.last().unwrap().body, "Final answer");
         assert!(app.entries.last().unwrap().expanded);
 
@@ -3102,7 +3729,6 @@ mod tests {
                 delta: ModelDelta::Text("wer".to_owned()),
             },
         });
-        assert_eq!(app.status, "Ready");
         assert_eq!(app.entries.last().unwrap().body, "Final answer");
     }
 
