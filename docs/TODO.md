@@ -22,3 +22,9 @@
 - [x] Ctrl+C clears nonempty draft input first; when the input is empty, it quits through the existing system-abort cleanup.
 - [x] Streaming Markdown rendering for expanded user, assistant, and reasoning messages; collapsed previews remain plain.
 - [ ] Bound console capture and spill oversized serialized eval results through embedding-provided storage.
+- [x] Clarify the eval tool description so the model passes structured values to `lam.result` directly instead of pre-stringifying.
+  - Root cause: the double JSON encoding was model behavior, not a harness defect. The provider APIs force exactly one stringification at the wire (`function_call_output.output` is a string); the second appeared only when the model called `JSON.stringify` before `lam.result`.
+  - Added `Pass structured values directly to lam.result without JSON.stringify; the runtime handles encoding` to `EVAL_TOOL_DESCRIPTION`.
+- [ ] Offer interleaved (merged, temporal-order) shell output as an option alongside the current separate stdout/stderr captures.
+  - Observed from the model side: separate streams are usually right, but when a command fails the merged ordering is what explains how stdout and stderr relate.
+  - Keep the structured per-stream fields; add merging without losing stream attribution.
