@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -554,15 +555,30 @@ fn append_model_projection(
     projection: ModelResponseProjection,
 ) {
     let mut projected = Vec::new();
+    let mut tool_calls = BTreeMap::<usize, (String, String)>::new();
     for delta in projection.display {
-        append_model_delta(&mut projected, address, delta);
+        match delta {
+            ModelDelta::ToolCall(delta) => {
+                let call = tool_calls.entry(delta.index).or_default();
+                if let Some(name) = delta.name {
+                    call.0.push_str(&name);
+                }
+                call.1.push_str(&delta.arguments);
+            }
+            delta => append_model_delta(&mut projected, address, delta),
+        }
     }
     match projection.directive {
-        ModelDirective::Eval(request) => projected.push(HistoryEntry {
-            kind: HistoryKind::ToolCall,
-            title: format!("{address} · {}", request.intent),
-            body: request.source,
-        }),
+        ModelDirective::Eval(request) => {
+            projected.push(HistoryEntry {
+                kind: HistoryKind::ToolCall,
+                title: format!("{address} · {}", request.intent),
+                body: request.source,
+            });
+            for (_, (name, arguments)) in tool_calls.into_iter().skip(1) {
+                projected.push(historical_tool_call(address, &name, arguments));
+            }
+        }
         ModelDirective::Output(output) => {
             let has_text = projected
                 .iter()
@@ -577,6 +593,26 @@ fn append_model_projection(
         }
     }
     history.extend(projected);
+}
+
+fn historical_tool_call(address: &str, name: &str, arguments: String) -> HistoryEntry {
+    let parsed = serde_json::from_str::<serde_json::Value>(&arguments).ok();
+    let intent = parsed
+        .as_ref()
+        .and_then(|value| value.get("intent"))
+        .and_then(serde_json::Value::as_str);
+    let source = parsed
+        .as_ref()
+        .and_then(|value| value.get("source"))
+        .and_then(serde_json::Value::as_str);
+    let label = intent
+        .or((!name.is_empty()).then_some(name))
+        .unwrap_or("tool call");
+    HistoryEntry {
+        kind: HistoryKind::ToolCall,
+        title: format!("{address} · {label}"),
+        body: source.map_or(arguments, str::to_owned),
+    }
 }
 
 fn session_history(
@@ -1054,6 +1090,7 @@ mod tests {
                     ModelDelta::Text("All clear".to_owned()),
                 ],
                 directive: ModelDirective::Output(json!("All clear")),
+                rejected_eval_calls: 0,
             },
         );
 
@@ -1063,6 +1100,53 @@ mod tests {
         assert_eq!(history[0].body, "Inspect the workspace");
         assert_eq!(history[1].kind, HistoryKind::Assistant);
         assert_eq!(history[1].body, "All clear");
+    }
+
+    #[test]
+    fn historical_model_projection_keeps_rejected_sibling_tool_calls() {
+        let mut history = Vec::new();
+        append_model_projection(
+            &mut history,
+            "/root",
+            ModelResponseProjection {
+                display: vec![
+                    ModelDelta::ToolCall(lam::ToolCallDelta {
+                        index: 0,
+                        call_id: Some("call-1".to_owned()),
+                        name: Some("eval".to_owned()),
+                        arguments: json!({
+                            "intent": "Commit the change",
+                            "source": "await commit()",
+                            "timeoutMs": null,
+                        })
+                        .to_string(),
+                    }),
+                    ModelDelta::ToolCall(lam::ToolCallDelta {
+                        index: 1,
+                        call_id: Some("call-2".to_owned()),
+                        name: Some("eval".to_owned()),
+                        arguments: json!({
+                            "intent": "Inspect the styling",
+                            "source": "await inspect()",
+                            "timeoutMs": null,
+                        })
+                        .to_string(),
+                    }),
+                ],
+                directive: ModelDirective::Eval(lam::EvalRequest {
+                    intent: "Commit the change".to_owned(),
+                    source: "await commit()".to_owned(),
+                    timeout: None,
+                }),
+                rejected_eval_calls: 1,
+            },
+        );
+
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].title, "/root · Commit the change");
+        assert_eq!(history[0].body, "await commit()");
+        assert_eq!(history[1].title, "/root · Inspect the styling");
+        assert_eq!(history[1].body, "await inspect()");
     }
 
     #[test]

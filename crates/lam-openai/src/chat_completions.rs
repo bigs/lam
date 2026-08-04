@@ -1,5 +1,7 @@
 //! Generic OpenAI-compatible Chat Completions adapter.
 
+use std::collections::VecDeque;
+
 use lam::{
     CodecId, CodecRef, CompactionArtifact, ContextTransition, EncodedPayload, Model, ModelCodec,
     ModelDelta, ModelDescriptor, ModelDirective, ModelEventSink, ModelProvider, ModelRequestConfig,
@@ -629,11 +631,7 @@ impl ModelCodec for ChatCompletionsCodec {
             });
         }
         let calls = tool_calls(&message)?;
-        if calls.len() > 1 {
-            return Err(CodecError::InvalidDirective {
-                message: "the model requested more than one eval".to_owned(),
-            });
-        }
+        let rejected_eval_calls = calls.len().saturating_sub(1);
         let display = response_display_deltas(response, &message, &calls);
         let directive = if let Some(call) = calls.first() {
             if call.name != "eval" {
@@ -645,7 +643,11 @@ impl ModelCodec for ChatCompletionsCodec {
         } else {
             output_value(output_kind, message_text(&message)?).map(ModelDirective::Output)?
         };
-        Ok(ModelResponseProjection { display, directive })
+        Ok(ModelResponseProjection {
+            display,
+            directive,
+            rejected_eval_calls,
+        })
     }
 
     fn response_metadata(&self, response: &EncodedPayload) -> ModelResponseMetadata {
@@ -692,14 +694,14 @@ impl ModelCodec for ChatCompletionsCodec {
 
 fn encode_context(context: &[ProjectedContextEntry]) -> Result<Vec<Value>, CodecError> {
     let mut native = Vec::new();
-    let mut pending_eval = None;
+    let mut pending_eval = VecDeque::new();
     for projected in context {
         let payload = &projected.entry.payload;
         if matches!(
             projected.entry.transition,
             ContextTransition::Compaction { .. }
         ) {
-            if pending_eval.is_some() {
+            if !pending_eval.is_empty() {
                 return Err(CodecError::InvalidPayload {
                     message: "compaction replacement cannot split an eval call and result"
                         .to_owned(),
@@ -721,10 +723,10 @@ fn encode_context(context: &[ProjectedContextEntry]) -> Result<Vec<Value>, Codec
             native.extend(replacement.iter().cloned());
         } else if is_codec(payload, LAM_MESSAGES_CODEC_ID, LAM_CODEC_VERSION) {
             for message in messages(&payload.value)? {
-                if message.closes_interrupted_eval
-                    && let Some(tool_call_id) = pending_eval.take()
-                {
-                    native.push(tool_output(tool_call_id, message.text.clone()));
+                if message.closes_interrupted_eval {
+                    for tool_call_id in pending_eval.drain(..) {
+                        native.push(tool_output(tool_call_id, message.text.clone()));
+                    }
                 }
                 let role = match message.role {
                     NativeRole::User => "user",
@@ -735,28 +737,28 @@ fn encode_context(context: &[ProjectedContextEntry]) -> Result<Vec<Value>, Codec
         } else if is_codec(payload, CHAT_RESPONSE_CODEC_ID, CODEC_VERSION) {
             let (_, mut message, _) = response_message(payload)?;
             let calls = tool_calls(&message)?;
-            if calls.len() > 1 {
+            if !pending_eval.is_empty() {
                 return Err(CodecError::InvalidPayload {
-                    message: "Chat Completions payload contains more than one tool call".to_owned(),
+                    message: "Chat Completions tool calls have no results before the next response"
+                        .to_owned(),
                 });
             }
-            if let Some(call) = calls.first() {
-                pending_eval = Some(call.id.clone());
-            }
+            pending_eval.extend(calls.into_iter().map(|call| call.id));
             omit_null_request_fields(&mut message);
             native.push(message);
         } else if is_codec(payload, LAM_EVAL_CODEC_ID, LAM_CODEC_VERSION) {
-            let tool_call_id = pending_eval
-                .take()
-                .ok_or_else(|| CodecError::InvalidPayload {
-                    message: "lam/eval has no preceding Chat Completions tool call".to_owned(),
-                })?;
+            let tool_call_id =
+                pending_eval
+                    .pop_front()
+                    .ok_or_else(|| CodecError::InvalidPayload {
+                        message: "lam/eval has no preceding Chat Completions tool call".to_owned(),
+                    })?;
             native.push(tool_output(tool_call_id, eval_output(&payload.value)?));
         } else {
             return Err(unsupported(payload));
         }
     }
-    if pending_eval.is_some() {
+    if !pending_eval.is_empty() {
         return Err(CodecError::InvalidPayload {
             message: "Chat Completions tool call has no eval result or interruption notice"
                 .to_owned(),

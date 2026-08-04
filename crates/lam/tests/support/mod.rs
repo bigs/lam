@@ -158,6 +158,12 @@ impl ModelCodec for ScriptedCodec {
         Ok(ModelResponseProjection {
             display: Vec::new(),
             directive,
+            rejected_eval_calls: response
+                .value
+                .get("rejectedEvalCalls")
+                .and_then(Value::as_u64)
+                .and_then(|count| usize::try_from(count).ok())
+                .unwrap_or(0),
         })
     }
 
@@ -239,6 +245,19 @@ pub(crate) struct ScriptError(String);
 pub(crate) fn eval(source: &str) -> ScriptedStep {
     ScriptedStep {
         response: Ok(native(json!({ "kind": "eval", "source": source }))),
+        deltas: Vec::new(),
+        gate: None,
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn eval_with_rejected_calls(source: &str, rejected_eval_calls: usize) -> ScriptedStep {
+    ScriptedStep {
+        response: Ok(native(json!({
+            "kind": "eval",
+            "source": source,
+            "rejectedEvalCalls": rejected_eval_calls,
+        }))),
         deltas: Vec::new(),
         gate: None,
     }

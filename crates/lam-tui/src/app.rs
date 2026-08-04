@@ -1378,12 +1378,15 @@ impl App {
         address: &str,
         run_id: &RunId,
     ) -> Option<&mut ConversationEntry> {
-        self.entries.iter_mut().rev().find(|entry| {
-            entry.kind == EntryKind::ToolCall
-                && entry.pending_tool
-                && entry.tool_owner.as_deref() == Some(address)
-                && entry.tool_run.as_deref() == Some(run_id.as_str())
-        })
+        self.entries
+            .iter_mut()
+            .filter(|entry| {
+                entry.kind == EntryKind::ToolCall
+                    && entry.pending_tool
+                    && entry.tool_owner.as_deref() == Some(address)
+                    && entry.tool_run.as_deref() == Some(run_id.as_str())
+            })
+            .min_by_key(|entry| entry.tool_index.unwrap_or(usize::MAX))
     }
 
     fn push_error(&mut self, title: impl Into<String>, body: impl Into<String>) {
@@ -2656,6 +2659,76 @@ mod tests {
         assert!(app.entries[1].expanded);
         assert_eq!(app.entries[1].title, "/root · Calculate the result");
         assert!(!app.entries[2].expanded);
+    }
+
+    #[test]
+    fn parallel_tool_results_pair_with_calls_in_provider_order() {
+        let mut app = app();
+        let address = ActorAddress::new("/root").unwrap();
+        let run_id = RunId::new("run-parallel").unwrap();
+        for (index, id, intent, source) in [
+            (0, "call-1", "Commit the change", "await commit()"),
+            (1, "call-2", "Inspect the styling", "await inspect()"),
+        ] {
+            app.apply_agent_event(AgentSystemEvent::Run {
+                address: address.clone(),
+                event: RunEvent::ModelDelta {
+                    run_id: run_id.clone(),
+                    delta: ModelDelta::ToolCall(ToolCallDelta {
+                        index,
+                        call_id: Some(id.to_owned()),
+                        name: Some("eval".to_owned()),
+                        arguments: serde_json::json!({
+                            "intent": intent,
+                            "source": source,
+                            "timeoutMs": null,
+                        })
+                        .to_string(),
+                    }),
+                },
+            });
+        }
+
+        app.apply_agent_event(AgentSystemEvent::Run {
+            address: address.clone(),
+            event: RunEvent::EvalStarted {
+                run_id: run_id.clone(),
+                request: EvalRequest {
+                    intent: "Commit the change".to_owned(),
+                    source: "await commit()".to_owned(),
+                    timeout: None,
+                },
+            },
+        });
+        assert_eq!(app.entries[1].body, "await commit()");
+        assert!(app.entries[1].pending_tool);
+        assert!(app.entries[2].pending_tool);
+
+        for outcome in [
+            EvalOutcome::Success {
+                output: EvalOutput {
+                    result: EvalValue::Json(serde_json::json!("committed")),
+                    logs: Vec::new(),
+                },
+            },
+            EvalOutcome::Rejected {
+                message: "Combine multiple actions in one eval program.".to_owned(),
+            },
+        ] {
+            app.apply_agent_event(AgentSystemEvent::Run {
+                address: address.clone(),
+                event: RunEvent::EvalCompleted {
+                    run_id: run_id.clone(),
+                    outcome,
+                },
+            });
+        }
+
+        assert!(!app.entries[1].pending_tool);
+        assert!(!app.entries[2].pending_tool);
+        assert_eq!(app.entries[3].kind, EntryKind::ToolResult);
+        assert_eq!(app.entries[4].kind, EntryKind::ToolResult);
+        assert!(app.entries[4].body.contains("Combine multiple actions"));
     }
 
     #[test]

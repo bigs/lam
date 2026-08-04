@@ -15,4 +15,18 @@ pub enum EvalOutcome {
         /// Structured kernel failure.
         error: EvalError,
     },
+    /// The provider emitted a sibling eval which Lam deliberately did not run.
+    Rejected {
+        /// Model-visible explanation of how to express the work in one eval.
+        message: String,
+    },
+}
+
+impl EvalOutcome {
+    pub(crate) fn parallel_tool_call_rejected() -> Self {
+        Self::Rejected {
+            message: "This eval call was not executed because the model response contained multiple tool calls. Lam executes only the first tool call. Combine multiple actions in one eval program: await dependent work sequentially and use Promise.all for independent work."
+                .to_owned(),
+        }
+    }
 }

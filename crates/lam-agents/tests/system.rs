@@ -583,6 +583,7 @@ impl ModelCodec for TestCodec {
         Ok(ModelResponseProjection {
             display: Vec::new(),
             directive,
+            rejected_eval_calls: 0,
         })
     }
 }

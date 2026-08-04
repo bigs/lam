@@ -339,10 +339,11 @@ where
                         metadata,
                     },
                 );
-                let directive = model
+                let projection = model
                     .project_response(&response)
-                    .map_err(|message| ActorError::Codec { message })?
-                    .directive;
+                    .map_err(|message| ActorError::Codec { message })?;
+                let rejected_eval_calls = projection.rejected_eval_calls;
+                let directive = projection.directive;
                 let recorded_at = self.clock.now();
 
                 match directive {
@@ -389,17 +390,23 @@ where
                             Ok(output) => EvalOutcome::Success { output },
                             Err(error) => EvalOutcome::Failure { error },
                         };
-                        emit(
-                            &self.run_events,
-                            events,
-                            RunEvent::EvalCompleted {
-                                run_id: run_id.clone(),
-                                outcome: outcome.clone(),
-                            },
+                        let mut outcomes = Vec::with_capacity(rejected_eval_calls + 1);
+                        outcomes.push(outcome);
+                        outcomes.extend(
+                            std::iter::repeat_with(EvalOutcome::parallel_tool_call_rejected)
+                                .take(rejected_eval_calls),
                         );
-                        let entry = eval_entry(&run_id, &outcome, self.clock.now())?;
-                        state =
-                            append_context(self.store.as_ref(), &self.actor_id, state, entry).await?;
+                        for outcome in &outcomes {
+                            emit(
+                                &self.run_events,
+                                events,
+                                RunEvent::EvalCompleted {
+                                    run_id: run_id.clone(),
+                                    outcome: outcome.clone(),
+                                },
+                            );
+                        }
+                        state = self.append_eval_outcomes(state, &run_id, &outcomes).await?;
                     }
                     ModelDirective::Output(value) => {
                         match self
@@ -592,6 +599,32 @@ where
             },
         );
         Ok(state)
+    }
+
+    async fn append_eval_outcomes(
+        &self,
+        mut state: ActorState,
+        run_id: &RunId,
+        outcomes: &[EvalOutcome],
+    ) -> Result<ActorState, ActorError> {
+        let entries = outcomes
+            .iter()
+            .map(|outcome| eval_entry(run_id, outcome, self.clock.now()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut events = entries.into_iter().map(ActorEvent::context_appended);
+        let first = events.next().ok_or_else(|| ActorError::State {
+            message: "an eval response produced no outcomes".to_owned(),
+        })?;
+        let batch = EventBatch::new(first, events.collect());
+
+        loop {
+            match append_batch(self.store.as_ref(), &self.actor_id, state, batch.clone()).await? {
+                AppendAttempt::Appended(next) => return Ok(next),
+                AppendAttempt::Conflict => {
+                    state = load_state(self.store.as_ref(), &self.actor_id).await?;
+                }
+            }
+        }
     }
 
     async fn append_messages(

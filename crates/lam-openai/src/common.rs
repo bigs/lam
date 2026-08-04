@@ -9,7 +9,7 @@ use crate::error::{BuildError, CodecError, ProviderError};
 use crate::metadata::ModelPricing;
 use crate::transport::HttpTransport;
 
-pub(crate) const EVAL_TOOL_DESCRIPTION: &str = "Run one TypeScript program with top-level await in a persistent Deno isolate. Include a brief one-line intent describing the operation for the user. Top-level state persists across calls. Return a value with the final expression; `lam.result(value)` makes it explicit. Pass structured values directly to `lam.result` without `JSON.stringify`; the runtime handles encoding. Use registered lam APIs for host interaction. Put dependent work in one program and use `Promise.all` for independent work.";
+pub(crate) const EVAL_TOOL_DESCRIPTION: &str = "Run one TypeScript program with top-level await in a persistent Deno isolate. Call this tool at most once per assistant response: combine multiple actions in one program, await dependent work sequentially, and use `Promise.all` for independent work. Additional tool calls in the same response will be rejected without execution. Include a brief one-line intent describing the operation for the user. Top-level state persists across calls. Return a value with the final expression; `lam.result(value)` makes it explicit. Pass structured values directly to `lam.result` without `JSON.stringify`; the runtime handles encoding. Use registered lam APIs for host interaction.";
 
 const LEGACY_EVAL_INTENT: &str = "Evaluate TypeScript";
 const MAX_EVAL_INTENT_CHARS: usize = 120;

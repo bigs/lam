@@ -19,8 +19,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use support::{
-    RejectingCompactionCodec, ScriptedCodec, ScriptedProvider, ScriptedStep, eval, output,
-    output_with_usage, overflow,
+    RejectingCompactionCodec, ScriptedCodec, ScriptedProvider, ScriptedStep, eval,
+    eval_with_rejected_calls, output, output_with_usage, overflow,
 };
 
 fn gated_output(value: Value, gate: Arc<Barrier>) -> ScriptedStep {
@@ -262,6 +262,54 @@ async fn model_eval_builtin_result_and_terminal_output_form_one_run() {
             ..
         }
     ));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn parallel_eval_calls_execute_the_first_and_reject_the_rest() {
+    let provider = ScriptedProvider::new([
+        eval_with_rejected_calls("await acme.math.double(21)", 2),
+        output("done"),
+    ]);
+    let math = Namespace::new("acme.math", "Fixture arithmetic.").function(
+        "double",
+        "Doubles one integer.",
+        |_context, input: i64| async move { Ok::<_, Never>(input * 2) },
+    );
+    let mut actor = build_actor(provider.clone(), [math]).await;
+    let actor_ref = actor.actor_ref();
+
+    let mut run = actor.call("run the calls");
+    let mut outcomes = Vec::new();
+    while let Some(event) = run.next().await {
+        if let RunEvent::EvalCompleted { outcome, .. } = event {
+            outcomes.push(outcome);
+        }
+    }
+    assert_eq!(run.await.unwrap(), "done");
+    assert!(matches!(outcomes[0], lam::EvalOutcome::Success { .. }));
+    assert_eq!(outcomes.len(), 3);
+    for outcome in &outcomes[1..] {
+        let lam::EvalOutcome::Rejected { message } = outcome else {
+            panic!("sibling eval should be rejected: {outcome:?}");
+        };
+        assert!(message.contains("executes only the first tool call"));
+        assert!(message.contains("Promise.all"));
+    }
+
+    let state = actor_ref.state().await.unwrap();
+    let evals = state
+        .context()
+        .iter()
+        .filter(|entry| matches!(entry.entry.transition, ContextTransition::Eval { .. }))
+        .collect::<Vec<_>>();
+    assert_eq!(evals.len(), 3);
+    assert_eq!(evals[0].entry.payload.value["status"], "success");
+    assert_eq!(evals[1].entry.payload.value["status"], "rejected");
+    assert_eq!(evals[2].entry.payload.value["status"], "rejected");
+
+    let requests = provider.requests();
+    let follow_up = requests[1].value.to_string();
+    assert_eq!(follow_up.matches("lam/eval").count(), 3);
 }
 
 #[tokio::test(flavor = "current_thread")]

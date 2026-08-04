@@ -1,5 +1,6 @@
 //! OpenAI Responses API adapter.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use lam::{
@@ -474,11 +475,7 @@ impl ModelCodec for ResponsesCodec {
             });
         }
         let calls = function_calls(envelope.value)?;
-        if calls.len() > 1 {
-            return Err(CodecError::InvalidDirective {
-                message: "the model requested more than one eval".to_owned(),
-            });
-        }
+        let rejected_eval_calls = calls.len().saturating_sub(1);
         let display = response_display_deltas(envelope.value);
         let directive = if let Some(call) = calls.first() {
             if call.name != "eval" {
@@ -491,7 +488,11 @@ impl ModelCodec for ResponsesCodec {
             let text = response_text(envelope.value)?;
             output_value(envelope.output_kind, text).map(ModelDirective::Output)?
         };
-        Ok(ModelResponseProjection { display, directive })
+        Ok(ModelResponseProjection {
+            display,
+            directive,
+            rejected_eval_calls,
+        })
     }
 
     fn response_metadata(&self, response: &EncodedPayload) -> ModelResponseMetadata {
@@ -532,14 +533,14 @@ impl ModelCodec for ResponsesCodec {
 
 fn encode_context(context: &[ProjectedContextEntry]) -> Result<Vec<Value>, CodecError> {
     let mut input = Vec::new();
-    let mut pending_eval = None;
+    let mut pending_eval = VecDeque::new();
     for projected in context {
         let payload = &projected.entry.payload;
         if matches!(
             projected.entry.transition,
             ContextTransition::Compaction { .. }
         ) {
-            if pending_eval.is_some() {
+            if !pending_eval.is_empty() {
                 return Err(CodecError::InvalidPayload {
                     message: "compaction replacement cannot split an eval call and result"
                         .to_owned(),
@@ -560,10 +561,10 @@ fn encode_context(context: &[ProjectedContextEntry]) -> Result<Vec<Value>, Codec
             input.extend(replacement.iter().cloned());
         } else if is_codec(payload, LAM_MESSAGES_CODEC_ID, LAM_CODEC_VERSION) {
             for message in messages(&payload.value)? {
-                if message.closes_interrupted_eval
-                    && let Some(call_id) = pending_eval.take()
-                {
-                    input.push(function_output(call_id, message.text.clone()));
+                if message.closes_interrupted_eval {
+                    for call_id in pending_eval.drain(..) {
+                        input.push(function_output(call_id, message.text.clone()));
+                    }
                 }
                 let role = match message.role {
                     NativeRole::User => "user",
@@ -585,17 +586,16 @@ fn encode_context(context: &[ProjectedContextEntry]) -> Result<Vec<Value>, Codec
                 })?;
             input.extend(output.iter().cloned());
             let calls = function_calls(envelope.value)?;
-            if calls.len() > 1 {
+            if !pending_eval.is_empty() {
                 return Err(CodecError::InvalidPayload {
-                    message: "Responses payload contains more than one function call".to_owned(),
+                    message: "Responses function calls have no results before the next response"
+                        .to_owned(),
                 });
             }
-            if let Some(call) = calls.first() {
-                pending_eval = Some(call.call_id.clone());
-            }
+            pending_eval.extend(calls.into_iter().map(|call| call.call_id));
         } else if is_codec(payload, LAM_EVAL_CODEC_ID, LAM_CODEC_VERSION) {
             let call_id = pending_eval
-                .take()
+                .pop_front()
                 .ok_or_else(|| CodecError::InvalidPayload {
                     message: "lam/eval has no preceding Responses function call".to_owned(),
                 })?;
@@ -604,7 +604,7 @@ fn encode_context(context: &[ProjectedContextEntry]) -> Result<Vec<Value>, Codec
             return Err(unsupported(payload));
         }
     }
-    if pending_eval.is_some() {
+    if !pending_eval.is_empty() {
         return Err(CodecError::InvalidPayload {
             message: "Responses function call has no eval result or interruption notice".to_owned(),
         });

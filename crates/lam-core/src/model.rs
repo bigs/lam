@@ -89,6 +89,13 @@ pub struct ModelResponseProjection {
     pub display: Vec<ModelDelta>,
     /// The single runtime action represented by the completed response.
     pub directive: ModelDirective,
+    /// Additional native eval calls which must receive rejection results.
+    ///
+    /// Lam executes only the first eval from a response. Some compatible
+    /// providers ignore their parallel-tool-call control, so codecs retain
+    /// those sibling calls for native replay while asking the runtime to
+    /// reject them without execution.
+    pub rejected_eval_calls: usize,
 }
 
 /// Provider-neutral model output suitable for live or historical display.

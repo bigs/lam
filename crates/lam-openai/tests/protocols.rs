@@ -127,6 +127,80 @@ fn responses_request_is_stateless_and_replays_encrypted_reasoning_unchanged() {
     assert_eq!(body["input"][1], function_call);
     assert_eq!(body["input"][2]["type"], "function_call_output");
     assert_eq!(body["input"][2]["call_id"], "call_1");
+    assert!(
+        body["tools"][0]["description"]
+            .as_str()
+            .unwrap()
+            .contains("at most once per assistant response")
+    );
+}
+
+#[test]
+fn responses_replays_rejections_for_parallel_eval_siblings() {
+    let (_, codec) = Responses::builder("gpt-test")
+        .api_key("test-key")
+        .build_parts()
+        .unwrap();
+    let call = |id: &str, source: &str| {
+        json!({
+            "type": "function_call",
+            "id": format!("fc_{id}"),
+            "call_id": id,
+            "name": "eval",
+            "arguments": json!({
+                "intent": format!("Run {source}"),
+                "source": source,
+                "timeoutMs": null,
+            }).to_string(),
+            "status": "completed",
+        })
+    };
+    let response = response_payload(
+        RESPONSES_RESPONSE_CODEC_ID,
+        "text",
+        "response",
+        json!({
+            "status": "completed",
+            "output": [call("call_1", "1 + 1"), call("call_2", "2 + 2")],
+        }),
+    );
+    let projection = codec.project_response(&response).unwrap();
+    assert_eq!(projection.rejected_eval_calls, 1);
+    assert!(matches!(
+        projection.directive,
+        ModelDirective::Eval(lam::EvalRequest { ref source, .. }) if source == "1 + 1"
+    ));
+
+    let request = codec
+        .encode_request(
+            &[
+                projected(1, model_transition(), response),
+                projected(
+                    2,
+                    eval_transition(),
+                    payload("lam/eval", json!({ "status": "success", "output": 2 })),
+                ),
+                projected(
+                    3,
+                    eval_transition(),
+                    payload(
+                        "lam/eval",
+                        json!({
+                            "status": "rejected",
+                            "message": "combine the work in one eval"
+                        }),
+                    ),
+                ),
+            ],
+            &ModelRequestConfig::agent(&OutputContract::Text, ""),
+        )
+        .unwrap();
+    let input = request.value["body"]["input"].as_array().unwrap();
+    assert_eq!(input[2]["type"], "function_call_output");
+    assert_eq!(input[2]["call_id"], "call_1");
+    assert_eq!(input[3]["type"], "function_call_output");
+    assert_eq!(input[3]["call_id"], "call_2");
+    assert!(input[3]["output"].as_str().unwrap().contains("rejected"));
 }
 
 #[test]
@@ -529,6 +603,91 @@ fn chat_replays_reasoning_extensions_and_tool_calls_from_native_chunks() {
     );
     assert_eq!(body["messages"][1]["role"], "tool");
     assert_eq!(body["messages"][1]["tool_call_id"], "call_1");
+    assert!(
+        body["tools"][0]["function"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("at most once per assistant response")
+    );
+}
+
+#[test]
+fn chat_replays_rejections_for_parallel_eval_siblings() {
+    let (_, codec) = ChatCompletions::builder("test-model")
+        .include_usage(false)
+        .build_parts()
+        .unwrap();
+    let response = response_payload(
+        CHAT_RESPONSE_CODEC_ID,
+        "text",
+        "response",
+        json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "eval",
+                                "arguments": "{\"intent\":\"First\",\"source\":\"1 + 1\",\"timeoutMs\":null}"
+                            }
+                        },
+                        {
+                            "id": "call_2",
+                            "type": "function",
+                            "function": {
+                                "name": "eval",
+                                "arguments": "{\"intent\":\"Second\",\"source\":\"2 + 2\",\"timeoutMs\":null}"
+                            }
+                        }
+                    ]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }),
+    );
+    let projection = codec.project_response(&response).unwrap();
+    assert_eq!(projection.rejected_eval_calls, 1);
+    assert!(matches!(
+        projection.directive,
+        ModelDirective::Eval(lam::EvalRequest { ref source, .. }) if source == "1 + 1"
+    ));
+
+    let request = codec
+        .encode_request(
+            &[
+                projected(1, model_transition(), response),
+                projected(
+                    2,
+                    eval_transition(),
+                    payload("lam/eval", json!({ "status": "success", "output": 2 })),
+                ),
+                projected(
+                    3,
+                    eval_transition(),
+                    payload(
+                        "lam/eval",
+                        json!({
+                            "status": "rejected",
+                            "message": "combine the work in one eval"
+                        }),
+                    ),
+                ),
+            ],
+            &ModelRequestConfig::agent(&OutputContract::Text, ""),
+        )
+        .unwrap();
+    let messages = request.value["body"]["messages"].as_array().unwrap();
+    assert_eq!(messages[1]["tool_call_id"], "call_1");
+    assert_eq!(messages[2]["tool_call_id"], "call_2");
+    assert!(
+        messages[2]["content"]
+            .as_str()
+            .unwrap()
+            .contains("rejected")
+    );
 }
 
 #[test]
