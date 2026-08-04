@@ -15,7 +15,7 @@ use crate::control::RunPhase;
 use crate::model::RegisteredModel;
 use crate::runner::{ActorRunner, emit, wait_for_abort};
 use crate::runtime_journal::{
-    AppendAttempt, append_batch, append_context, append_event, load_state,
+    AppendAttempt, append_batch, append_context, append_event, load_state, refresh_state,
 };
 use crate::{ActorError, ModelSwitchPolicy, ModelSwitchReceipt, RunEvent, RuntimeEvent};
 
@@ -162,8 +162,8 @@ where
                     model_id: target_id.clone(),
                 })?;
 
+        let mut state = load_state(self.store.as_ref(), &self.actor_id).await?;
         loop {
-            let state = load_state(self.store.as_ref(), &self.actor_id).await?;
             let source = self.selected_model(&state)?.clone();
             let previous_id = state
                 .selected_model()
@@ -262,7 +262,11 @@ where
                                 compaction: Some(compaction),
                             });
                         }
-                        AppendAttempt::Conflict => continue,
+                        AppendAttempt::Conflict(conflicted) => {
+                            state = refresh_state(self.store.as_ref(), &self.actor_id, conflicted)
+                                .await?;
+                            continue;
+                        }
                     }
                 }
             }
@@ -276,7 +280,10 @@ where
                         compaction: None,
                     });
                 }
-                AppendAttempt::Conflict => continue,
+                AppendAttempt::Conflict(conflicted) => {
+                    state = refresh_state(self.store.as_ref(), &self.actor_id, conflicted).await?;
+                    continue;
+                }
             }
         }
     }

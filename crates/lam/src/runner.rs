@@ -606,8 +606,8 @@ where
         let notice_message_id = self.ids.message_id();
         let recorded_at = self.clock.now();
 
+        let mut state = load_state(self.store.as_ref(), &self.actor_id).await?;
         loop {
-            let state = load_state(self.store.as_ref(), &self.actor_id).await?;
             if state.active_run() != Some(run_id) {
                 return Err(ActorError::State {
                     message: format!(
@@ -691,7 +691,9 @@ where
                         interrupted_eval_outcome,
                     });
                 }
-                AppendAttempt::Conflict => continue,
+                AppendAttempt::Conflict(conflicted) => {
+                    state = refresh_state(self.store.as_ref(), &self.actor_id, conflicted).await?;
+                }
             }
         }
     }
@@ -740,8 +742,8 @@ where
         loop {
             match append_batch(self.store.as_ref(), &self.actor_id, state, batch.clone()).await? {
                 AppendAttempt::Appended(next) => return Ok(next),
-                AppendAttempt::Conflict => {
-                    state = load_state(self.store.as_ref(), &self.actor_id).await?;
+                AppendAttempt::Conflict(conflicted) => {
+                    state = refresh_state(self.store.as_ref(), &self.actor_id, conflicted).await?;
                 }
             }
         }
@@ -774,8 +776,8 @@ where
             let event = state.plan_context_append(entry).map_err(state_error)?;
             match append_event(self.store.as_ref(), &self.actor_id, state, event).await? {
                 AppendAttempt::Appended(next) => return Ok((next, message_ids)),
-                AppendAttempt::Conflict => {
-                    state = load_state(self.store.as_ref(), &self.actor_id).await?;
+                AppendAttempt::Conflict(conflicted) => {
+                    state = refresh_state(self.store.as_ref(), &self.actor_id, conflicted).await?;
                 }
             }
         }
@@ -797,8 +799,9 @@ where
                         AppendAttempt::Appended(next) => {
                             return Ok(OutputAppend::Completed(next));
                         }
-                        AppendAttempt::Conflict => {
-                            state = load_state(self.store.as_ref(), &self.actor_id).await?;
+                        AppendAttempt::Conflict(conflicted) => {
+                            state = refresh_state(self.store.as_ref(), &self.actor_id, conflicted)
+                                .await?;
                         }
                     }
                 }

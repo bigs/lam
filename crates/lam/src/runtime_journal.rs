@@ -15,7 +15,9 @@ const JOURNAL_PAGE_SIZE: NonZeroUsize = NonZeroUsize::new(256).expect("256 is no
 
 pub(crate) enum AppendAttempt {
     Appended(ActorState),
-    Conflict,
+    /// The compare-and-append conflicted. The projection is returned so the
+    /// caller can refresh incrementally instead of replaying the journal.
+    Conflict(ActorState),
 }
 
 pub(crate) async fn load_state<S>(store: &S, actor_id: &ActorId) -> Result<ActorState, ActorError>
@@ -73,9 +75,9 @@ where
             .map_err(state_error)?;
         match append_event(store, actor_id, state, event).await? {
             AppendAttempt::Appended(next) => return Ok((next, created)),
-            AppendAttempt::Conflict => {
+            AppendAttempt::Conflict(conflicted) => {
                 created = false;
-                state = load_state(store, actor_id).await?;
+                state = refresh_state(store, actor_id, conflicted).await?;
             }
         }
     }
@@ -112,7 +114,9 @@ where
                         };
                         return Ok((receipt, next));
                     }
-                    AppendAttempt::Conflict => state = load_state(store, actor_id).await?,
+                    AppendAttempt::Conflict(conflicted) => {
+                        state = refresh_state(store, actor_id, conflicted).await?
+                    }
                 }
             }
         }
@@ -134,7 +138,9 @@ where
             .map_err(state_error)?;
         match append_event(store, actor_id, state, event).await? {
             AppendAttempt::Appended(next) => return Ok(next),
-            AppendAttempt::Conflict => state = load_state(store, actor_id).await?,
+            AppendAttempt::Conflict(conflicted) => {
+                state = refresh_state(store, actor_id, conflicted).await?
+            }
         }
     }
 }
@@ -186,7 +192,7 @@ where
                 .map_err(state_error)?;
             Ok(AppendAttempt::Appended(state))
         }
-        AppendOutcome::Conflict { .. } => Ok(AppendAttempt::Conflict),
+        AppendOutcome::Conflict { .. } => Ok(AppendAttempt::Conflict(state)),
     }
 }
 
@@ -491,5 +497,63 @@ mod tests {
         let state = load_state(store.as_ref(), &actor).await.expect("load");
         assert_eq!(state.messages().len(), 2);
         assert_eq!(state.revision(), Revision::new(4));
+    }
+
+    #[tokio::test]
+    async fn conflicted_append_returns_the_state_for_incremental_refresh() {
+        let store = Arc::new(MemStore::new());
+        let actor = root();
+        let seed = envelope("m1", "seed");
+        let _ = store
+            .append(
+                &actor,
+                Revision::ZERO,
+                EventBatch::one(ActorEvent::message_admitted(seed)),
+            )
+            .await
+            .expect("append");
+        let state = load_state(store.as_ref(), &actor).await.expect("load");
+
+        // Another path advances the head behind the projected state.
+        let external = envelope("x1", "external");
+        let _ = store
+            .append(
+                &actor,
+                state.revision(),
+                EventBatch::one(ActorEvent::message_admitted(external.clone())),
+            )
+            .await
+            .expect("append");
+
+        // Appending with the stale state conflicts and hands the projection
+        // back so the retry refreshes incrementally instead of replaying.
+        let batch = EventBatch::one(ActorEvent::message_admitted(envelope("m2", "mine")));
+        let attempt = append_batch(store.as_ref(), &actor, state, batch)
+            .await
+            .expect("append");
+        let state = match attempt {
+            AppendAttempt::Conflict(state) => state,
+            AppendAttempt::Appended(_) => panic!("a stale append must conflict"),
+        };
+        let state = refresh_state(store.as_ref(), &actor, state)
+            .await
+            .expect("refresh");
+        let retry = envelope("m2", "mine");
+        match append_batch(
+            store.as_ref(),
+            &actor,
+            state,
+            EventBatch::one(ActorEvent::message_admitted(retry.clone())),
+        )
+        .await
+        .expect("append")
+        {
+            AppendAttempt::Appended(state) => {
+                assert_eq!(state.revision(), Revision::new(3));
+                assert!(state.message(external.message_id()).is_some());
+                assert!(state.message(retry.message_id()).is_some());
+            }
+            AppendAttempt::Conflict(_) => panic!("a refreshed retry must append"),
+        }
     }
 }
