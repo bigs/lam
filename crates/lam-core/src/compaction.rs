@@ -496,6 +496,8 @@ fn validate_ratio(amount: ContextAmount) -> Result<(), CompactionConfigError> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use serde_json::json;
 
     use super::*;
@@ -509,11 +511,11 @@ mod tests {
         ProjectedContextEntry {
             sequence: ContextSequence::new(sequence),
             revision: Revision::new(sequence),
-            entry: ContextEntry {
+            entry: Arc::new(ContextEntry {
                 transition,
                 payload: EncodedPayload::lam_json(value).expect("fixture should encode"),
                 recorded_at: Timestamp::from_unix_millis(0),
-            },
+            }),
         }
     }
 

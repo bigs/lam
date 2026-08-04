@@ -86,7 +86,7 @@ where
                 context.push(ProjectedContextEntry {
                     sequence: ContextSequence::ZERO,
                     revision: Revision::ZERO,
-                    entry: ContextEntry {
+                    entry: Arc::new(ContextEntry {
                         transition: ContextTransition::Compaction {
                             covers_through: ContextSequence::ZERO,
                             run_id: None,
@@ -95,7 +95,7 @@ where
                             .encode()
                             .map_err(|error| CompactionError::new(error.to_string()))?,
                         recorded_at: Timestamp::from_unix_millis(0),
-                    },
+                    }),
                 });
             }
 
@@ -393,11 +393,11 @@ fn replay_marker(
     Ok(ProjectedContextEntry {
         sequence: marker.sequence,
         revision: marker.revision,
-        entry: ContextEntry {
+        entry: Arc::new(ContextEntry {
             transition: marker.entry.transition.clone(),
             payload,
             recorded_at: marker.entry.recorded_at,
-        },
+        }),
     })
 }
 
@@ -432,7 +432,7 @@ fn summary_instruction(
     Ok(ProjectedContextEntry {
         sequence: ContextSequence::new(sequence),
         revision: Revision::ZERO,
-        entry: ContextEntry {
+        entry: Arc::new(ContextEntry {
             transition: ContextTransition::Messages {
                 run_id: lam_core::RunId::new("lam-compaction")
                     .expect("Lam's compaction run id is valid"),
@@ -440,7 +440,7 @@ fn summary_instruction(
             },
             payload: EncodedPayload::new(codec("lam/messages"), value),
             recorded_at: Timestamp::from_unix_millis(0),
-        },
+        }),
     })
 }
 
@@ -471,14 +471,14 @@ mod tests {
         let context = vec![ProjectedContextEntry {
             sequence: ContextSequence::new(1),
             revision: Revision::new(1),
-            entry: ContextEntry {
+            entry: Arc::new(ContextEntry {
                 transition: ContextTransition::Model {
                     run_id: RunId::new("run").unwrap(),
                     progress: RunProgress::Complete,
                 },
                 payload: EncodedPayload::lam_json("old").unwrap(),
                 recorded_at: Timestamp::from_unix_millis(0),
-            },
+            }),
         }];
         let request = CompactionRequest {
             reason: CompactionReason::Manual,

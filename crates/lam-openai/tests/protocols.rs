@@ -1922,11 +1922,11 @@ fn projected(
     ProjectedContextEntry {
         sequence: ContextSequence::new(sequence),
         revision: Revision::new(sequence),
-        entry: ContextEntry {
+        entry: Arc::new(ContextEntry {
             transition,
             payload,
             recorded_at: Timestamp::from_unix_millis(0),
-        },
+        }),
     }
 }
 

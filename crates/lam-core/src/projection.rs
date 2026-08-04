@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use crate::{
     ACTOR_EVENT_SCHEMA_VERSION, ActorEvent, ActorEventData, ContextEntry, ContextSequence,
@@ -24,8 +25,11 @@ pub struct ProjectedContextEntry {
     pub sequence: ContextSequence,
     /// Actor-journal revision which stored the entry.
     pub revision: Revision,
-    /// Model-visible item.
-    pub entry: ContextEntry,
+    /// Model-visible item. Shared immutably: entries are never mutated once
+    /// they enter the projection, so cloning a projection clones a cheap Arc
+    /// instead of the (potentially large) payload. A future mutator would
+    /// need Arc::make_mut or an explicit lock.
+    pub entry: Arc<ContextEntry>,
 }
 
 /// Pure current-state projection of one actor journal.
@@ -421,7 +425,7 @@ impl ActorState {
         self.context.push(ProjectedContextEntry {
             sequence,
             revision,
-            entry,
+            entry: Arc::new(entry),
         });
         Ok(())
     }
