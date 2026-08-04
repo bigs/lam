@@ -340,8 +340,9 @@ where
                     },
                 );
                 let directive = model
-                    .interpret_response(&response)
-                    .map_err(|message| ActorError::Codec { message })?;
+                    .project_response(&response)
+                    .map_err(|message| ActorError::Codec { message })?
+                    .directive;
                 let recorded_at = self.clock.now();
 
                 match directive {

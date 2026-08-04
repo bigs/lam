@@ -12,7 +12,7 @@ use lam::{
     ActorEventData, ActorId, ActorState, AppendOutcome, CodecId, CodecRef, EncodedPayload,
     EvalRequest, EventBatch, JournalError, JournalPage, JournalStore, Lam, MemStore, MessageSource,
     Model, ModelCodec, ModelDescriptor, ModelDirective, ModelEventSink, ModelProvider,
-    ModelRequestConfig, OutputContract, Revision,
+    ModelRequestConfig, ModelResponseProjection, OutputContract, Revision,
 };
 use lam_agents::{
     ActorAddress, AgentOutcome, AgentSystem, AgentSystemError, AgentSystemEvent, StopReason,
@@ -555,9 +555,12 @@ impl ModelCodec for TestCodec {
         })))
     }
 
-    fn interpret_response(&self, response: &EncodedPayload) -> Result<ModelDirective, Self::Error> {
-        match response.value.get("kind").and_then(Value::as_str) {
-            Some("eval") => Ok(ModelDirective::Eval(EvalRequest {
+    fn project_response(
+        &self,
+        response: &EncodedPayload,
+    ) -> Result<ModelResponseProjection, Self::Error> {
+        let directive = match response.value.get("kind").and_then(Value::as_str) {
+            Some("eval") => ModelDirective::Eval(EvalRequest {
                 intent: response
                     .value
                     .get("intent")
@@ -571,12 +574,16 @@ impl ModelCodec for TestCodec {
                     .ok_or(TestCodecError)?
                     .to_owned(),
                 timeout: None,
-            })),
-            Some("output") => Ok(ModelDirective::Output(
-                response.value.get("value").cloned().ok_or(TestCodecError)?,
-            )),
-            _ => Err(TestCodecError),
-        }
+            }),
+            Some("output") => {
+                ModelDirective::Output(response.value.get("value").cloned().ok_or(TestCodecError)?)
+            }
+            _ => return Err(TestCodecError),
+        };
+        Ok(ModelResponseProjection {
+            display: Vec::new(),
+            directive,
+        })
     }
 }
 

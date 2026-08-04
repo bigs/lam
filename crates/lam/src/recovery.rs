@@ -116,7 +116,7 @@ pub(crate) fn has_pending_eval(state: &ActorState, model: &RegisteredModel) -> b
         return false;
     };
     matches!(
-        model.interpret_response(&last_step.entry.payload),
-        Ok(ModelDirective::Eval(_))
+        model.project_response(&last_step.entry.payload),
+        Ok(projection) if matches!(projection.directive, ModelDirective::Eval(_))
     )
 }

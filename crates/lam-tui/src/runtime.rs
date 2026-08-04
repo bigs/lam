@@ -5,9 +5,9 @@ use std::sync::{Arc, RwLock};
 use lam::{
     ActorError, ActorEventData, ActorId, ActorState, CompactionArtifact, CompactionRecord,
     ContextTransition, EncodedPayload, InterruptedEvalOutcome, IsolateState, JournalStore, Lam,
-    LamBuilder, MemStore, MessageSource, Model, ModelCodec, ModelDescriptor, ModelDirective,
-    ModelRequestConfig, ModelResponseMetadata, ProjectedContextEntry, Revision,
-    SYSTEM_NOTICE_CODEC_ID, SystemNotice,
+    LamBuilder, MemStore, MessageSource, Model, ModelCodec, ModelDelta, ModelDescriptor,
+    ModelDirective, ModelRequestConfig, ModelResponseMetadata, ModelResponseProjection,
+    ProjectedContextEntry, Revision, SYSTEM_NOTICE_CODEC_ID, SystemNotice,
 };
 use lam_agents::{
     Agent, AgentSystem, AgentSystemError, AgentSystemEvents, AgentTreeInterruptionReceipt,
@@ -69,6 +69,7 @@ impl AgentHistory {
 pub(crate) enum HistoryKind {
     User,
     Assistant,
+    Reasoning,
     ToolCall,
     ToolResult,
     System,
@@ -445,8 +446,11 @@ where
         Ok(request)
     }
 
-    fn interpret_response(&self, response: &EncodedPayload) -> Result<ModelDirective, Self::Error> {
-        self.inner.interpret_response(response)
+    fn project_response(
+        &self,
+        response: &EncodedPayload,
+    ) -> Result<ModelResponseProjection, Self::Error> {
+        self.inner.project_response(response)
     }
 
     fn response_metadata(&self, response: &EncodedPayload) -> ModelResponseMetadata {
@@ -514,12 +518,65 @@ impl AnyModel {
         }
     }
 
-    fn interpret_response(&self, payload: &lam::EncodedPayload) -> Option<ModelDirective> {
+    fn project_response(&self, payload: &lam::EncodedPayload) -> Option<ModelResponseProjection> {
         match self {
-            Self::Responses(model) => model.shared_parts().1.interpret_response(payload).ok(),
-            Self::ChatCompletions(model) => model.shared_parts().1.interpret_response(payload).ok(),
+            Self::Responses(model) => model.shared_parts().1.project_response(payload).ok(),
+            Self::ChatCompletions(model) => model.shared_parts().1.project_response(payload).ok(),
         }
     }
+}
+
+fn append_model_delta(history: &mut Vec<HistoryEntry>, address: &str, delta: ModelDelta) {
+    let (kind, title, body) = match delta {
+        ModelDelta::Text(text) if text.is_empty() => return,
+        ModelDelta::Text(text) => (HistoryKind::Assistant, address.to_owned(), text),
+        ModelDelta::Reasoning(text) if text.is_empty() => return,
+        ModelDelta::Reasoning(text) => (
+            HistoryKind::Reasoning,
+            format!("{address} · reasoning"),
+            text,
+        ),
+        ModelDelta::ToolCall(_) => return,
+    };
+    if let Some(last) = history.last_mut()
+        && last.kind == kind
+        && last.title == title
+    {
+        last.body.push_str(&body);
+    } else {
+        history.push(HistoryEntry { kind, title, body });
+    }
+}
+
+fn append_model_projection(
+    history: &mut Vec<HistoryEntry>,
+    address: &str,
+    projection: ModelResponseProjection,
+) {
+    let mut projected = Vec::new();
+    for delta in projection.display {
+        append_model_delta(&mut projected, address, delta);
+    }
+    match projection.directive {
+        ModelDirective::Eval(request) => projected.push(HistoryEntry {
+            kind: HistoryKind::ToolCall,
+            title: format!("{address} · {}", request.intent),
+            body: request.source,
+        }),
+        ModelDirective::Output(output) => {
+            let has_text = projected
+                .iter()
+                .any(|entry| entry.kind == HistoryKind::Assistant);
+            if !has_text {
+                projected.push(HistoryEntry {
+                    kind: HistoryKind::Assistant,
+                    title: address.to_owned(),
+                    body: display_json(&output),
+                });
+            }
+        }
+    }
+    history.extend(projected);
 }
 
 fn session_history(
@@ -566,20 +623,13 @@ fn session_history(
                 }
             }
             ContextTransition::Model { .. } => {
-                let directive = models
+                let projection = models
                     .iter()
-                    .find_map(|configured| configured.model.interpret_response(&entry.payload));
-                match directive {
-                    Some(ModelDirective::Eval(request)) => history.push(HistoryEntry {
-                        kind: HistoryKind::ToolCall,
-                        title: format!("{address} · {}", request.intent),
-                        body: request.source,
-                    }),
-                    Some(ModelDirective::Output(output)) => history.push(HistoryEntry {
-                        kind: HistoryKind::Assistant,
-                        title: address.to_owned(),
-                        body: display_json(&output),
-                    }),
+                    .find_map(|configured| configured.model.project_response(&entry.payload));
+                match projection {
+                    Some(projection) => {
+                        append_model_projection(&mut history, address, projection);
+                    }
                     None => history.push(HistoryEntry {
                         kind: HistoryKind::System,
                         title: "Historical model output".to_owned(),
@@ -910,14 +960,15 @@ mod tests {
     use lam::{
         ActorEvent, ActorId, AppendOutcome, CodecId, CodecRef, DeliveryMode, EncodedPayload,
         EventBatch, InterruptionReason, IsolateState, JournalStore, MessageEnvelope, MessageId,
-        MessageSource, Revision, RunId, SYSTEM_NOTICE_CODEC_ID, SYSTEM_NOTICE_CODEC_VERSION,
-        SystemNotice, Timestamp,
+        MessageSource, ModelDelta, ModelDirective, ModelResponseProjection, Revision, RunId,
+        SYSTEM_NOTICE_CODEC_ID, SYSTEM_NOTICE_CODEC_VERSION, SystemNotice, Timestamp,
     };
     use lam_redb::RedbStore;
     use serde_json::json;
 
     use super::{
-        EffortControl, coding_instruction, first_user_message, insert_json_path, runtime_notice,
+        EffortControl, HistoryKind, append_model_projection, coding_instruction,
+        first_user_message, insert_json_path, runtime_notice,
     };
     use crate::config::ModelChoice;
     use crate::session::Session;
@@ -988,6 +1039,30 @@ mod tests {
                 .contains("external effects may already have completed")
         );
         assert!(row.body.contains("failure result was recorded"));
+    }
+
+    #[test]
+    fn historical_model_projection_restores_reasoning_before_terminal_text() {
+        let mut history = Vec::new();
+        append_model_projection(
+            &mut history,
+            "/root",
+            ModelResponseProjection {
+                display: vec![
+                    ModelDelta::Reasoning("Inspect ".to_owned()),
+                    ModelDelta::Reasoning("the workspace".to_owned()),
+                    ModelDelta::Text("All clear".to_owned()),
+                ],
+                directive: ModelDirective::Output(json!("All clear")),
+            },
+        );
+
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].kind, HistoryKind::Reasoning);
+        assert_eq!(history[0].title, "/root · reasoning");
+        assert_eq!(history[0].body, "Inspect the workspace");
+        assert_eq!(history[1].kind, HistoryKind::Assistant);
+        assert_eq!(history[1].body, "All clear");
     }
 
     #[test]

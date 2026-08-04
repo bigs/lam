@@ -6,7 +6,8 @@ use lam::{
     CodecId, CodecRef, CompactionArtifact, CompactionError, CompactionOutput, CompactionPlan,
     CompactionRequest, Compactor, ContextTransition, EncodedPayload, Model, ModelCodec, ModelDelta,
     ModelDescriptor, ModelDirective, ModelEventSink, ModelProvider, ModelRequestConfig,
-    ModelResponseMetadata, OutputContract, ProjectedContextEntry, ToolCallDelta,
+    ModelResponseMetadata, ModelResponseProjection, OutputContract, ProjectedContextEntry,
+    ToolCallDelta,
 };
 use serde_json::{Map, Value, json};
 
@@ -460,7 +461,10 @@ impl ModelCodec for ResponsesCodec {
         ))
     }
 
-    fn interpret_response(&self, response: &EncodedPayload) -> Result<ModelDirective, Self::Error> {
+    fn project_response(
+        &self,
+        response: &EncodedPayload,
+    ) -> Result<ModelResponseProjection, Self::Error> {
         let envelope = parse_response(response, RESPONSES_RESPONSE_CODEC_ID, "response")?;
         if let Some(status) = envelope.value.get("status").and_then(Value::as_str)
             && status != "completed"
@@ -475,16 +479,19 @@ impl ModelCodec for ResponsesCodec {
                 message: "the model requested more than one eval".to_owned(),
             });
         }
-        if let Some(call) = calls.first() {
+        let display = response_display_deltas(envelope.value);
+        let directive = if let Some(call) = calls.first() {
             if call.name != "eval" {
                 return Err(CodecError::InvalidDirective {
                     message: format!("the model requested unsupported function `{}`", call.name),
                 });
             }
-            return parse_eval_arguments(&call.arguments).map(ModelDirective::Eval);
-        }
-        let text = response_text(envelope.value)?;
-        output_value(envelope.output_kind, text).map(ModelDirective::Output)
+            parse_eval_arguments(&call.arguments).map(ModelDirective::Eval)?
+        } else {
+            let text = response_text(envelope.value)?;
+            output_value(envelope.output_kind, text).map(ModelDirective::Output)?
+        };
+        Ok(ModelResponseProjection { display, directive })
     }
 
     fn response_metadata(&self, response: &EncodedPayload) -> ModelResponseMetadata {
@@ -652,6 +659,57 @@ struct FunctionCall {
     call_id: String,
     name: String,
     arguments: String,
+}
+
+fn response_display_deltas(response: &Value) -> Vec<ModelDelta> {
+    let mut deltas = Vec::new();
+    let Some(output) = response.get("output").and_then(Value::as_array) else {
+        return deltas;
+    };
+    for (index, item) in output.iter().enumerate() {
+        match item.get("type").and_then(Value::as_str) {
+            Some("reasoning") => {
+                for field in ["content", "summary"] {
+                    let Some(parts) = item.get(field).and_then(Value::as_array) else {
+                        continue;
+                    };
+                    deltas.extend(parts.iter().filter_map(|part| {
+                        part.get("text")
+                            .and_then(Value::as_str)
+                            .filter(|text| !text.is_empty())
+                            .map(|text| ModelDelta::Reasoning(text.to_owned()))
+                    }));
+                }
+            }
+            Some("message") => {
+                let Some(content) = item.get("content").and_then(Value::as_array) else {
+                    continue;
+                };
+                deltas.extend(content.iter().filter_map(|part| {
+                    part.get("text")
+                        .and_then(Value::as_str)
+                        .or_else(|| part.get("refusal").and_then(Value::as_str))
+                        .filter(|text| !text.is_empty())
+                        .map(|text| ModelDelta::Text(text.to_owned()))
+                }));
+            }
+            Some("function_call") => deltas.push(ModelDelta::ToolCall(ToolCallDelta {
+                index,
+                call_id: item
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                name: item.get("name").and_then(Value::as_str).map(str::to_owned),
+                arguments: item
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+            })),
+            _ => {}
+        }
+    }
+    deltas
 }
 
 fn function_calls(response: &Value) -> Result<Vec<FunctionCall>, CodecError> {

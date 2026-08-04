@@ -3,7 +3,8 @@
 use lam::{
     CodecId, CodecRef, CompactionArtifact, ContextTransition, EncodedPayload, Model, ModelCodec,
     ModelDelta, ModelDescriptor, ModelDirective, ModelEventSink, ModelProvider, ModelRequestConfig,
-    ModelResponseMetadata, OutputContract, ProjectedContextEntry, ToolCallDelta,
+    ModelResponseMetadata, ModelResponseProjection, OutputContract, ProjectedContextEntry,
+    ToolCallDelta,
 };
 use serde_json::{Map, Value, json};
 
@@ -464,8 +465,15 @@ const fn provider_error_kind(error: &ProviderError) -> &'static str {
 }
 
 fn emit_chunk_deltas(events: &ModelEventSink, chunk: &Value) {
+    for delta in chunk_deltas(chunk) {
+        events.emit(delta);
+    }
+}
+
+fn chunk_deltas(chunk: &Value) -> Vec<ModelDelta> {
+    let mut output = Vec::new();
     let Some(choices) = chunk.get("choices").and_then(Value::as_array) else {
-        return;
+        return output;
     };
     for delta in choices
         .iter()
@@ -476,7 +484,7 @@ fn emit_chunk_deltas(events: &ModelEventSink, chunk: &Value) {
             .and_then(Value::as_str)
             .filter(|text| !text.is_empty())
         {
-            events.emit(ModelDelta::Text(text.to_owned()));
+            output.push(ModelDelta::Text(text.to_owned()));
         }
         for field in ["reasoning_content", "reasoning", "thinking"] {
             if let Some(text) = delta
@@ -484,7 +492,7 @@ fn emit_chunk_deltas(events: &ModelEventSink, chunk: &Value) {
                 .and_then(Value::as_str)
                 .filter(|text| !text.is_empty())
             {
-                events.emit(ModelDelta::Reasoning(text.to_owned()));
+                output.push(ModelDelta::Reasoning(text.to_owned()));
             }
         }
         if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
@@ -495,7 +503,7 @@ fn emit_chunk_deltas(events: &ModelEventSink, chunk: &Value) {
                     .and_then(|index| usize::try_from(index).ok())
                     .unwrap_or(position);
                 let function = call.get("function");
-                events.emit(ModelDelta::ToolCall(ToolCallDelta {
+                output.push(ModelDelta::ToolCall(ToolCallDelta {
                     index,
                     call_id: call.get("id").and_then(Value::as_str).map(str::to_owned),
                     name: function
@@ -511,6 +519,7 @@ fn emit_chunk_deltas(events: &ModelEventSink, chunk: &Value) {
             }
         }
     }
+    output
 }
 
 /// Pure Chat Completions request/replay codec.
@@ -607,7 +616,10 @@ impl ModelCodec for ChatCompletionsCodec {
         ))
     }
 
-    fn interpret_response(&self, response: &EncodedPayload) -> Result<ModelDirective, Self::Error> {
+    fn project_response(
+        &self,
+        response: &EncodedPayload,
+    ) -> Result<ModelResponseProjection, Self::Error> {
         let (output_kind, message, finish_reason) = response_message(response)?;
         if let Some(reason) = finish_reason
             && !matches!(reason.as_str(), "stop" | "tool_calls" | "function_call")
@@ -622,15 +634,18 @@ impl ModelCodec for ChatCompletionsCodec {
                 message: "the model requested more than one eval".to_owned(),
             });
         }
-        if let Some(call) = calls.first() {
+        let display = response_display_deltas(response, &message, &calls);
+        let directive = if let Some(call) = calls.first() {
             if call.name != "eval" {
                 return Err(CodecError::InvalidDirective {
                     message: format!("the model requested unsupported function `{}`", call.name),
                 });
             }
-            return parse_eval_arguments(&call.arguments).map(ModelDirective::Eval);
-        }
-        output_value(output_kind, message_text(&message)?).map(ModelDirective::Output)
+            parse_eval_arguments(&call.arguments).map(ModelDirective::Eval)?
+        } else {
+            output_value(output_kind, message_text(&message)?).map(ModelDirective::Output)?
+        };
+        Ok(ModelResponseProjection { display, directive })
     }
 
     fn response_metadata(&self, response: &EncodedPayload) -> ModelResponseMetadata {
@@ -874,6 +889,41 @@ fn response_message(
             .map(str::to_owned);
         Ok((envelope.output_kind, message, finish_reason))
     }
+}
+
+fn response_display_deltas(
+    response: &EncodedPayload,
+    message: &Value,
+    calls: &[ToolCall],
+) -> Vec<ModelDelta> {
+    if let Some(chunks) = response.value.get("chunks").and_then(Value::as_array) {
+        return chunks.iter().flat_map(chunk_deltas).collect();
+    }
+
+    let mut deltas = Vec::new();
+    for field in ["reasoning_content", "reasoning", "thinking"] {
+        if let Some(reasoning) = message
+            .get(field)
+            .and_then(Value::as_str)
+            .filter(|reasoning| !reasoning.is_empty())
+        {
+            deltas.push(ModelDelta::Reasoning(reasoning.to_owned()));
+        }
+    }
+    if let Ok(text) = message_text(message)
+        && !text.is_empty()
+    {
+        deltas.push(ModelDelta::Text(text));
+    }
+    deltas.extend(calls.iter().enumerate().map(|(index, call)| {
+        ModelDelta::ToolCall(ToolCallDelta {
+            index,
+            call_id: Some(call.id.clone()),
+            name: Some(call.name.clone()),
+            arguments: call.arguments.clone(),
+        })
+    }));
+    deltas
 }
 
 fn streamed_finish_reason(chunks: &[Value]) -> Option<String> {

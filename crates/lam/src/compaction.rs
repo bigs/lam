@@ -121,8 +121,9 @@ where
             let metadata = self.codec.response_metadata(&response);
             let directive = self
                 .codec
-                .interpret_response(&response)
-                .map_err(|error| CompactionError::new(error.to_string()))?;
+                .project_response(&response)
+                .map_err(|error| CompactionError::new(error.to_string()))?
+                .directive;
             let ModelDirective::Output(Value::String(summary)) = directive else {
                 return Err(CompactionError::new(
                     "summary model did not return one text completion",

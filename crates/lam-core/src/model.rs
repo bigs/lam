@@ -78,7 +78,20 @@ pub enum ModelDirective {
     Output(Value),
 }
 
-/// Ephemeral model output suitable for interactive display.
+/// Provider-neutral projection of one completed native model response.
+///
+/// Display deltas preserve the response's visible text, reasoning, and tool
+/// call stream for interactive or historical presentation. The directive is
+/// the single semantic action consumed by the actor runtime.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModelResponseProjection {
+    /// Ordered visible output recovered from the completed response.
+    pub display: Vec<ModelDelta>,
+    /// The single runtime action represented by the completed response.
+    pub directive: ModelDirective,
+}
+
+/// Provider-neutral model output suitable for live or historical display.
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "kind", content = "delta", rename_all = "camelCase")]
 pub enum ModelDelta {
@@ -219,8 +232,12 @@ pub trait ModelCodec: Send + Sync + 'static {
         config: &ModelRequestConfig<'_>,
     ) -> Result<EncodedPayload, Self::Error>;
 
-    /// Interprets one untouched completed provider response.
-    fn interpret_response(&self, response: &EncodedPayload) -> Result<ModelDirective, Self::Error>;
+    /// Projects one untouched completed provider response into its ordered
+    /// display output and single semantic runtime action.
+    fn project_response(
+        &self,
+        response: &EncodedPayload,
+    ) -> Result<ModelResponseProjection, Self::Error>;
 
     /// Computes optional observability metadata from a native response.
     ///

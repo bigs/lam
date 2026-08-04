@@ -1686,6 +1686,7 @@ fn historical_entry(entry: HistoryEntry) -> ConversationEntry {
     let kind = match entry.kind {
         HistoryKind::User => EntryKind::User,
         HistoryKind::Assistant => EntryKind::Assistant,
+        HistoryKind::Reasoning => EntryKind::Reasoning,
         HistoryKind::ToolCall => EntryKind::ToolCall,
         HistoryKind::ToolResult => EntryKind::ToolResult,
         HistoryKind::System => EntryKind::System,

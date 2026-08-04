@@ -40,7 +40,7 @@ fn responses_request_is_stateless_and_replays_encrypted_reasoning_unchanged() {
     let reasoning = json!({
         "type": "reasoning",
         "id": "rs_1",
-        "summary": [],
+        "summary": [{ "type": "summary_text", "text": "Inspect the result" }],
         "encrypted_content": "opaque-ciphertext"
     });
     let function_call = json!({
@@ -64,13 +64,28 @@ fn responses_request_is_stateless_and_replays_encrypted_reasoning_unchanged() {
         "response",
         native_response,
     );
+    let projection = codec.project_response(&response).expect("valid eval");
     assert_eq!(
-        codec.interpret_response(&response).expect("valid eval"),
+        projection.directive,
         ModelDirective::Eval(lam::EvalRequest {
             intent: "Calculate the result".to_owned(),
             source: "1 + 1".to_owned(),
             timeout: Some(Duration::from_millis(250)),
         })
+    );
+    assert_eq!(
+        projection.display,
+        [
+            ModelDelta::Reasoning("Inspect the result".to_owned()),
+            ModelDelta::ToolCall(ToolCallDelta {
+                index: 1,
+                call_id: Some("call_1".to_owned()),
+                name: Some("eval".to_owned()),
+                arguments:
+                    "{\"intent\":\"Calculate the result\",\"source\":\"1 + 1\",\"timeoutMs\":250}"
+                        .to_owned(),
+            }),
+        ]
     );
 
     let context = vec![
@@ -152,7 +167,10 @@ fn responses_structured_output_uses_json_schema_and_decodes_json() {
         }),
     );
     assert_eq!(
-        codec.interpret_response(&response).expect("valid output"),
+        codec
+            .project_response(&response)
+            .expect("valid output")
+            .directive,
         ModelDirective::Output(json!({ "answer": 42 }))
     );
 }
@@ -448,13 +466,33 @@ fn chat_replays_reasoning_extensions_and_tool_calls_from_native_chunks() {
     ]);
     let response = response_payload(CHAT_RESPONSE_CODEC_ID, "text", "chunks", chunks.clone());
     assert_eq!(response.value["chunks"], chunks);
+    let projection = codec.project_response(&response).expect("valid eval");
     assert_eq!(
-        codec.interpret_response(&response).expect("valid eval"),
+        projection.directive,
         ModelDirective::Eval(lam::EvalRequest {
             intent: "Evaluate TypeScript".to_owned(),
             source: "2 + 2".to_owned(),
             timeout: None,
         })
+    );
+    assert_eq!(
+        projection.display,
+        [
+            ModelDelta::Reasoning("inspect ".to_owned()),
+            ModelDelta::ToolCall(ToolCallDelta {
+                index: 0,
+                call_id: Some("call_1".to_owned()),
+                name: Some("eval".to_owned()),
+                arguments: "{\"source\":\"".to_owned(),
+            }),
+            ModelDelta::Reasoning("state".to_owned()),
+            ModelDelta::ToolCall(ToolCallDelta {
+                index: 0,
+                call_id: None,
+                name: None,
+                arguments: "2 + 2\"}".to_owned(),
+            }),
+        ]
     );
 
     let request = codec
@@ -542,7 +580,10 @@ fn chat_structured_output_uses_json_schema_and_decodes_json() {
         }),
     );
     assert_eq!(
-        codec.interpret_response(&response).expect("valid output"),
+        codec
+            .project_response(&response)
+            .expect("valid output")
+            .directive,
         ModelDirective::Output(json!([1, 2, 3]))
     );
 }

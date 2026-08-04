@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use lam_core::{
     CompactionArtifact, CompactionConfig, Compactor, EncodedPayload, ModelCodec, ModelDescriptor,
-    ModelDirective, ModelEventSink, ModelProvider, ModelRequestConfig, ModelResponseMetadata,
-    ProjectedContextEntry,
+    ModelEventSink, ModelProvider, ModelRequestConfig, ModelResponseMetadata,
+    ModelResponseProjection, ProjectedContextEntry,
 };
 
 /// One configured model transport and its pure payload codec.
@@ -134,11 +134,11 @@ impl RegisteredModel {
         self.runtime.invoke(request, events)
     }
 
-    pub(crate) fn interpret_response(
+    pub(crate) fn project_response(
         &self,
         response: &EncodedPayload,
-    ) -> Result<ModelDirective, String> {
-        self.runtime.interpret_response(response)
+    ) -> Result<ModelResponseProjection, String> {
+        self.runtime.project_response(response)
     }
 
     pub(crate) fn response_metadata(&self, response: &EncodedPayload) -> ModelResponseMetadata {
@@ -178,7 +178,10 @@ trait RuntimeModel: Send + Sync {
 
     fn invoke(&self, request: EncodedPayload, events: ModelEventSink) -> RuntimeModelFuture<'_>;
 
-    fn interpret_response(&self, response: &EncodedPayload) -> Result<ModelDirective, String>;
+    fn project_response(
+        &self,
+        response: &EncodedPayload,
+    ) -> Result<ModelResponseProjection, String>;
 
     fn response_metadata(&self, response: &EncodedPayload) -> ModelResponseMetadata;
 
@@ -231,10 +234,13 @@ where
         })
     }
 
-    fn interpret_response(&self, response: &EncodedPayload) -> Result<ModelDirective, String> {
+    fn project_response(
+        &self,
+        response: &EncodedPayload,
+    ) -> Result<ModelResponseProjection, String> {
         self.model
             .codec
-            .interpret_response(response)
+            .project_response(response)
             .map_err(|error| error.to_string())
     }
 
