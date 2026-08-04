@@ -14,7 +14,7 @@ use serde::Serialize;
 use tokio::sync::{mpsc, watch};
 use tracing::Instrument;
 
-use crate::actor::{Clock, RuntimeIds};
+use crate::actor::{Clock, MessageReceipt, RuntimeIds};
 use crate::command::{CallRequest, RunnerCommand};
 use crate::compaction::{estimated_context_tokens, model_context};
 use crate::control::{RunControl, RunPhase};
@@ -22,8 +22,8 @@ use crate::model::RegisteredModel;
 use crate::notice::system_notice_codec;
 use crate::recovery::{has_pending_eval, has_recoverable_work};
 use crate::runtime_journal::{
-    AppendAttempt, admit_message, append_batch, append_context, append_event, load_state,
-    refresh_state, state_error,
+    AppendAttempt, admit_message_from_state, append_batch, append_context, append_event,
+    load_state, refresh_state, state_error,
 };
 use crate::{
     ActorError, EvalOutcome, InterruptedEvalOutcome, InterruptionReceipt, IsolateState,
@@ -53,6 +53,9 @@ pub(crate) struct ActorRunner<S> {
     pub(crate) run_events: mpsc::Sender<RunEvent>,
     pub(crate) runtime_events: mpsc::Sender<RuntimeEvent>,
     pub(crate) control: Arc<RunControl>,
+    /// Last folded actor projection, refreshed incrementally between drives
+    /// so a wake replays only journal activity since the previous drive.
+    pub(crate) state: Option<ActorState>,
 }
 
 impl<S> ActorRunner<S>
@@ -145,8 +148,11 @@ where
     async fn drain_recovered_work(&mut self) -> Result<(), ActorError> {
         loop {
             self.drive_one(OutputContract::Text, None).await?;
-            let state = load_state(self.store.as_ref(), &self.actor_id).await?;
-            if !has_recoverable_work(&state) {
+            let state = self
+                .state
+                .as_ref()
+                .expect("a successful drive stores its projection");
+            if !has_recoverable_work(state) {
                 return Ok(());
             }
         }
@@ -169,10 +175,17 @@ where
         call: &mut CallRequest,
     ) -> Result<serde_json::Value, ActorError> {
         loop {
-            let state = load_state(self.store.as_ref(), &self.actor_id).await?;
+            let state = refresh_state(
+                self.store.as_ref(),
+                &self.actor_id,
+                self.state.take().unwrap_or_default(),
+            )
+            .await?;
             if !has_recoverable_work(&state) {
+                self.state = Some(state);
                 break;
             }
+            self.state = Some(state);
             self.drive_one(OutputContract::Text, None).await?;
         }
 
@@ -180,9 +193,7 @@ where
         let receipt = tokio::select! {
             biased;
             _ = wait_for_abort(&mut abort) => return Err(ActorError::Aborted),
-            receipt = admit_message(self.store.as_ref(), &self.actor_id, call.message.clone()) => {
-                receipt?
-            }
+            receipt = self.admit_call(call.message.clone()) => receipt?,
         };
         call.admitted(receipt);
         self.drive_one(call.output.clone(), Some(&call.events))
@@ -192,12 +203,56 @@ where
             })
     }
 
+    /// Admits a call input against the cached projection so calls never
+    /// replay the whole journal.
+    async fn admit_call(&mut self, message: MessageEnvelope) -> Result<MessageReceipt, ActorError> {
+        let state = refresh_state(
+            self.store.as_ref(),
+            &self.actor_id,
+            self.state.take().unwrap_or_default(),
+        )
+        .await?;
+        let (receipt, state) =
+            admit_message_from_state(self.store.as_ref(), &self.actor_id, state, message).await?;
+        self.state = Some(state);
+        Ok(receipt)
+    }
+
     async fn drive_one(
         &mut self,
         output: OutputContract,
         events: Option<&mpsc::Sender<RunEvent>>,
     ) -> Result<Option<serde_json::Value>, ActorError> {
-        let mut state = load_state(self.store.as_ref(), &self.actor_id).await?;
+        let state = refresh_state(
+            self.store.as_ref(),
+            &self.actor_id,
+            self.state.take().unwrap_or_default(),
+        )
+        .await?;
+        match self.drive_one_inner(state, output, events).await {
+            Ok((value, state)) => {
+                self.state = Some(state);
+                Ok(value)
+            }
+            Err(error) => {
+                // The projection was consumed by the failed drive. Re-warm it
+                // so the next wake refreshes incrementally instead of replaying
+                // the whole journal.
+                match refresh_state(self.store.as_ref(), &self.actor_id, ActorState::new()).await {
+                    Ok(state) => self.state = Some(state),
+                    Err(_) => self.state = None,
+                }
+                Err(error)
+            }
+        }
+    }
+
+    async fn drive_one_inner(
+        &mut self,
+        mut state: ActorState,
+        output: OutputContract,
+        events: Option<&mpsc::Sender<RunEvent>>,
+    ) -> Result<(Option<serde_json::Value>, ActorState), ActorError> {
         let model = self.selected_model(&state)?.clone();
         let model_id = state
             .selected_model()
@@ -209,7 +264,7 @@ where
             Some(run_id) => run_id.clone(),
             None => {
                 if state.eligible_messages().next().is_none() {
-                    return Ok(None);
+                    return Ok((None, state));
                 }
                 self.ids.run_id()
             }
@@ -427,16 +482,16 @@ where
                             .append_output_candidate(state, &run_id, response, recorded_at)
                             .await?
                         {
-                            OutputAppend::Completed => {
-                                emit(
-                                    &self.run_events,
-                                    events,
-                                    RunEvent::Completed {
-                                        run_id: run_id.clone(),
-                                    },
-                                );
-                                return Ok(Some(value));
-                            }
+                        OutputAppend::Completed(state) => {
+                            emit(
+                                &self.run_events,
+                                events,
+                                RunEvent::Completed {
+                                    run_id: run_id.clone(),
+                                },
+                            );
+                            return Ok((Some(value), state));
+                        }
                             OutputAppend::Continued(next, delivered) => {
                                 state = next;
                                 emit(
@@ -489,7 +544,7 @@ where
         .await;
 
         if self.control.is_requested(&run_id)
-            && !matches!(&result, Err(ActorError::Aborted) | Ok(Some(_)))
+            && !matches!(&result, Err(ActorError::Aborted) | Ok((Some(_), _)))
         {
             let eval_terminated = self.control.eval_was_terminated(&run_id);
             let interrupted = self.persist_interruption(&run_id, eval_terminated).await;
@@ -739,7 +794,9 @@ where
             match state.plan_context_append(terminal) {
                 Ok(event) => {
                     match append_event(self.store.as_ref(), &self.actor_id, state, event).await? {
-                        AppendAttempt::Appended(_next) => return Ok(OutputAppend::Completed),
+                        AppendAttempt::Appended(next) => {
+                            return Ok(OutputAppend::Completed(next));
+                        }
                         AppendAttempt::Conflict => {
                             state = load_state(self.store.as_ref(), &self.actor_id).await?;
                         }
@@ -793,7 +850,7 @@ pub(crate) async fn wait_for_abort(abort: &mut watch::Receiver<bool>) {
 }
 
 enum OutputAppend {
-    Completed,
+    Completed(ActorState),
     Continued(ActorState, Vec<MessageId>),
 }
 

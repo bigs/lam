@@ -280,10 +280,10 @@ async fn tokio_main() -> Result<(), AppError> {
             // interaction stays ordered ahead of streaming noise.
             tick = if let Ok(terminal_event) = terminal_receiver.try_recv() {
                 Tick::Terminal(terminal_event)
-            } else if let Some(event) = runtime.events.try_next() {
-                Tick::Agent(event)
             } else if let Ok(result) = command_receiver.try_recv() {
                 Tick::Command(result)
+            } else if let Some(event) = runtime.events.try_next() {
+                Tick::Agent(event)
             } else {
                 break;
             };

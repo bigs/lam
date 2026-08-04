@@ -36,3 +36,9 @@
     - Two pipes + read-lock or chunk timestamps: keeps stream labels, but ordering is heuristic (timestamps would measure read/arrival time, not the child's write time) and a read-lock risks blocking the child on a full pipe buffer. Worst of both.
     - Status quo (two pipes, separate fields): exact labels, no claimed cross-stream order.
   - Deferred pending a decision on whether guaranteed ordering (one pipe, unlabeled) is worth giving up attribution.
+
+## Tooling / eval harness
+
+- [ ] The eval harness rejects source whose template-literal patch strings contain backtick characters (e.g. Markdown code spans in doc comments): the transpiler parses the closing backtick as the end of the string and chokes on the remainder.
+  - Workaround in use: keep patch and heredoc content backtick-free (plain doc wording, escaped backticks, or single-line strings with \n escapes).
+  - Consider a follow-up where the harness accepts backticks inside template literals, or a helper that writes patch text to a file instead of embedding it in source.

@@ -1,9 +1,12 @@
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 
 use lam_core::{
-    ActorEvent, ActorId, ActorState, AdmissionDecision, AppendOutcome, ContextEntry, EventBatch,
-    JournalPage, JournalStore, MessageEnvelope, ModelSelection, StoredEvent,
+    ActorEvent, ActorEventData, ActorId, ActorState, AdmissionDecision, AdmittedMessage,
+    AppendOutcome, ContextEntry, EventBatch, JournalPage, JournalStore, MessageEnvelope,
+    ModelSelection, Revision, StateError, StoredEvent,
 };
+use tokio::sync::Mutex;
 
 use crate::ActorError;
 use crate::actor::MessageReceipt;
@@ -76,20 +79,6 @@ where
             }
         }
     }
-}
-
-pub(crate) async fn admit_message<S>(
-    store: &S,
-    actor_id: &ActorId,
-    message: MessageEnvelope,
-) -> Result<MessageReceipt, ActorError>
-where
-    S: JournalStore,
-{
-    let state = load_state(store, actor_id).await?;
-    admit_message_from_state(store, actor_id, state, message)
-        .await
-        .map(|(receipt, _state)| receipt)
 }
 
 pub(crate) async fn admit_message_from_state<S>(
@@ -213,5 +202,294 @@ where
 pub(crate) fn state_error(error: lam_core::StateError) -> ActorError {
     ActorError::State {
         message: error.to_string(),
+    }
+}
+
+/// The durable-message slice of actor state the send path needs to admit a
+/// message idempotently without replaying the whole journal: the fold head
+/// and every admitted envelope. It is seeded once from a folded
+/// ActorState and afterwards advances only by scanning newly appended
+/// journal events, so each admission is bounded by journal activity since
+/// the previous admission rather than by total journal size.
+pub(crate) struct AdmissionLedger<S> {
+    inner: Mutex<AdmissionView>,
+    store: Arc<S>,
+    actor_id: ActorId,
+}
+
+#[derive(Debug, Default)]
+struct AdmissionView {
+    /// Journal revision covered by the admitted-message list (fold head).
+    revision: Revision,
+    /// Every admitted envelope in admission order.
+    messages: Vec<AdmittedMessage>,
+}
+
+impl<S> AdmissionLedger<S>
+where
+    S: JournalStore + 'static,
+{
+    /// Seeds the ledger from an already-folded actor state at the journal
+    /// head. After seeding, the ledger only ever advances incrementally.
+    pub(crate) fn seed(store: Arc<S>, actor_id: ActorId, state: &ActorState) -> Self {
+        Self {
+            inner: Mutex::new(AdmissionView {
+                revision: state.revision(),
+                messages: state.messages().to_vec(),
+            }),
+            store,
+            actor_id,
+        }
+    }
+
+    /// Durably admits one envelope under the same idempotency contract as
+    /// ActorState::plan_admission, without materializing the full actor
+    /// projection. Conflict retries refresh the view incrementally.
+    pub(crate) async fn admit(
+        &self,
+        message: MessageEnvelope,
+    ) -> Result<MessageReceipt, ActorError> {
+        let message_id = message.message_id().clone();
+        let mut view = self.inner.lock().await;
+        self.refresh(&mut view).await?;
+        loop {
+            match plan_view_admission(&view, message.clone()).map_err(state_error)? {
+                AdmissionDecision::Existing { revision } => {
+                    return Ok(MessageReceipt {
+                        actor_id: self.actor_id.clone(),
+                        message_id,
+                        revision,
+                    });
+                }
+                AdmissionDecision::Append(event) => {
+                    let expected = view.revision;
+                    match self
+                        .store
+                        .append(&self.actor_id, expected, EventBatch::one(event))
+                        .await
+                        .map_err(journal_error)?
+                    {
+                        AppendOutcome::Appended { head } => {
+                            view.revision = head;
+                            view.messages.push(AdmittedMessage {
+                                revision: head,
+                                envelope: message,
+                                consumed_at: None,
+                            });
+                            return Ok(MessageReceipt {
+                                actor_id: self.actor_id.clone(),
+                                message_id,
+                                revision: head,
+                            });
+                        }
+                        AppendOutcome::Conflict { .. } => self.refresh(&mut view).await?,
+                    }
+                }
+            }
+        }
+    }
+
+    /// Folds newly appended journal events into the view, collecting only
+    /// message admissions. Context appends advance the revision without
+    /// growing the view.
+    async fn refresh(&self, view: &mut AdmissionView) -> Result<(), ActorError> {
+        loop {
+            let page = self
+                .store
+                .read(&self.actor_id, view.revision, JOURNAL_PAGE_SIZE)
+                .await
+                .map_err(journal_error)?;
+            let head = page.head;
+            if page.events.is_empty() {
+                return Ok(());
+            }
+            for stored in &page.events {
+                if let ActorEventData::MessageAdmitted { message } = stored.event.data() {
+                    view.messages.push(AdmittedMessage {
+                        revision: stored.revision,
+                        envelope: message.clone(),
+                        consumed_at: None,
+                    });
+                }
+            }
+            view.revision = page
+                .events
+                .last()
+                .expect("a non-empty page has a last event")
+                .revision;
+            if view.revision == head {
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Mirrors ActorState::plan_admission against a lightweight admission view.
+/// Keep the two in sync: the ledger must enforce the same idempotency and
+/// collision rules as the full projection.
+fn plan_view_admission(
+    view: &AdmissionView,
+    message: MessageEnvelope,
+) -> Result<AdmissionDecision, StateError> {
+    message.validate()?;
+    if let Some(existing) = view
+        .messages
+        .iter()
+        .find(|admitted| admitted.envelope.message_id() == message.message_id())
+    {
+        if message.is_idempotent_retry_of(&existing.envelope) {
+            return Ok(AdmissionDecision::Existing {
+                revision: existing.revision,
+            });
+        }
+        return Err(StateError::MessageIdCollision {
+            message_id: message.message_id().clone(),
+        });
+    }
+    Ok(AdmissionDecision::Append(ActorEvent::message_admitted(
+        message,
+    )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lam_core::{
+        ContextEntry, ContextTransition, DeliveryMode, EncodedPayload, MemStore, MessageId,
+        MessageSource, RunId, RunProgress, Timestamp,
+    };
+
+    fn envelope(id: &str, text: &str) -> MessageEnvelope {
+        MessageEnvelope::new(
+            MessageId::new(id).expect("message id"),
+            MessageSource::User { principal: None },
+            DeliveryMode::Steer,
+            EncodedPayload::lam_json(text.to_owned()).expect("payload"),
+            Timestamp::from_unix_millis(1),
+        )
+        .expect("envelope")
+    }
+
+    fn root() -> ActorId {
+        ActorId::new("/root").expect("actor id")
+    }
+
+    #[tokio::test]
+    async fn ledger_admits_messages_and_dedups_idempotent_retries() {
+        let store = Arc::new(MemStore::new());
+        let ledger = AdmissionLedger::seed(Arc::clone(&store), root(), &ActorState::default());
+
+        let first = envelope("m1", "hello");
+        let receipt = ledger.admit(first.clone()).await.expect("admit");
+        assert_eq!(receipt.revision, Revision::new(1));
+
+        // Re-admitting the identical envelope is an idempotent retry: the
+        // original revision is returned and no new event is appended.
+        let retry = ledger.admit(first).await.expect("idempotent retry");
+        assert_eq!(retry.revision, Revision::new(1));
+
+        // A different envelope reusing the id collides instead of appending.
+        assert!(
+            ledger
+                .admit(envelope("m1", "different payload"))
+                .await
+                .is_err()
+        );
+
+        // A fresh message advances the head.
+        let second = ledger.admit(envelope("m2", "world")).await.expect("admit");
+        assert_eq!(second.revision, Revision::new(2));
+
+        let state = load_state(store.as_ref(), &root()).await.expect("load");
+        assert_eq!(state.messages().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn ledger_refresh_sees_external_admissions() {
+        let store = Arc::new(MemStore::new());
+        let actor = root();
+        let ledger =
+            AdmissionLedger::seed(Arc::clone(&store), actor.clone(), &ActorState::default());
+
+        // Another path admits directly through the store, as the runner does
+        // for notices and call inputs.
+        let external = envelope("x1", "external");
+        let _ = store
+            .append(
+                &actor,
+                Revision::ZERO,
+                EventBatch::one(ActorEvent::message_admitted(external.clone())),
+            )
+            .await
+            .expect("append");
+
+        // The ledger dedups against the external admission without replaying
+        // the journal from zero.
+        let retry = ledger.admit(external).await.expect("idempotent retry");
+        assert_eq!(retry.revision, Revision::new(1));
+
+        let state = load_state(store.as_ref(), &actor).await.expect("load");
+        assert_eq!(state.messages().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn ledger_lands_behind_external_activity_without_conflicts() {
+        let store = Arc::new(MemStore::new());
+        let actor = root();
+        let ledger =
+            AdmissionLedger::seed(Arc::clone(&store), actor.clone(), &ActorState::default());
+
+        // A valid run sequence: admit m0, start run r1 by consuming it, then
+        // continue with a model entry. Context appends advance the head
+        // without growing the admitted set.
+        let m0 = envelope("m0", "seed");
+        let _ = store
+            .append(
+                &actor,
+                Revision::ZERO,
+                EventBatch::one(ActorEvent::message_admitted(m0.clone())),
+            )
+            .await
+            .expect("append");
+        let messages = ContextEntry {
+            transition: ContextTransition::Messages {
+                run_id: RunId::new("r1").expect("run id"),
+                consumed_message_ids: vec![m0.message_id().clone()],
+            },
+            payload: EncodedPayload::lam_json("payload").expect("payload"),
+            recorded_at: Timestamp::from_unix_millis(1),
+        };
+        let _ = store
+            .append(
+                &actor,
+                Revision::new(1),
+                EventBatch::one(ActorEvent::context_appended(messages)),
+            )
+            .await
+            .expect("append");
+        let model = ContextEntry {
+            transition: ContextTransition::Model {
+                run_id: RunId::new("r1").expect("run id"),
+                progress: RunProgress::Continue,
+            },
+            payload: EncodedPayload::lam_json("payload").expect("payload"),
+            recorded_at: Timestamp::from_unix_millis(2),
+        };
+        let _ = store
+            .append(
+                &actor,
+                Revision::new(2),
+                EventBatch::one(ActorEvent::context_appended(model)),
+            )
+            .await
+            .expect("append");
+
+        // The admission refreshes past the context events and lands at rev 4.
+        let admitted = ledger.admit(envelope("m1", "mine")).await.expect("admit");
+        assert_eq!(admitted.revision, Revision::new(4));
+
+        let state = load_state(store.as_ref(), &actor).await.expect("load");
+        assert_eq!(state.messages().len(), 2);
+        assert_eq!(state.revision(), Revision::new(4));
     }
 }

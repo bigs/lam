@@ -22,7 +22,7 @@ use crate::prompt::SystemPrompt;
 use crate::recovery::recover_actor;
 use crate::run::RUN_EVENT_BUFFER;
 use crate::runner::ActorRunner;
-use crate::runtime_journal::{admit_message, ensure_model_selection, load_state};
+use crate::runtime_journal::{AdmissionLedger, ensure_model_selection, load_state};
 use crate::{
     ActorBuildError, ActorError, ActorTask, InterruptedEvalOutcome, IsolateState, Model, Run,
     RunEvents, RuntimeEvents,
@@ -643,19 +643,25 @@ where
                 ),
             });
         }
-        let recovery = recover_actor(
+        let (recovery, state) = recover_actor(
             &self.actor_id,
             store.as_ref(),
             selected_model,
             self.clock.as_ref(),
             ids.as_ref(),
             !created,
+            state,
         )
         .await
         .map_err(initialization_error)?;
         if let Some(event) = recovery.event {
             let _ = runtime_event_sender.try_send(event);
         }
+        let admission = Arc::new(AdmissionLedger::seed(
+            Arc::clone(&store),
+            self.actor_id.clone(),
+            &state,
+        ));
 
         let runner = ActorRunner {
             actor_id: self.actor_id.clone(),
@@ -672,6 +678,7 @@ where
             run_events: run_event_sender,
             runtime_events: runtime_event_sender,
             control: Arc::clone(&control),
+            state: Some(state),
         };
         let actor_ref = ActorRef {
             actor_id: self.actor_id,
@@ -679,6 +686,7 @@ where
             commands: commands.clone(),
             clock: self.clock,
             ids,
+            admission,
         };
         let handle = ActorHandle {
             actor_ref,
@@ -1066,6 +1074,7 @@ where
     commands: mpsc::UnboundedSender<RunnerCommand>,
     clock: Arc<dyn Clock>,
     ids: Arc<RuntimeIds>,
+    admission: Arc<AdmissionLedger<S>>,
 }
 
 impl<S> Clone for ActorRef<S>
@@ -1079,6 +1088,7 @@ where
             commands: self.commands.clone(),
             clock: Arc::clone(&self.clock),
             ids: Arc::clone(&self.ids),
+            admission: Arc::clone(&self.admission),
         }
     }
 }
@@ -1144,7 +1154,7 @@ where
     {
         let message_id = self.ids.message_id();
         let message = self.message(message_id, source, input, delivery)?;
-        let receipt = admit_message(self.store.as_ref(), &self.actor_id, message).await?;
+        let receipt = self.admission.admit(message).await?;
         let _ = self.commands.send(RunnerCommand::Wake);
         Ok(receipt)
     }

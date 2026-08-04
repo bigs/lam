@@ -89,6 +89,12 @@ impl ActorState {
             .filter(|message| message.consumed_at.is_none())
     }
 
+    /// Returns all admitted messages in admission order.
+    #[must_use]
+    pub fn messages(&self) -> &[AdmittedMessage] {
+        &self.messages
+    }
+
     /// Returns messages currently eligible to enter context.
     pub fn eligible_messages(&self) -> impl Iterator<Item = &AdmittedMessage> {
         let active = self.active_run.is_some();

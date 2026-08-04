@@ -95,14 +95,18 @@ impl MessageEnvelope {
         self.received_at
     }
 
-    pub(crate) fn is_idempotent_retry_of(&self, existing: &Self) -> bool {
+    /// Returns whether this envelope is a durable retry of the existing
+    /// envelope: the same identity, provenance, delivery mode, and payload.
+    #[must_use]
+    pub fn is_idempotent_retry_of(&self, existing: &Self) -> bool {
         self.message_id == existing.message_id
             && self.source == existing.source
             && self.delivery == existing.delivery
             && self.payload == existing.payload
     }
 
-    pub(crate) fn validate(&self) -> Result<(), MessageError> {
+    /// Validates the envelope against Lam's delivery contract.
+    pub fn validate(&self) -> Result<(), MessageError> {
         if matches!(self.source, MessageSource::Actor { .. })
             && self.delivery != DeliveryMode::Steer
         {

@@ -6,7 +6,7 @@ use lam_core::{
 use crate::actor::{Clock, RuntimeIds};
 use crate::model::RegisteredModel;
 use crate::notice::system_notice_codec;
-use crate::runtime_journal::{admit_message_from_state, load_state};
+use crate::runtime_journal::admit_message_from_state;
 use crate::{
     ActorError, InterruptedEvalOutcome, IsolateState, RUNTIME_COMPONENT_ID, RuntimeEvent,
     SystemNotice,
@@ -24,16 +24,19 @@ pub(crate) async fn recover_actor<S>(
     clock: &dyn Clock,
     ids: &RuntimeIds,
     announce: bool,
-) -> Result<StartupRecovery, ActorError>
+    state: ActorState,
+) -> Result<(StartupRecovery, ActorState), ActorError>
 where
     S: JournalStore,
 {
-    let state = load_state(store, actor_id).await?;
     if !announce {
-        return Ok(StartupRecovery {
-            wake: false,
-            event: None,
-        });
+        return Ok((
+            StartupRecovery {
+                wake: false,
+                event: None,
+            },
+            state,
+        ));
     }
 
     let resumed_run_id = state.active_run().cloned();
@@ -68,16 +71,19 @@ where
     let (receipt, recovered) = admit_message_from_state(store, actor_id, state, message).await?;
     let wake = has_recoverable_work(&recovered);
 
-    Ok(StartupRecovery {
-        wake,
-        event: Some(RuntimeEvent::RuntimeResumed {
-            message_id,
-            revision: receipt.revision,
-            isolate_state: IsolateState::Reset,
-            resumed_run_id,
-            interrupted_eval_outcome,
-        }),
-    })
+    Ok((
+        StartupRecovery {
+            wake,
+            event: Some(RuntimeEvent::RuntimeResumed {
+                message_id,
+                revision: receipt.revision,
+                isolate_state: IsolateState::Reset,
+                resumed_run_id,
+                interrupted_eval_outcome,
+            }),
+        },
+        recovered,
+    ))
 }
 
 pub(crate) fn has_recoverable_work(state: &ActorState) -> bool {
