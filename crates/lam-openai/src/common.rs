@@ -21,6 +21,7 @@ pub(crate) const CHAT_RESPONSE_CODEC_ID: &str = "openai/chat-completions";
 pub(crate) const CODEC_VERSION: u32 = 1;
 
 pub(crate) const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+pub(crate) const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -57,6 +58,7 @@ pub(crate) struct SharedBuilder {
     extra_body: Value,
     pricing: Option<ModelPricing>,
     client: Option<reqwest::Client>,
+    stream_idle_timeout: Duration,
 }
 
 pub(crate) struct BuiltConfig {
@@ -75,6 +77,7 @@ impl SharedBuilder {
             extra_body: Value::Object(Map::new()),
             pricing: None,
             client: None,
+            stream_idle_timeout: DEFAULT_STREAM_IDLE_TIMEOUT,
         }
     }
 
@@ -103,6 +106,11 @@ impl SharedBuilder {
         self
     }
 
+    pub(crate) fn stream_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.stream_idle_timeout = timeout;
+        self
+    }
+
     pub(crate) fn build(
         self,
         path: &'static str,
@@ -119,6 +127,9 @@ impl SharedBuilder {
         };
         if self.pricing.is_some_and(|pricing| !pricing.is_valid()) {
             return Err(BuildError::InvalidPricing);
+        }
+        if self.stream_idle_timeout.is_zero() {
+            return Err(BuildError::InvalidStreamIdleTimeout);
         }
         let client = match self.client {
             Some(client) => client,
@@ -140,7 +151,12 @@ impl SharedBuilder {
             model: self.model,
             extra_body,
             pricing: self.pricing,
-            transport: HttpTransport::new(client, endpoint, authorization),
+            transport: HttpTransport::new(
+                client,
+                endpoint,
+                authorization,
+                self.stream_idle_timeout,
+            ),
         })
     }
 }

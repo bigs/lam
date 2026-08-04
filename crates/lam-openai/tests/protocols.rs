@@ -106,7 +106,7 @@ fn responses_request_is_stateless_and_replays_encrypted_reasoning_unchanged() {
     let body = &request.value["body"];
     assert_eq!(body["store"], false);
     assert_eq!(body["stream"], true);
-    assert_eq!(body["parallel_tool_calls"], false);
+    assert!(body.get("parallel_tool_calls").is_none());
     assert_eq!(body["instructions"], "runtime instructions");
     assert_eq!(
         body["tools"][0]["parameters"]["required"],
@@ -586,7 +586,7 @@ fn chat_replays_reasoning_extensions_and_tool_calls_from_native_chunks() {
     let body = &request.value["body"];
     assert_eq!(body["stream"], true);
     assert_eq!(body["stream_options"]["include_usage"], true);
-    assert_eq!(body["parallel_tool_calls"], false);
+    assert!(body.get("parallel_tool_calls").is_none());
     assert_eq!(
         body["tools"][0]["function"]["parameters"]["required"],
         json!(["intent", "source", "timeoutMs"])
@@ -822,6 +822,16 @@ fn adapter_rejects_invalid_cost_rates() {
             .pricing(ModelPricing::new(f64::NAN, 1.0))
             .build_parts(),
         Err(BuildError::InvalidPricing)
+    ));
+}
+
+#[test]
+fn adapter_rejects_a_zero_stream_idle_timeout() {
+    assert!(matches!(
+        ChatCompletions::builder("test-model")
+            .stream_idle_timeout(Duration::ZERO)
+            .build_parts(),
+        Err(BuildError::InvalidStreamIdleTimeout)
     ));
 }
 
@@ -1287,6 +1297,72 @@ async fn chat_provider_rejects_a_truncated_body_before_a_terminal_chunk() {
 }
 
 #[tokio::test]
+async fn chat_provider_fails_a_nonterminal_parallel_tool_stream_after_going_idle() {
+    let parallel = json!({
+        "id": "chat_parallel",
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "index": 0,
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "eval",
+                            "arguments": "{\"intent\":\"First\",\"source\":\"1 + 1\",\"timeoutMs\":null}"
+                        }
+                    },
+                    {
+                        "index": 1,
+                        "id": "call_2",
+                        "type": "function",
+                        "function": {
+                            "name": "eval",
+                            "arguments": "{\"intent\":\"Second\",\"source\":\"2 + 2\",\"timeoutMs\":null}"
+                        }
+                    },
+                    {
+                        "index": 2,
+                        "id": "call_3",
+                        "type": "function",
+                        "function": {
+                            "name": "eval",
+                            "arguments": "{\"intent\":\"Third\",\"source\":\"3 + 3\",\"timeoutMs\":null}"
+                        }
+                    }
+                ]
+            },
+            "finish_reason": null
+        }]
+    });
+    let stream = format!("data: {parallel}\n\n");
+    let server = MockServer::start_stalled("text/event-stream", stream, Duration::from_millis(250));
+    let (provider, codec) = ChatCompletions::builder("test-model")
+        .base_url(format!("{}/v1", server.origin))
+        .stream_idle_timeout(Duration::from_millis(25))
+        .build_parts()
+        .unwrap();
+    let request = codec
+        .encode_request(
+            &[user_message("run the work")],
+            &ModelRequestConfig::agent(&OutputContract::Text, ""),
+        )
+        .unwrap();
+
+    let error = provider
+        .invoke(request, ModelEventSink::new(|_| {}))
+        .await
+        .expect_err("an unterminated assistant message must not be projected");
+    assert!(matches!(
+        error,
+        ProviderError::StreamIdle { timeout } if timeout == Duration::from_millis(25)
+    ));
+    server.finish();
+}
+
+#[tokio::test]
 async fn responses_adapter_drives_a_complete_lam_eval_loop() {
     let first_response = json!({
         "id": "resp_eval",
@@ -1528,6 +1604,105 @@ async fn chat_adapter_drives_a_complete_lam_eval_loop() {
     assert_eq!(follow_up_messages[5]["role"], "user");
 }
 
+#[tokio::test]
+async fn chat_adapter_executes_first_terminal_parallel_eval_and_rejects_siblings() {
+    let parallel = json!({
+        "id": "chat_parallel_eval",
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "index": 0,
+                        "id": "call_first",
+                        "type": "function",
+                        "function": {
+                            "name": "eval",
+                            "arguments": "{\"intent\":\"Calculate\",\"source\":\"6 * 7\",\"timeoutMs\":null}"
+                        }
+                    },
+                    {
+                        "index": 1,
+                        "id": "call_second",
+                        "type": "function",
+                        "function": {
+                            "name": "eval",
+                            "arguments": "{\"intent\":\"Do another thing\",\"source\":\"sideEffect()\",\"timeoutMs\":null}"
+                        }
+                    },
+                    {
+                        "index": 2,
+                        "id": "call_third",
+                        "type": "function",
+                        "function": {
+                            "name": "eval",
+                            "arguments": "{\"intent\":\"Do a third thing\",\"source\":\"otherEffect()\",\"timeoutMs\":null}"
+                        }
+                    }
+                ]
+            },
+            "finish_reason": "tool_calls"
+        }]
+    });
+    let first_stream = format!("data: {parallel}\n\ndata: [DONE]\n\n");
+    let done = json!({
+        "id": "chat_parallel_done",
+        "choices": [{
+            "index": 0,
+            "delta": { "role": "assistant", "content": "done" },
+            "finish_reason": "stop"
+        }]
+    });
+    let second_stream = format!("data: {done}\n\ndata: [DONE]\n\n");
+    let server = MockServer::start_responses(vec![
+        (
+            "text/event-stream",
+            first_stream.clone(),
+            first_stream.len(),
+        ),
+        (
+            "text/event-stream",
+            second_stream.clone(),
+            second_stream.len(),
+        ),
+    ]);
+    let model = ChatCompletions::builder("test-model")
+        .base_url(format!("{}/v1", server.origin))
+        .build()
+        .unwrap();
+    let mut actor = lam::Lam::builder(model)
+        .build()
+        .actor("parallel-chat-integration")
+        .build()
+        .await
+        .unwrap();
+
+    let answer: String = actor.call("run the work").await.unwrap();
+    assert_eq!(answer, "done");
+    actor.shutdown().await.unwrap();
+
+    let requests = server.finish_all();
+    let messages = requests[1].body["messages"].as_array().unwrap();
+    assert_eq!(messages[2]["tool_calls"].as_array().unwrap().len(), 3);
+    assert_eq!(messages[3]["tool_call_id"], "call_first");
+    assert_eq!(messages[4]["tool_call_id"], "call_second");
+    assert_eq!(messages[5]["tool_call_id"], "call_third");
+    let first: Value = serde_json::from_str(messages[3]["content"].as_str().unwrap()).unwrap();
+    let second: Value = serde_json::from_str(messages[4]["content"].as_str().unwrap()).unwrap();
+    let third: Value = serde_json::from_str(messages[5]["content"].as_str().unwrap()).unwrap();
+    assert_eq!(first["status"], "success");
+    assert_eq!(first["output"]["result"]["value"], 42);
+    assert_eq!(second["status"], "rejected");
+    assert_eq!(third["status"], "rejected");
+    for rejected in [second, third] {
+        let message = rejected["message"].as_str().unwrap();
+        assert!(message.contains("executes only the first tool call"));
+        assert!(message.contains("one eval program"));
+        assert!(message.contains("Promise.all"));
+    }
+}
+
 fn user_message(text: &str) -> ProjectedContextEntry {
     projected(
         1,
@@ -1689,6 +1864,32 @@ impl MockServer {
             response_body.clone(),
             response_body.len() + 128,
         )])
+    }
+
+    fn start_stalled(content_type: &'static str, response_body: String, stall: Duration) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        let address = listener.local_addr().expect("mock address");
+        let (sender, request) = mpsc::channel();
+        let join = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let captured = read_request(&mut stream);
+            sender.send(captured).expect("capture request");
+            let content_length = response_body.len() + 128;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {content_length}\r\nConnection: close\r\n\r\n{response_body}"
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+            stream.flush().expect("flush response");
+            std::thread::sleep(stall);
+        });
+        Self {
+            origin: format!("http://{address}"),
+            request,
+            join,
+            expected_requests: 1,
+        }
     }
 
     fn start_mixed(responses: Vec<(&'static str, String)>) -> Self {

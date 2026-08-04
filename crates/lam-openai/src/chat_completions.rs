@@ -1,6 +1,7 @@
 //! Generic OpenAI-compatible Chat Completions adapter.
 
 use std::collections::VecDeque;
+use std::time::Duration;
 
 use lam::{
     CodecId, CodecRef, CompactionArtifact, ContextTransition, EncodedPayload, Model, ModelCodec,
@@ -80,7 +81,9 @@ impl ChatCompletionsBuilder {
     /// This is where compatible extensions such as Fireworks'
     /// `reasoning_effort` and `reasoning_history` belong. Lam overwrites
     /// protocol invariants including `model`, `messages`, `stream`, `tools`,
-    /// `n`, and `parallel_tool_calls`.
+    /// `n`, and `parallel_tool_calls`. Lam omits `parallel_tool_calls` so the
+    /// provider can stream a complete native tool-call batch; the runtime
+    /// executes only the first eval and rejects any siblings.
     #[must_use]
     pub fn extra_body(mut self, extra_body: Value) -> Self {
         self.shared = self.shared.extra_body(extra_body);
@@ -109,6 +112,16 @@ impl ChatCompletionsBuilder {
     #[must_use]
     pub fn http_client(mut self, client: reqwest::Client) -> Self {
         self.shared = self.shared.http_client(client);
+        self
+    }
+
+    /// Sets the maximum permitted delay between streaming response body chunks.
+    ///
+    /// An idle stream fails the provider request. Partially streamed assistant
+    /// messages are never projected into output or eval directives.
+    #[must_use]
+    pub fn stream_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.shared = self.shared.stream_idle_timeout(timeout);
         self
     }
 
@@ -458,6 +471,7 @@ const fn provider_error_kind(error: &ProviderError) -> &'static str {
         ProviderError::UnexpectedRequestCodec { .. } => "unexpected_request_codec",
         ProviderError::InvalidRequest { .. } => "invalid_request",
         ProviderError::Http(_) => "http",
+        ProviderError::StreamIdle { .. } => "stream_idle",
         ProviderError::HttpStatus { .. } => "http_status",
         ProviderError::InvalidEventStream { .. } => "invalid_event_stream",
         ProviderError::InvalidEventJson { .. } => "invalid_event_json",
@@ -571,7 +585,6 @@ impl ModelCodec for ChatCompletionsCodec {
         body.remove("tool_choice");
         body.remove("parallel_tool_calls");
         if config.enable_eval {
-            body.insert("parallel_tool_calls".to_owned(), Value::Bool(false));
             body.insert("tools".to_owned(), Value::Array(vec![eval_tool()]));
             body.insert("tool_choice".to_owned(), Value::String("auto".to_owned()));
         }

@@ -2,6 +2,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::Duration;
 
 use lam::{
     CodecId, CodecRef, CompactionArtifact, CompactionError, CompactionOutput, CompactionPlan,
@@ -76,7 +77,9 @@ impl ResponsesBuilder {
     ///
     /// lam overwrites protocol invariants including `model`, `input`,
     /// `instructions`, `store`, `stream`, `tools`, and
-    /// `parallel_tool_calls`.
+    /// `parallel_tool_calls`. Lam omits `parallel_tool_calls` so the provider
+    /// can stream a complete native tool-call batch; the runtime executes only
+    /// the first eval and rejects any siblings.
     #[must_use]
     pub fn extra_body(mut self, extra_body: Value) -> Self {
         self.shared = self.shared.extra_body(extra_body);
@@ -94,6 +97,16 @@ impl ResponsesBuilder {
     #[must_use]
     pub fn http_client(mut self, client: reqwest::Client) -> Self {
         self.shared = self.shared.http_client(client);
+        self
+    }
+
+    /// Sets the maximum permitted delay between streaming response body chunks.
+    ///
+    /// An idle stream fails the provider request. Partially streamed responses
+    /// are never projected into output or eval directives.
+    #[must_use]
+    pub fn stream_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.shared = self.shared.stream_idle_timeout(timeout);
         self
     }
 
@@ -429,7 +442,6 @@ impl ModelCodec for ResponsesCodec {
         body.remove("tool_choice");
         body.remove("parallel_tool_calls");
         if config.enable_eval {
-            body.insert("parallel_tool_calls".to_owned(), Value::Bool(false));
             body.insert("tools".to_owned(), Value::Array(vec![eval_tool()]));
             body.insert("tool_choice".to_owned(), Value::String("auto".to_owned()));
         }

@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use reqwest::header::InvalidHeaderValue;
 
 /// Invalid model-adapter configuration.
@@ -24,6 +26,9 @@ pub enum BuildError {
     /// Configured token prices must be finite and non-negative.
     #[error("model token prices must be finite and non-negative")]
     InvalidPricing,
+    /// The response stream idle timeout must allow time for network progress.
+    #[error("model stream idle timeout must be greater than zero")]
+    InvalidStreamIdleTimeout,
     /// Reqwest could not construct its reusable client.
     #[error("failed to construct HTTP client")]
     HttpClient(#[source] reqwest::Error),
@@ -49,6 +54,12 @@ pub enum ProviderError {
     /// The HTTP request or response stream failed.
     #[error("model HTTP request failed: {0}")]
     Http(#[source] reqwest::Error),
+    /// The provider left an event stream open without sending more data.
+    #[error("model event stream was idle for {timeout:?}")]
+    StreamIdle {
+        /// Maximum permitted delay between response body chunks.
+        timeout: Duration,
+    },
     /// The server rejected the request with a non-success status.
     #[error("model endpoint returned HTTP {status}: {body}")]
     HttpStatus {
@@ -86,6 +97,7 @@ pub enum ProviderError {
 impl ProviderError {
     pub(crate) fn is_response_body_failure(&self) -> bool {
         matches!(self, Self::Http(error) if error.is_body() || error.is_decode())
+            || matches!(self, Self::StreamIdle { .. })
     }
 
     pub(crate) fn is_context_overflow(&self) -> bool {

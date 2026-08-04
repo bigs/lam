@@ -1,5 +1,5 @@
 use std::error::Error as _;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
@@ -15,6 +15,7 @@ pub(crate) struct HttpTransport {
     client: reqwest::Client,
     endpoint: reqwest::Url,
     authorization: Option<HeaderValue>,
+    stream_idle_timeout: Duration,
 }
 
 pub(crate) enum StreamBody {
@@ -32,11 +33,13 @@ impl HttpTransport {
         client: reqwest::Client,
         endpoint: reqwest::Url,
         authorization: Option<HeaderValue>,
+        stream_idle_timeout: Duration,
     ) -> Self {
         Self {
             client,
             endpoint,
             authorization,
+            stream_idle_timeout,
         }
     }
 
@@ -48,6 +51,7 @@ impl HttpTransport {
             client: self.client.clone(),
             endpoint,
             authorization: self.authorization.clone(),
+            stream_idle_timeout: self.stream_idle_timeout,
         }
     }
 
@@ -167,7 +171,28 @@ impl HttpTransport {
             let mut chunk_count = 0_u64;
             let mut total_bytes = 0_u64;
             let mut event_count = 0_u64;
-            while let Some(chunk) = stream.next().await {
+            loop {
+                let next = match tokio::time::timeout(self.stream_idle_timeout, stream.next()).await
+                {
+                    Ok(next) => next,
+                    Err(_) => {
+                        tracing::error!(
+                            event = "http.stream_idle",
+                            chunk_count,
+                            total_bytes,
+                            event_count,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            timeout_ms = self.stream_idle_timeout.as_millis() as u64,
+                            "model response stream stopped making progress"
+                        );
+                        return Err(ProviderError::StreamIdle {
+                            timeout: self.stream_idle_timeout,
+                        });
+                    }
+                };
+                let Some(chunk) = next else {
+                    break;
+                };
                 let chunk = match chunk {
                     Ok(chunk) => chunk,
                     Err(error) => {
@@ -336,6 +361,7 @@ const fn provider_error_kind(error: &ProviderError) -> &'static str {
         ProviderError::UnexpectedRequestCodec { .. } => "unexpected_request_codec",
         ProviderError::InvalidRequest { .. } => "invalid_request",
         ProviderError::Http(_) => "http",
+        ProviderError::StreamIdle { .. } => "stream_idle",
         ProviderError::HttpStatus { .. } => "http_status",
         ProviderError::InvalidEventStream { .. } => "invalid_event_stream",
         ProviderError::InvalidEventJson { .. } => "invalid_event_json",
