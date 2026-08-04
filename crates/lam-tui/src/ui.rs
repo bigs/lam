@@ -215,6 +215,12 @@ fn entry_lines(
     let (marker, color) = entry_style(entry.kind);
     let selection = if selected { "│" } else { " " };
     let disclosure = if entry.expanded { "▾" } else { "▸" };
+    // Tool and reasoning rows are ambient detail: render them faint until
+    // selected, when they return to full intensity for focused reading.
+    let dimmed = matches!(
+        entry.kind,
+        EntryKind::ToolCall | EntryKind::ToolResult | EntryKind::Reasoning
+    ) && !selected;
     let style = if selected {
         Style::default().bg(PANEL)
     } else {
@@ -237,21 +243,26 @@ fn entry_lines(
             Span::styled(selection.to_owned(), Style::default().fg(ACCENT)),
             Span::styled(
                 format!("{disclosure} {marker} "),
-                Style::default().fg(color),
+                dim_ambient(style_fg(color), dimmed),
             ),
             Span::styled(
                 entry.title.clone(),
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
+                if dimmed {
+                    style_fg(color).add_modifier(Modifier::DIM)
+                } else {
+                    style_fg(color).add_modifier(Modifier::BOLD)
+                },
             ),
             Span::raw(if preview.is_empty() { "" } else { "  " }),
-            Span::styled(preview, Style::default().fg(Color::Gray)),
+            Span::styled(preview, dim_ambient(style_fg(Color::Gray), dimmed)),
         ])
         .style(style),
     );
     if entry.expanded {
         let body_width = width.saturating_sub(5).max(1);
         if renders_markdown(entry.kind) {
-            for body_line in markdown_lines(&entry.body, body_width) {
+            let base = dim_ambient(style_fg(Color::Gray), dimmed);
+            for body_line in markdown_lines(&entry.body, body_width, base) {
                 let mut spans = Vec::with_capacity(body_line.spans.len() + 1);
                 spans.push(Span::raw("    "));
                 spans.extend(body_line.spans);
@@ -262,12 +273,24 @@ fn entry_lines(
                 lines.push(
                     Line::from(vec![
                         Span::raw("    "),
-                        Span::styled(body_line, Style::default().fg(Color::Gray)),
+                        Span::styled(body_line, dim_ambient(style_fg(Color::Gray), dimmed)),
                     ])
                     .style(style),
                 );
             }
         }
+    }
+}
+
+fn style_fg(color: Color) -> Style {
+    Style::default().fg(color)
+}
+
+fn dim_ambient(style: Style, dimmed: bool) -> Style {
+    if dimmed {
+        style.add_modifier(Modifier::DIM)
+    } else {
+        style
     }
 }
 
@@ -278,10 +301,10 @@ fn renders_markdown(kind: EntryKind) -> bool {
     )
 }
 
-fn markdown_lines(markdown: &str, width: usize) -> Vec<Line<'static>> {
+fn markdown_lines(markdown: &str, width: usize, base: Style) -> Vec<Line<'static>> {
     let options = MarkdownOptions::new(MarkdownStyle);
     let text = from_str_with_options(markdown, &options);
-    wrap_markdown_lines(text.lines, width, Style::default().fg(Color::Gray))
+    wrap_markdown_lines(text.lines, width, base)
 }
 
 fn markdown_preview(markdown: &str) -> String {
@@ -809,12 +832,13 @@ mod tests {
     use lam_agents::{ActorAddress, AgentSystemEvent};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::style::{Color, Modifier, Style};
 
     use super::{
         PANEL, elide_end, markdown_lines, markdown_preview, needs_message_spacing, render,
         renders_markdown, viewport_offset, wrap_text,
     };
-    use crate::app::{App, EntryKind, SessionChoice, SessionView};
+    use crate::app::{App, EntryKind, Focus, SessionChoice, SessionView};
     use crate::config::ModelChoice;
     use crate::runtime::{AgentHistory, HistoryEntry, HistoryKind};
 
@@ -857,7 +881,7 @@ mod tests {
 
     #[test]
     fn markdown_preserves_inline_styles_in_ratatui_spans() {
-        let lines = markdown_lines("A **bold** word and `code`.", 80);
+        let lines = markdown_lines("A **bold** word and `code`.", 80, Style::default().fg(Color::Gray));
         let spans = lines
             .iter()
             .flat_map(|line| line.spans.iter())
@@ -883,7 +907,7 @@ mod tests {
 
     #[test]
     fn markdown_wraps_styled_wide_text_by_terminal_cells() {
-        let lines = markdown_lines("**ab界cd**", 4);
+        let lines = markdown_lines("**ab界cd**", 4, Style::default().fg(Color::Gray));
 
         assert_eq!(
             lines.iter().map(ToString::to_string).collect::<Vec<_>>(),
@@ -900,7 +924,7 @@ mod tests {
     #[test]
     fn markdown_tables_wrap_cells_within_the_pane() {
         let markdown = "| Term | Meaning |\n| --- | --- |\n| **Thread-mobile / migratable** | The value can be moved across threads while work is running. |\n| **Thread-affine** | The value must remain on the worker that owns it. |";
-        let lines = markdown_lines(markdown, 42);
+        let lines = markdown_lines(markdown, 42, Style::default().fg(Color::Gray));
         let rendered = lines.iter().map(ToString::to_string).collect::<Vec<_>>();
         let rows = rendered
             .iter()
@@ -987,7 +1011,7 @@ mod tests {
 
     #[test]
     fn incomplete_streamed_code_fence_renders_its_content() {
-        let lines = markdown_lines("Working…\n\n```rust\nlet answer = 42;", 80);
+        let lines = markdown_lines("Working…\n\n```rust\nlet answer = 42;", 80, Style::default().fg(Color::Gray));
         let rendered = lines.iter().map(ToString::to_string).collect::<String>();
 
         assert!(rendered.contains("Working…"));
@@ -1069,5 +1093,61 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(expanded.contains("secret_marker"));
+    }
+
+    #[test]
+    fn tool_rows_render_dimmed_until_selected() {
+        let mut app = test_app(vec![HistoryEntry {
+            kind: HistoryKind::ToolCall,
+            title: "/root · Inspect the workspace".to_owned(),
+            body: "const files = await lam.fs.list({ path: '.' });".to_owned(),
+        }]);
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let dimmed = text_modifier(terminal.backend().buffer(), "/root · Inspect");
+        assert!(dimmed.contains(Modifier::DIM));
+        assert!(!dimmed.contains(Modifier::BOLD));
+
+        app.focus = Focus::Conversation;
+        app.selected_entry = Some(0);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let focused = text_modifier(terminal.backend().buffer(), "/root · Inspect");
+        assert!(!focused.contains(Modifier::DIM));
+        assert!(focused.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn reasoning_rows_render_dimmed_until_selected() {
+        let mut app = test_app(vec![HistoryEntry {
+            kind: HistoryKind::Reasoning,
+            title: "agent".to_owned(),
+            body: "weighing the options".to_owned(),
+        }]);
+        app.entries[0].expanded = true;
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        assert!(text_modifier(buffer, "weighing").contains(Modifier::DIM));
+
+        app.focus = Focus::Conversation;
+        app.selected_entry = Some(0);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        assert!(!text_modifier(buffer, "weighing").contains(Modifier::DIM));
+    }
+
+    fn text_modifier(buffer: &ratatui::buffer::Buffer, needle: &str) -> Modifier {
+        let cells = buffer.content();
+        let symbols: Vec<&str> = cells.iter().map(|cell| cell.symbol()).collect();
+        let needle: Vec<String> = needle.chars().map(|character| character.to_string()).collect();
+        let index = symbols
+            .windows(needle.len())
+            .position(|window| window == needle.as_slice())
+            .expect("the needle is rendered");
+        cells[index].modifier
     }
 }
