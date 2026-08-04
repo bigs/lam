@@ -6,6 +6,7 @@ use crossterm::event::{
 };
 use lam::{ModelDelta, RunEvent, RunId, RuntimeEvent, ToolCallDelta};
 use lam_agents::{AgentOutcome, AgentSystemEvent, StopReason};
+use ratatui::layout::Rect;
 use unicode_width::UnicodeWidthChar;
 
 use crate::config::ModelChoice;
@@ -153,6 +154,9 @@ pub(crate) struct App {
     pub(crate) focus: Focus,
     pub(crate) input: InputBuffer,
     pub(crate) input_width: usize,
+    /// Terminal geometry of the input box from the last rendered frame, so
+    /// mouse clicks can be mapped back to character positions.
+    pub(crate) input_area: Option<Rect>,
     pub(crate) entries: Vec<ConversationEntry>,
     pub(crate) selected_entry: Option<usize>,
     pub(crate) conversation_offset: usize,
@@ -277,6 +281,7 @@ impl App {
             focus: Focus::Input,
             input: InputBuffer::default(),
             input_width: 80,
+            input_area: None,
             entries,
             selected_entry,
             conversation_offset: 0,
@@ -628,6 +633,20 @@ impl App {
                 self.suggestion_index = 0;
                 None
             }
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.input.move_to_line_start();
+                None
+            }
+            KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.input.move_to_line_end();
+                None
+            }
+            KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.input_history = None;
+                self.input.delete_word_backward();
+                self.suggestion_index = 0;
+                None
+            }
             KeyCode::Char(character)
                 if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
             {
@@ -902,6 +921,19 @@ impl App {
                 self.scroll_conversation(1);
             }
             MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(area) = self.input_area
+                    && mouse.row >= area.y
+                    && mouse.row < area.y.saturating_add(area.height)
+                    && mouse.column >= area.x
+                {
+                    self.focus = Focus::Input;
+                    let row = usize::from(mouse.row - area.y);
+                    let column = usize::from(mouse.column - area.x).saturating_sub(3);
+                    self.input.cursor = self.input.cursor_at(self.input_width, row, column);
+                    self.input.preferred_column = None;
+                    self.suggestion_index = 0;
+                    return;
+                }
                 if let Some(hitbox) = self
                     .hitboxes
                     .iter()
@@ -2132,6 +2164,72 @@ impl InputBuffer {
         self.text.replace_range(start..end, "");
         self.preferred_column = None;
     }
+
+    /// Character index of the start of the logical line containing the cursor.
+    fn line_start(&self) -> usize {
+        let byte = byte_index(&self.text, self.cursor);
+        self.text[..byte]
+            .rfind('\n')
+            .map_or(0, |newline| self.text[..newline].chars().count() + 1)
+    }
+
+    /// Character index just past the end of the logical line containing the cursor.
+    fn line_end(&self) -> usize {
+        let byte = byte_index(&self.text, self.cursor);
+        self.text[byte..].find('\n').map_or_else(
+            || self.char_count(),
+            |newline| self.cursor + self.text[byte..byte + newline].chars().count(),
+        )
+    }
+
+    /// Moves the cursor to the start of its logical line (Ctrl-A).
+    fn move_to_line_start(&mut self) {
+        self.cursor = self.line_start();
+        self.preferred_column = None;
+    }
+
+    /// Moves the cursor to the end of its logical line (Ctrl-E).
+    fn move_to_line_end(&mut self) {
+        self.cursor = self.line_end();
+        self.preferred_column = None;
+    }
+
+    /// Removes the whitespace-delimited word immediately before the cursor
+    /// (terminal-style Ctrl-W / unix word rubout).
+    fn delete_word_backward(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let byte = byte_index(&self.text, self.cursor);
+        let before = &self.text[..byte];
+        let trimmed = before.trim_end_matches(char::is_whitespace);
+        let start = trimmed
+            .trim_end_matches(|character: char| !character.is_whitespace())
+            .len();
+        self.text.replace_range(start..byte, "");
+        self.cursor = self.text[..start].chars().count();
+        self.preferred_column = None;
+    }
+
+    /// Character index of the cursor position nearest the clicked visual
+    /// (row, column) within the wrapped layout. Rows below the text place the
+    /// cursor at the end of the input.
+    pub(crate) fn cursor_at(&self, width: usize, row: usize, column: usize) -> usize {
+        let layout = self.layout(width);
+        if row >= layout.rows.len() {
+            return self.char_count();
+        }
+        layout
+            .cursor_positions
+            .iter()
+            .enumerate()
+            .filter(|(_, (candidate_row, _))| *candidate_row == row)
+            .max_by_key(|(_, (_, candidate_column))| {
+                (*candidate_column <= column, *candidate_column)
+            })
+            .map(|(index, _)| index)
+            .unwrap_or(0)
+    }
 }
 
 fn byte_index(text: &str, character: usize) -> usize {
@@ -2150,6 +2248,7 @@ mod tests {
         TokenUsage, ToolCallDelta,
     };
     use lam_agents::{ActorAddress, AgentOutcome, AgentSystemEvent};
+    use ratatui::layout::Rect;
 
     use super::{
         App, EntryKind, Focus, Hitbox, InputBuffer, SessionChoice, SessionView, partial_eval_intent,
@@ -2217,6 +2316,162 @@ mod tests {
         input.insert('界');
         assert_eq!(input.text, "a界");
         assert_eq!(input.cursor, 2);
+    }
+
+    #[test]
+    fn cursor_at_maps_clicked_columns_to_character_positions() {
+        let input = InputBuffer::at_end("ab界d".to_owned());
+        assert_eq!(input.cursor_at(10, 0, 0), 0);
+        assert_eq!(
+            input.cursor_at(10, 0, 1),
+            1,
+            "clicking a narrow char puts the cursor before it"
+        );
+        assert_eq!(
+            input.cursor_at(10, 0, 2),
+            2,
+            "left half of a wide char stays before it"
+        );
+        assert_eq!(
+            input.cursor_at(10, 0, 3),
+            2,
+            "right half of a wide char stays before it"
+        );
+        assert_eq!(
+            input.cursor_at(10, 0, 4),
+            3,
+            "the column right after a wide char lands after it"
+        );
+        assert_eq!(
+            input.cursor_at(10, 0, 5),
+            4,
+            "past the end clamps to the end"
+        );
+        assert_eq!(input.cursor_at(10, 0, 99), 4);
+    }
+
+    #[test]
+    fn cursor_at_maps_multiline_and_wrapped_rows() {
+        let input = InputBuffer::at_end("first\nsecond".to_owned());
+        assert_eq!(input.cursor_at(10, 0, 2), 2);
+        assert_eq!(input.cursor_at(10, 0, 99), 5, "end of the first line");
+        assert_eq!(input.cursor_at(10, 1, 0), 6, "start of the second line");
+        assert_eq!(input.cursor_at(10, 1, 3), 9);
+        assert_eq!(input.cursor_at(10, 1, 99), 12, "end of the second line");
+        assert_eq!(
+            input.cursor_at(10, 5, 0),
+            12,
+            "rows below the text land at the end"
+        );
+    }
+
+    #[test]
+    fn delete_word_backward_removes_whitespace_delimited_chunks() {
+        let mut input = InputBuffer::at_end("inspect the workspace".to_owned());
+        input.delete_word_backward();
+        assert_eq!(input.text, "inspect the ");
+        assert_eq!(input.cursor, 12);
+
+        let mut input = InputBuffer::at_end("hello".to_owned());
+        input.cursor = 3;
+        input.delete_word_backward();
+        assert_eq!(input.text, "lo");
+        assert_eq!(input.cursor, 0);
+
+        let mut input = InputBuffer::at_end("αβ γδ".to_owned());
+        input.delete_word_backward();
+        assert_eq!(input.text, "αβ ");
+        assert_eq!(input.cursor, 3);
+
+        let mut input = InputBuffer::default();
+        input.delete_word_backward();
+        assert_eq!(input.text, "");
+    }
+
+    #[test]
+    fn control_a_and_e_jump_to_logical_line_bounds() {
+        let mut app = app();
+        app.input = InputBuffer::at_end("first\nsecond".to_owned());
+        app.input.cursor = 9;
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert_eq!(app.input.cursor, 6);
+        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        assert_eq!(app.input.cursor, 12);
+        // Ctrl-A is line-relative: repeating it stays at the line start.
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert_eq!(app.input.cursor, 6);
+    }
+
+    #[test]
+    fn control_w_deletes_the_word_before_the_cursor() {
+        let mut app = app();
+        app.input = InputBuffer::at_end("inspect the workspace".to_owned());
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(app.input.text, "inspect the ");
+        assert_eq!(app.input.cursor, 12);
+    }
+
+    #[test]
+    fn clicking_the_input_focuses_and_moves_the_cursor() {
+        let mut app = app();
+        app.input = InputBuffer::at_end("hello".to_owned());
+        app.focus = Focus::Conversation;
+        app.input_area = Some(Rect {
+            x: 2,
+            y: 10,
+            width: 60,
+            height: 1,
+        });
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2 + 3 + 2,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.focus, Focus::Input);
+        assert_eq!(app.input.cursor, 2);
+    }
+
+    #[test]
+    fn clicking_the_input_prefix_moves_the_cursor_to_the_start() {
+        let mut app = app();
+        app.input = InputBuffer::at_end("hello".to_owned());
+        app.focus = Focus::Conversation;
+        app.input_area = Some(Rect {
+            x: 2,
+            y: 10,
+            width: 60,
+            height: 1,
+        });
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.focus, Focus::Input);
+        assert_eq!(app.input.cursor, 0);
+    }
+
+    #[test]
+    fn clicking_below_the_input_puts_the_cursor_at_the_end() {
+        let mut app = app();
+        app.input = InputBuffer::at_end("hi".to_owned());
+        app.focus = Focus::Conversation;
+        app.input_area = Some(Rect {
+            x: 0,
+            y: 10,
+            width: 80,
+            height: 3,
+        });
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 3,
+            row: 12,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.focus, Focus::Input);
+        assert_eq!(app.input.cursor, 2);
     }
 
     #[test]

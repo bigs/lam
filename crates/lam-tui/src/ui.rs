@@ -735,6 +735,7 @@ fn render_shelf(frame: &mut Frame<'_>, area: Rect, app: &mut App, suggestions: &
         Constraint::Min(1),
     ])
     .areas(inner);
+    app.input_area = Some(input_area);
     if steer_height > 0 {
         render_pending_steers(frame, steer_area, app);
     }
