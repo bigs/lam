@@ -231,6 +231,17 @@ impl ActorState {
     /// This is required when later events depend on state established earlier
     /// in the same compare-and-append operation.
     pub fn validate_batch(&self, batch: &EventBatch) -> Result<(), StateError> {
+        // Single-event batches carry no cross-event dependencies, so they
+        // validate against the projection without cloning it. Cloning the
+        // full context (many megabytes of model payloads) on every ordinary
+        // append would dominate the cost of each step.
+        if batch.event_count() == 1 {
+            let event = batch
+                .iter()
+                .next()
+                .expect("a nonempty batch has a first event");
+            return self.validate_event_without_apply(event);
+        }
         let mut preview = self.clone();
         let mut revision = self.revision;
         for event in batch.iter() {
@@ -241,6 +252,50 @@ impl ActorState {
                 revision,
                 event: event.clone(),
             })?;
+        }
+        Ok(())
+    }
+
+    /// Validates one event against the current projection without applying
+    /// its state changes. Equivalent to the checks Self::apply_stored_event
+    /// performs for a single-event batch, minus the mutations, which only
+    /// matter when later events in the same batch depend on them.
+    fn validate_event_without_apply(&self, event: &ActorEvent) -> Result<(), StateError> {
+        let schema_version = event.schema_version();
+        let revision = self
+            .revision
+            .checked_advance(1)
+            .ok_or(StateError::RevisionExhausted)?;
+        if schema_version == 0 || schema_version > ACTOR_EVENT_SCHEMA_VERSION {
+            return Err(StateError::UnsupportedEventVersion {
+                revision,
+                found: schema_version,
+                supported: ACTOR_EVENT_SCHEMA_VERSION,
+            });
+        }
+        let data = event.data();
+        if schema_version == 1 && matches!(data, ActorEventData::ModelSelected { .. }) {
+            return Err(StateError::UnsupportedEventVersion {
+                revision,
+                found: schema_version,
+                supported: ACTOR_EVENT_SCHEMA_VERSION,
+            });
+        }
+        match data {
+            ActorEventData::MessageAdmitted { message } => {
+                message.validate()?;
+                if self.message(message.message_id()).is_some() {
+                    return Err(StateError::DuplicateMessage {
+                        message_id: message.message_id().clone(),
+                    });
+                }
+            }
+            ActorEventData::ContextAppended { entry } => {
+                self.validate_context_entry(entry)?;
+            }
+            ActorEventData::ModelSelected { selection } => {
+                self.validate_model_selection(selection)?;
+            }
         }
         Ok(())
     }

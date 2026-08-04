@@ -773,3 +773,46 @@ fn actor_messages_are_always_steering() {
         Err(lam_core::MessageError::ActorMustSteer)
     ));
 }
+
+#[tokio::test]
+async fn single_event_batches_validate_without_the_full_preview_clone() {
+    let store = MemStore::new();
+    let actor = actor_id();
+    let first = message("m1", DeliveryMode::Steer, "first", 1);
+    append_successfully(
+        &store,
+        &actor,
+        Revision::ZERO,
+        ActorEvent::message_admitted(first),
+    )
+    .await;
+    let state = catch_up(&store, &actor, ActorState::default()).await;
+
+    // A fresh single-event admission validates on the fast path.
+    let fresh = message("m2", DeliveryMode::Steer, "second", 2);
+    state
+        .validate_batch(&EventBatch::one(ActorEvent::message_admitted(fresh)))
+        .expect("a fresh single-event admission validates");
+
+    // The duplicate rejection the preview path enforces is preserved.
+    let duplicate = message("m1", DeliveryMode::Steer, "first", 1);
+    let error = state
+        .validate_batch(&EventBatch::one(ActorEvent::message_admitted(duplicate)))
+        .expect_err("a duplicate single-event admission is rejected");
+    assert!(matches!(error, StateError::DuplicateMessage { .. }));
+
+    // Context validation still runs on the fast path: a Messages transition
+    // must consume exactly the eligible set.
+    let orphan = context(
+        ContextTransition::Messages {
+            run_id: RunId::new("r1").expect("fixture run id is valid"),
+            consumed_message_ids: Vec::new(),
+        },
+        json!({ "messages": [] }),
+        3,
+    );
+    let error = state
+        .validate_batch(&EventBatch::one(ActorEvent::context_appended(orphan)))
+        .expect_err("an empty Messages transition is rejected");
+    assert!(matches!(error, StateError::MessageBatchMismatch { .. }));
+}
