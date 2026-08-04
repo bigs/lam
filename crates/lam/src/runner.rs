@@ -30,6 +30,14 @@ use crate::{
     RUNTIME_COMPONENT_ID, RunEvent, RuntimeEvent, SystemNotice,
 };
 
+/// Terminal bound on uninterrupted model self-correction.
+///
+/// A rejected directive is returned to the model as its call's result so an
+/// occasional malformed call costs one round trip instead of the run. A model
+/// that keeps sending invalid directives is not converging, so the run fails
+/// once this many arrive with no valid directive between them.
+const MAX_CONSECUTIVE_REJECTED_DIRECTIVES: u8 = 3;
+
 pub(crate) struct ActorRunner<S> {
     pub(crate) actor_id: ActorId,
     pub(crate) store: Arc<S>,
@@ -215,6 +223,7 @@ where
                     run_id: run_id.clone(),
                 },
             );
+            let mut consecutive_rejections: u8 = 0;
             loop {
                 if self.control.is_requested(&run_id) {
                     return Err(ActorError::Interrupted);
@@ -348,6 +357,7 @@ where
 
                 match directive {
                     ModelDirective::Eval(request) => {
+                        consecutive_rejections = 0;
                         let entry = model_entry(&run_id, RunProgress::Continue, response, recorded_at);
                         state =
                             append_context(self.store.as_ref(), &self.actor_id, state, entry).await?;
@@ -412,6 +422,7 @@ where
                         }
                     }
                     ModelDirective::Output(value) => {
+                        consecutive_rejections = 0;
                         match self
                             .append_output_candidate(state, &run_id, response, recorded_at)
                             .await?
@@ -437,6 +448,39 @@ where
                                     },
                                 );
                             }
+                        }
+                    }
+                    ModelDirective::Rejected { message } => {
+                        consecutive_rejections += 1;
+                        let entry = model_entry(&run_id, RunProgress::Continue, response, recorded_at);
+                        state =
+                            append_context(self.store.as_ref(), &self.actor_id, state, entry).await?;
+                        let mut outcomes = Vec::with_capacity(rejected_eval_calls + 1);
+                        outcomes.push(EvalOutcome::Rejected { message });
+                        outcomes.extend(
+                            std::iter::repeat_with(EvalOutcome::parallel_tool_call_rejected)
+                                .take(rejected_eval_calls),
+                        );
+                        // Commit before emitting, and even when the cap below
+                        // fails the run: every native call has its durable
+                        // rejection result, so the journal replays cleanly.
+                        state = self.append_eval_outcomes(state, &run_id, &outcomes).await?;
+                        for outcome in outcomes {
+                            emit(
+                                &self.run_events,
+                                events,
+                                RunEvent::EvalCompleted {
+                                    run_id: run_id.clone(),
+                                    outcome,
+                                },
+                            );
+                        }
+                        if consecutive_rejections >= MAX_CONSECUTIVE_REJECTED_DIRECTIVES {
+                            return Err(ActorError::Codec {
+                                message: format!(
+                                    "the model sent {consecutive_rejections} consecutive invalid directives"
+                                ),
+                            });
                         }
                     }
                 }

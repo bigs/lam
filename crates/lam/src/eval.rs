@@ -15,9 +15,10 @@ pub enum EvalOutcome {
         /// Structured kernel failure.
         error: EvalError,
     },
-    /// The provider emitted a sibling eval which Lam deliberately did not run.
+    /// Lam deliberately did not run this call: a sibling beyond the first
+    /// eval, an unknown function, or invalid eval arguments.
     Rejected {
-        /// Model-visible explanation of how to express the work in one eval.
+        /// Model-visible explanation of why the call did not run.
         message: String,
     },
 }

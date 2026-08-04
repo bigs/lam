@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use lam::{CodecId, CodecRef, EncodedPayload, EvalRequest, OutputContract};
+use lam::{CodecId, CodecRef, EncodedPayload, EvalRequest, ModelDirective, OutputContract};
 use reqwest::header::HeaderValue;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -288,44 +288,40 @@ pub(crate) fn eval_parameters() -> Value {
     })
 }
 
-pub(crate) fn parse_eval_arguments(arguments: &str) -> Result<EvalRequest, CodecError> {
+/// Parses eval call arguments, or explains in model-addressed language why
+/// they are invalid so the runtime can return the reason as the call's
+/// rejection result.
+pub(crate) fn parse_eval_arguments(arguments: &str) -> Result<EvalRequest, String> {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase", deny_unknown_fields)]
     struct Arguments {
         #[serde(default)]
         intent: Option<String>,
         source: String,
+        // Providers without strict schema enforcement habitually emit
+        // snake_case field names; accept the alias rather than fail the call.
+        #[serde(alias = "timeout_ms")]
         timeout_ms: Option<u64>,
     }
 
-    let arguments: Arguments =
-        serde_json::from_str(arguments).map_err(|error| CodecError::InvalidDirective {
-            message: format!("eval arguments are invalid: {error}"),
-        })?;
+    let arguments: Arguments = serde_json::from_str(arguments)
+        .map_err(|error| format!("eval arguments are invalid: {error}"))?;
     if arguments.source.trim().is_empty() {
-        return Err(CodecError::InvalidDirective {
-            message: "eval source must not be empty".to_owned(),
-        });
+        return Err("eval source must not be empty".to_owned());
     }
     let intent = match arguments.intent {
         Some(intent) => {
             let intent = intent.trim();
             if intent.is_empty() {
-                return Err(CodecError::InvalidDirective {
-                    message: "eval intent must not be empty".to_owned(),
-                });
+                return Err("eval intent must not be empty".to_owned());
             }
             if intent.contains(['\n', '\r']) {
-                return Err(CodecError::InvalidDirective {
-                    message: "eval intent must be one line".to_owned(),
-                });
+                return Err("eval intent must be one line".to_owned());
             }
             if intent.chars().count() > MAX_EVAL_INTENT_CHARS {
-                return Err(CodecError::InvalidDirective {
-                    message: format!(
-                        "eval intent must be at most {MAX_EVAL_INTENT_CHARS} characters"
-                    ),
-                });
+                return Err(format!(
+                    "eval intent must be at most {MAX_EVAL_INTENT_CHARS} characters"
+                ));
             }
             intent.to_owned()
         }
@@ -338,6 +334,24 @@ pub(crate) fn parse_eval_arguments(arguments: &str) -> Result<EvalRequest, Codec
         source: arguments.source,
         timeout: arguments.timeout_ms.map(Duration::from_millis),
     })
+}
+
+/// Rejection directive for an eval call whose arguments could not be used.
+pub(crate) fn invalid_eval_rejection(reason: &str) -> ModelDirective {
+    ModelDirective::Rejected {
+        message: format!(
+            "This eval call was not executed: {reason}. Send one corrected eval call whose JSON arguments match the tool schema: `intent`, `source`, and `timeoutMs`."
+        ),
+    }
+}
+
+/// Rejection directive for a call to a function that does not exist.
+pub(crate) fn unsupported_function_rejection(name: &str) -> ModelDirective {
+    ModelDirective::Rejected {
+        message: format!(
+            "This call was not executed because `{name}` is not an available function. The only available function is `eval`."
+        ),
+    }
 }
 
 pub(crate) fn output_value(output_kind: OutputKind, text: String) -> Result<Value, CodecError> {
@@ -396,5 +410,12 @@ mod tests {
         let request = parse_eval_arguments(r#"{"source":"1 + 1","timeoutMs":null}"#)
             .expect("version-one eval arguments remain readable");
         assert_eq!(request.intent, LEGACY_EVAL_INTENT);
+    }
+
+    #[test]
+    fn snake_case_timeout_is_accepted_as_an_alias() {
+        let request = parse_eval_arguments(r#"{"intent":"Sum","source":"1 + 1","timeout_ms":250}"#)
+            .expect("snake_case timeout should parse via the alias");
+        assert_eq!(request.timeout, Some(Duration::from_millis(250)));
     }
 }

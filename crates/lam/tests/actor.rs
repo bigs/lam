@@ -20,7 +20,7 @@ use serde_json::{Value, json};
 
 use support::{
     RejectingCompactionCodec, ScriptedCodec, ScriptedProvider, ScriptedStep, eval,
-    eval_with_rejected_calls, output, output_with_usage, overflow,
+    eval_with_rejected_calls, output, output_with_usage, overflow, rejected,
 };
 
 fn gated_output(value: Value, gate: Arc<Barrier>) -> ScriptedStep {
@@ -310,6 +310,94 @@ async fn parallel_eval_calls_execute_the_first_and_reject_the_rest() {
     let requests = provider.requests();
     let follow_up = requests[1].value.to_string();
     assert_eq!(follow_up.matches("lam/eval").count(), 3);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn rejected_directive_returns_its_reason_and_the_run_continues() {
+    let provider = ScriptedProvider::new([
+        rejected(
+            "This eval call was not executed: eval arguments are invalid: unknown field `timeout_ms`.",
+        ),
+        output("recovered"),
+    ]);
+    let mut actor = build_actor(provider.clone(), []).await;
+    let actor_ref = actor.actor_ref();
+
+    let mut run = actor.call("do the work");
+    let mut outcomes = Vec::new();
+    while let Some(event) = run.next().await {
+        if let RunEvent::EvalCompleted { outcome, .. } = event {
+            outcomes.push(outcome);
+        }
+    }
+    assert_eq!(run.await.unwrap(), "recovered");
+    assert_eq!(outcomes.len(), 1);
+    let lam::EvalOutcome::Rejected { message } = &outcomes[0] else {
+        panic!("the invalid directive should surface as a rejection: {outcomes:?}");
+    };
+    assert!(message.contains("unknown field"));
+
+    let state = actor_ref.state().await.unwrap();
+    let transitions = state
+        .context()
+        .iter()
+        .map(|entry| &entry.entry.transition)
+        .collect::<Vec<_>>();
+    assert!(matches!(transitions[0], ContextTransition::Messages { .. }));
+    assert!(matches!(
+        transitions[1],
+        ContextTransition::Model {
+            progress: RunProgress::Continue,
+            ..
+        }
+    ));
+    assert!(matches!(transitions[2], ContextTransition::Eval { .. }));
+    assert!(matches!(
+        transitions[3],
+        ContextTransition::Model {
+            progress: RunProgress::Complete,
+            ..
+        }
+    ));
+    assert_eq!(state.context()[2].entry.payload.value["status"], "rejected");
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    let follow_up = requests[1].value.to_string();
+    assert!(
+        follow_up.contains("unknown field `timeout_ms`"),
+        "the model must see why its call was rejected: {follow_up}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn consecutive_rejected_directives_fail_the_run_at_the_cap() {
+    let provider = ScriptedProvider::new([
+        rejected("first invalid directive"),
+        rejected("second invalid directive"),
+        rejected("third invalid directive"),
+    ]);
+    let mut actor = build_actor(provider.clone(), []).await;
+    let actor_ref = actor.actor_ref();
+
+    let error = actor.call("spin").await.unwrap_err();
+    let ActorError::Codec { message } = &error else {
+        panic!("a non-converging model should fail the run: {error:?}");
+    };
+    assert!(message.contains("3 consecutive"), "{message}");
+
+    // Every rejected response is durable with its paired rejection result.
+    let state = actor_ref.state().await.unwrap();
+    let evals = state
+        .context()
+        .iter()
+        .filter(|entry| matches!(entry.entry.transition, ContextTransition::Eval { .. }))
+        .collect::<Vec<_>>();
+    assert_eq!(evals.len(), 3);
+    for eval in evals {
+        assert_eq!(eval.entry.payload.value["status"], "rejected");
+    }
+    assert_eq!(provider.requests().len(), 3);
 }
 
 #[tokio::test(flavor = "current_thread")]

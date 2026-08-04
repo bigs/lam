@@ -152,6 +152,14 @@ impl ModelCodec for ScriptedCodec {
                     .cloned()
                     .ok_or_else(|| ScriptError("output response has no value".to_owned()))?,
             ),
+            Some("rejected") => ModelDirective::Rejected {
+                message: response
+                    .value
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| ScriptError("rejected response has no message".to_owned()))?
+                    .to_owned(),
+            },
             Some(kind) => return Err(ScriptError(format!("unknown directive `{kind}`"))),
             None => return Err(ScriptError("response has no directive".to_owned())),
         };
@@ -258,6 +266,15 @@ pub(crate) fn eval_with_rejected_calls(source: &str, rejected_eval_calls: usize)
             "source": source,
             "rejectedEvalCalls": rejected_eval_calls,
         }))),
+        deltas: Vec::new(),
+        gate: None,
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn rejected(message: &str) -> ScriptedStep {
+    ScriptedStep {
+        response: Ok(native(json!({ "kind": "rejected", "message": message }))),
         deltas: Vec::new(),
         gate: None,
     }

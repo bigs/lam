@@ -676,6 +676,14 @@ fn append_model_projection(
                 });
             }
         }
+        // No call parsed, so every native call renders from its raw
+        // fragments; the rejection message itself arrives as the eval
+        // result rows that follow this entry in the journal.
+        ModelDirective::Rejected { .. } => {
+            for (_, (name, arguments)) in tool_calls {
+                projected.push(historical_tool_call(address, &name, arguments));
+            }
+        }
     }
     history.extend(projected);
 }
@@ -1405,6 +1413,37 @@ mod tests {
         assert_eq!(history[0].body, "await commit()");
         assert_eq!(history[1].title, "/root · Inspect the styling");
         assert_eq!(history[1].body, "await inspect()");
+    }
+
+    #[test]
+    fn historical_model_projection_renders_rejected_calls_from_raw_fragments() {
+        let mut history = Vec::new();
+        append_model_projection(
+            &mut history,
+            "/root",
+            ModelResponseProjection {
+                display: vec![ModelDelta::ToolCall(lam::ToolCallDelta {
+                    index: 0,
+                    call_id: Some("call-1".to_owned()),
+                    name: Some("eval".to_owned()),
+                    arguments: json!({
+                        "intent": "Sum the numbers",
+                        "source": "1 + 1",
+                        "timeout": 5,
+                    })
+                    .to_string(),
+                })],
+                directive: ModelDirective::Rejected {
+                    message: "This eval call was not executed.".to_owned(),
+                },
+                rejected_eval_calls: 0,
+            },
+        );
+
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].kind, HistoryKind::ToolCall);
+        assert_eq!(history[0].title, "/root · Sum the numbers");
+        assert_eq!(history[0].body, "1 + 1");
     }
 
     #[test]

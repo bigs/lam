@@ -76,6 +76,16 @@ pub enum ModelDirective {
     Eval(EvalRequest),
     /// Candidate terminal value interpreted by the codec.
     Output(Value),
+    /// The response is a well-formed native message whose first call cannot
+    /// be executed — an unknown function or invalid eval arguments.
+    ///
+    /// The runtime records the response, returns this message as the call's
+    /// rejection result, and requests the model again, so the model can
+    /// correct a mistake instead of failing the run.
+    Rejected {
+        /// Model-visible explanation of why the call was not executed.
+        message: String,
+    },
 }
 
 /// Provider-neutral projection of one completed native model response.

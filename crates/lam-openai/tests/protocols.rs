@@ -204,6 +204,67 @@ fn responses_replays_rejections_for_parallel_eval_siblings() {
 }
 
 #[test]
+fn responses_reject_unusable_calls_instead_of_failing_projection() {
+    let (_, codec) = Responses::builder("gpt-test")
+        .api_key("test-key")
+        .build_parts()
+        .unwrap();
+    let call = |name: &str, arguments: &str| {
+        response_payload(
+            RESPONSES_RESPONSE_CODEC_ID,
+            "text",
+            "response",
+            json!({
+                "status": "completed",
+                "output": [{
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_1",
+                    "name": name,
+                    "arguments": arguments,
+                    "status": "completed",
+                }],
+            }),
+        )
+    };
+
+    // Loose providers habitually emit snake_case field names; the alias keeps
+    // the call an ordinary eval instead of a rejection.
+    let snake_case = codec
+        .project_response(&call(
+            "eval",
+            "{\"intent\":\"Sum\",\"source\":\"1 + 1\",\"timeout_ms\":250}",
+        ))
+        .unwrap();
+    assert!(matches!(
+        snake_case.directive,
+        ModelDirective::Eval(lam::EvalRequest { timeout: Some(timeout), .. })
+            if timeout == Duration::from_millis(250)
+    ));
+
+    let invalid = codec
+        .project_response(&call(
+            "eval",
+            "{\"intent\":\"Sum\",\"source\":\"1 + 1\",\"timeout\":5}",
+        ))
+        .unwrap();
+    let ModelDirective::Rejected { message } = &invalid.directive else {
+        panic!("invalid eval arguments should reject the call: {invalid:?}");
+    };
+    assert!(message.contains("unknown field `timeout`"), "{message}");
+    assert!(message.contains("`timeoutMs`"), "{message}");
+
+    let unsupported = codec
+        .project_response(&call("bash", "{\"command\":\"ls\"}"))
+        .unwrap();
+    let ModelDirective::Rejected { message } = &unsupported.directive else {
+        panic!("an unknown function should reject the call: {unsupported:?}");
+    };
+    assert!(message.contains("`bash`"), "{message}");
+    assert!(message.contains("`eval`"), "{message}");
+}
+
+#[test]
 fn responses_structured_output_uses_json_schema_and_decodes_json() {
     let (_, codec) = Responses::builder("gpt-test")
         .api_key("test-key")
@@ -687,6 +748,67 @@ fn chat_replays_rejections_for_parallel_eval_siblings() {
             .as_str()
             .unwrap()
             .contains("rejected")
+    );
+}
+
+#[test]
+fn chat_rejects_unusable_calls_and_replays_their_rejection_results() {
+    let (_, codec) = ChatCompletions::builder("test-model")
+        .include_usage(false)
+        .build_parts()
+        .unwrap();
+    let response = response_payload(
+        CHAT_RESPONSE_CODEC_ID,
+        "text",
+        "response",
+        json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "eval",
+                            "arguments": "{\"intent\":\"Sum\",\"source\":\"1 + 1\",\"timeout\":5}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }),
+    );
+    let projection = codec.project_response(&response).unwrap();
+    assert_eq!(projection.rejected_eval_calls, 0);
+    let ModelDirective::Rejected { message } = &projection.directive else {
+        panic!("invalid eval arguments should reject the call: {projection:?}");
+    };
+    assert!(message.contains("unknown field `timeout`"), "{message}");
+
+    let request = codec
+        .encode_request(
+            &[
+                projected(1, model_transition(), response),
+                projected(
+                    2,
+                    eval_transition(),
+                    payload(
+                        "lam/eval",
+                        json!({ "status": "rejected", "message": message }),
+                    ),
+                ),
+            ],
+            &ModelRequestConfig::agent(&OutputContract::Text, ""),
+        )
+        .unwrap();
+    let messages = request.value["body"]["messages"].as_array().unwrap();
+    assert_eq!(messages[1]["tool_call_id"], "call_1");
+    assert!(
+        messages[1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("unknown field"),
+        "the replayed result must carry the rejection reason"
     );
 }
 

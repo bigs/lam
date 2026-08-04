@@ -115,8 +115,14 @@ pub(crate) fn has_pending_eval(state: &ActorState, model: &RegisteredModel) -> b
     let ContextTransition::Model { .. } = &last_step.entry.transition else {
         return false;
     };
+    // A rejected directive counts: its native calls were journaled without
+    // their rejection results, so they too need closing before the next
+    // request encodes.
     matches!(
         model.project_response(&last_step.entry.payload),
-        Ok(projection) if matches!(projection.directive, ModelDirective::Eval(_))
+        Ok(projection) if matches!(
+            projection.directive,
+            ModelDirective::Eval(_) | ModelDirective::Rejected { .. }
+        )
     )
 }

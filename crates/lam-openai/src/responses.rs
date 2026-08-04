@@ -15,8 +15,9 @@ use serde_json::{Map, Value, json};
 
 use crate::common::{
     BuiltConfig, CODEC_VERSION, EVAL_TOOL_DESCRIPTION, OutputKind, RESPONSES_REQUEST_CODEC_ID,
-    RESPONSES_RESPONSE_CODEC_ID, SharedBuilder, codec, eval_parameters, output_value,
-    parse_eval_arguments, parse_request, parse_response, request_payload, response_payload,
+    RESPONSES_RESPONSE_CODEC_ID, SharedBuilder, codec, eval_parameters, invalid_eval_rejection,
+    output_value, parse_eval_arguments, parse_request, parse_response, request_payload,
+    response_payload, unsupported_function_rejection,
 };
 use crate::context::{
     LAM_CODEC_VERSION, LAM_EVAL_CODEC_ID, LAM_MESSAGES_CODEC_ID, NativeRole, compaction_record,
@@ -490,12 +491,14 @@ impl ModelCodec for ResponsesCodec {
         let rejected_eval_calls = calls.len().saturating_sub(1);
         let display = response_display_deltas(envelope.value);
         let directive = if let Some(call) = calls.first() {
-            if call.name != "eval" {
-                return Err(CodecError::InvalidDirective {
-                    message: format!("the model requested unsupported function `{}`", call.name),
-                });
+            if call.name == "eval" {
+                match parse_eval_arguments(&call.arguments) {
+                    Ok(request) => ModelDirective::Eval(request),
+                    Err(reason) => invalid_eval_rejection(&reason),
+                }
+            } else {
+                unsupported_function_rejection(&call.name)
             }
-            parse_eval_arguments(&call.arguments).map(ModelDirective::Eval)?
         } else {
             let text = response_text(envelope.value)?;
             output_value(envelope.output_kind, text).map(ModelDirective::Output)?
