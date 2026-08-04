@@ -9,6 +9,7 @@ use lam_core::{
     MessageSource, ModelResponseMetadata, Revision, RunId, RunProgress, Timestamp,
 };
 use lam_redb::RedbStore;
+use redb::Database;
 use serde_json::json;
 
 #[tokio::test(flavor = "current_thread")]
@@ -18,6 +19,20 @@ async fn redb_store_obeys_the_journal_contract() {
         .expect("redb store should open");
 
     lam_core::test_support::assert_actor_journal_conformance(&store).await;
+}
+
+#[test]
+fn opening_requires_an_initialized_journal_schema() {
+    let directory = tempfile::tempdir().expect("temporary directory should exist");
+    let path = directory.path().join("uninitialized.redb");
+    drop(Database::create(&path).expect("empty redb database should be created"));
+
+    assert!(
+        RedbStore::open(&path).is_err(),
+        "open must validate rather than silently initialize the journal schema"
+    );
+    RedbStore::create(&path).expect("create should initialize the journal schema");
+    RedbStore::open(&path).expect("initialized journal should open");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -122,6 +137,43 @@ async fn actor_projection_survives_database_reopen() {
     assert_eq!(record.source.unwrap().value["raw"], "provider response");
     assert_eq!(record.replacement.value["text"], "complete");
     assert_eq!(state.context().len(), 3, "raw context remains available");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn actor_journals_can_be_discovered_in_canonical_order() {
+    let directory = tempfile::tempdir().expect("temporary directory should exist");
+    let store =
+        RedbStore::create(directory.path().join("actors.redb")).expect("redb store should open");
+    for name in ["/root/zeta", "/root", "/root/alpha"] {
+        let actor = ActorId::new(name).expect("fixture actor ID should be valid");
+        let outcome = store
+            .append(
+                &actor,
+                Revision::ZERO,
+                EventBatch::one(ActorEvent::message_admitted(message(
+                    MessageId::new(format!("message-{name}"))
+                        .expect("fixture message ID should be valid"),
+                    DeliveryMode::Steer,
+                    1,
+                ))),
+            )
+            .await
+            .expect("journal append should succeed");
+        assert_eq!(
+            outcome,
+            AppendOutcome::Appended {
+                head: Revision::new(1)
+            }
+        );
+    }
+
+    let actors = store
+        .actor_ids()
+        .expect("actor discovery should succeed")
+        .into_iter()
+        .map(|actor| actor.to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(actors, ["/root", "/root/alpha", "/root/zeta"]);
 }
 
 fn message(id: MessageId, delivery: DeliveryMode, time: i64) -> MessageEnvelope {

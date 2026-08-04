@@ -3,9 +3,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use lam_core::{
-    CompactionArtifact, Compactor, EncodedPayload, ModelCodec, ModelDescriptor, ModelDirective,
+    CompactionArtifact, CompactionConfig, Compactor, EncodedPayload, ModelCodec, ModelDescriptor,
     ModelEventSink, ModelProvider, ModelRequestConfig, ModelResponseMetadata,
-    ProjectedContextEntry,
+    ModelResponseProjection, ProjectedContextEntry,
 };
 
 /// One configured model transport and its pure payload codec.
@@ -13,6 +13,7 @@ pub struct Model<P, C> {
     pub(crate) provider: Arc<P>,
     pub(crate) codec: Arc<C>,
     descriptor: ModelDescriptor,
+    context_window_tokens: Option<u64>,
 }
 
 impl<P, C> Clone for Model<P, C> {
@@ -21,6 +22,7 @@ impl<P, C> Clone for Model<P, C> {
             provider: Arc::clone(&self.provider),
             codec: Arc::clone(&self.codec),
             descriptor: self.descriptor.clone(),
+            context_window_tokens: self.context_window_tokens,
         }
     }
 }
@@ -42,6 +44,7 @@ impl<P, C> Model<P, C> {
                 std::any::type_name::<C>(),
             )
             .expect("Rust type names are nonempty"),
+            context_window_tokens: None,
         }
     }
 
@@ -50,6 +53,19 @@ impl<P, C> Model<P, C> {
     pub fn with_descriptor(mut self, descriptor: ModelDescriptor) -> Self {
         self.descriptor = descriptor;
         self
+    }
+
+    /// Declares this model's context window for automatic compaction.
+    #[must_use]
+    pub const fn with_context_window_tokens(mut self, tokens: u64) -> Self {
+        self.context_window_tokens = Some(tokens);
+        self
+    }
+
+    /// Returns this model's declared context window, when configured.
+    #[must_use]
+    pub const fn context_window_tokens(&self) -> Option<u64> {
+        self.context_window_tokens
     }
 
     /// Returns the non-secret durable model description.
@@ -91,6 +107,13 @@ impl RegisteredModel {
         }
     }
 
+    pub(crate) fn compaction_config(&self, fallback: &CompactionConfig) -> CompactionConfig {
+        self.runtime.context_window_tokens().map_or_else(
+            || fallback.clone(),
+            |tokens| fallback.clone().context_window_tokens(tokens),
+        )
+    }
+
     pub(crate) fn descriptor(&self) -> &ModelDescriptor {
         self.runtime.descriptor()
     }
@@ -111,11 +134,11 @@ impl RegisteredModel {
         self.runtime.invoke(request, events)
     }
 
-    pub(crate) fn interpret_response(
+    pub(crate) fn project_response(
         &self,
         response: &EncodedPayload,
-    ) -> Result<ModelDirective, String> {
-        self.runtime.interpret_response(response)
+    ) -> Result<ModelResponseProjection, String> {
+        self.runtime.project_response(response)
     }
 
     pub(crate) fn response_metadata(&self, response: &EncodedPayload) -> ModelResponseMetadata {
@@ -145,6 +168,8 @@ pub(crate) type RuntimeModelFuture<'a> =
 trait RuntimeModel: Send + Sync {
     fn descriptor(&self) -> &ModelDescriptor;
 
+    fn context_window_tokens(&self) -> Option<u64>;
+
     fn encode_request(
         &self,
         context: &[ProjectedContextEntry],
@@ -153,7 +178,10 @@ trait RuntimeModel: Send + Sync {
 
     fn invoke(&self, request: EncodedPayload, events: ModelEventSink) -> RuntimeModelFuture<'_>;
 
-    fn interpret_response(&self, response: &EncodedPayload) -> Result<ModelDirective, String>;
+    fn project_response(
+        &self,
+        response: &EncodedPayload,
+    ) -> Result<ModelResponseProjection, String>;
 
     fn response_metadata(&self, response: &EncodedPayload) -> ModelResponseMetadata;
 
@@ -176,6 +204,10 @@ where
 {
     fn descriptor(&self) -> &ModelDescriptor {
         self.model.descriptor()
+    }
+
+    fn context_window_tokens(&self) -> Option<u64> {
+        self.model.context_window_tokens()
     }
 
     fn encode_request(
@@ -202,10 +234,13 @@ where
         })
     }
 
-    fn interpret_response(&self, response: &EncodedPayload) -> Result<ModelDirective, String> {
+    fn project_response(
+        &self,
+        response: &EncodedPayload,
+    ) -> Result<ModelResponseProjection, String> {
         self.model
             .codec
-            .interpret_response(response)
+            .project_response(response)
             .map_err(|error| error.to_string())
     }
 

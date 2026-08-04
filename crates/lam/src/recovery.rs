@@ -1,14 +1,15 @@
 use lam_core::{
-    ActorId, ActorState, CodecId, CodecRef, ComponentId, ContextTransition, DeliveryMode,
-    EncodedPayload, JournalStore, MessageEnvelope, MessageSource, ModelDirective,
+    ActorId, ActorState, ComponentId, ContextTransition, DeliveryMode, EncodedPayload,
+    JournalStore, MessageEnvelope, MessageSource, ModelDirective,
 };
 
 use crate::actor::{Clock, RuntimeIds};
 use crate::model::RegisteredModel;
+use crate::notice::system_notice_codec;
 use crate::runtime_journal::{admit_message_from_state, load_state};
 use crate::{
     ActorError, InterruptedEvalOutcome, IsolateState, RUNTIME_COMPONENT_ID, RuntimeEvent,
-    SYSTEM_NOTICE_CODEC_ID, SYSTEM_NOTICE_CODEC_VERSION, SystemNotice,
+    SystemNotice,
 };
 
 pub(crate) struct StartupRecovery {
@@ -36,7 +37,8 @@ where
     }
 
     let resumed_run_id = state.active_run().cloned();
-    let interrupted_eval_outcome = interrupted_eval_outcome(&state, model);
+    let interrupted_eval_outcome =
+        has_pending_eval(&state, model).then_some(InterruptedEvalOutcome::Unknown);
     let notice = SystemNotice::runtime_resumed(resumed_run_id.clone(), interrupted_eval_outcome);
     let payload = EncodedPayload::new(
         system_notice_codec(),
@@ -97,30 +99,24 @@ fn is_runtime_resumption(message: &MessageEnvelope) -> bool {
         )
 }
 
-fn interrupted_eval_outcome(
-    state: &ActorState,
-    model: &RegisteredModel,
-) -> Option<InterruptedEvalOutcome> {
-    let active_run = state.active_run()?;
+pub(crate) fn has_pending_eval(state: &ActorState, model: &RegisteredModel) -> bool {
+    let Some(active_run) = state.active_run() else {
+        return false;
+    };
     let last_step = state.context().iter().rev().find(|projected| {
         !matches!(
             projected.entry.transition,
             ContextTransition::Compaction { .. }
         ) && projected.entry.transition.run_id() == Some(active_run)
-    })?;
+    });
+    let Some(last_step) = last_step else {
+        return false;
+    };
     let ContextTransition::Model { .. } = &last_step.entry.transition else {
-        return None;
+        return false;
     };
     matches!(
-        model.interpret_response(&last_step.entry.payload),
-        Ok(ModelDirective::Eval(_))
-    )
-    .then_some(InterruptedEvalOutcome::Unknown)
-}
-
-fn system_notice_codec() -> CodecRef {
-    CodecRef::new(
-        CodecId::new(SYSTEM_NOTICE_CODEC_ID).expect("Lam's system notice codec id is valid"),
-        SYSTEM_NOTICE_CODEC_VERSION,
+        model.project_response(&last_step.entry.payload),
+        Ok(projection) if matches!(projection.directive, ModelDirective::Eval(_))
     )
 }

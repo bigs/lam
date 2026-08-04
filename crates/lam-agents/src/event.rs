@@ -16,6 +16,8 @@ pub enum StopReason {
     Stopped,
     /// Structured call cancellation retired the child it owned.
     Cancelled,
+    /// A recoverable tree interruption retired this descendant.
+    Interrupted,
     /// Graceful system shutdown retired the actor.
     Shutdown,
     /// Forceful system or host cancellation retired the actor.

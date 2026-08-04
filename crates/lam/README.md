@@ -74,19 +74,30 @@ one actor identity:
 
 ## Handles and control flow
 
-- `Actor` is the linear owner used for correlated calls, compaction, model
-  switching, graceful shutdown, and joined abort.
+- `Actor` is the linear runtime owner used for event-stream ownership, graceful
+  shutdown, and joined abort. Its operation methods delegate to its handle.
+- `ActorHandle` is cloneable authority for correlated calls, compaction, model
+  switching, state projection, durable mailbox delivery, and recoverable run
+  interruption.
 - `ActorRef` is cloneable send-only mailbox authority. `send` returns after the
   message is durably admitted.
 - `AbortHandle` is cloneable out-of-band cancellation authority and can
   interrupt a blocked model request or active JavaScript without waiting for
-  the `Actor` call lock.
-- `Run<T>` is the lazy, streamable form of a call. It exposes progress events
-  and can decode schema-constrained output.
+  the active correlated operation.
+- `Run<T>` is the owned, lazy, streamable form of a call. It exposes progress
+  events and can decode schema-constrained output.
 
-Only one call may run at a time for an actor. Additional input should use the
-mailbox: steering joins the active run at its next boundary, while queueing
-waits for that run to finish.
+Calls, compaction, and model switches are mutually exclusive per actor. A
+conflicting operation returns `ActorError::Busy`. Additional input should use
+the mailbox: steering joins the active run at its next boundary, while
+queueing waits for that run to finish.
+
+`ActorHandle::interrupt` is deliberately separate from abort. It cancels
+in-flight provider, compactor, or eval work, discards incomplete model deltas,
+and atomically records a model-visible runtime notice plus any required eval
+failure. The active run becomes permanently interrupted, the actor remains
+resident, and a later call starts a new run from the durable boundary. If an
+eval had begun, its isolate is replaced before interruption completes.
 
 ## Context and recovery
 
@@ -96,6 +107,10 @@ projection and starts a fresh isolate. If execution may have stopped between a
 model's eval request and its durable result, recovery admits a structured,
 model-visible notice declaring that the isolate was reset and the effect
 outcome is unknown.
+
+A live recoverable interruption is more precise than crash recovery: when a
+durable eval request has no result, Lam records an explicit interrupted eval
+failure in the same journal batch as the terminal interruption notice.
 
 Process-local call waiters are not durable jobs. Recovered work continues
 through the actor mailbox and journal rather than trying to resurrect a Rust

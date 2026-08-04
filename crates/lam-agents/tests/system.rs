@@ -9,10 +9,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use lam::{
-    ActorEventData, ActorId, AppendOutcome, CodecId, CodecRef, EncodedPayload, EvalRequest,
-    EventBatch, JournalError, JournalPage, JournalStore, Lam, MemStore, MessageSource, Model,
-    ModelCodec, ModelDescriptor, ModelDirective, ModelEventSink, ModelProvider, ModelRequestConfig,
-    OutputContract, Revision,
+    ActorEventData, ActorId, ActorState, AppendOutcome, CodecId, CodecRef, EncodedPayload,
+    EvalRequest, EventBatch, JournalError, JournalPage, JournalStore, Lam, MemStore, MessageSource,
+    Model, ModelCodec, ModelDescriptor, ModelDirective, ModelEventSink, ModelProvider,
+    ModelRequestConfig, ModelResponseProjection, OutputContract, Revision,
 };
 use lam_agents::{
     ActorAddress, AgentOutcome, AgentSystem, AgentSystemError, AgentSystemEvent, StopReason,
@@ -34,9 +34,12 @@ enum RoutingScenario {
     General,
     ChildCall,
     BackgroundOutcome,
+    SpawnWait,
     DirectStop,
     CancelCall,
     UnauthorizedStop,
+    TreeInterruption,
+    BackgroundInterruption,
 }
 
 struct ProviderState {
@@ -310,9 +313,12 @@ fn scenario_response(scenario: RoutingScenario, request: &Value) -> Option<Value
         RoutingScenario::General => None,
         RoutingScenario::ChildCall => Some(child_call_response(request)),
         RoutingScenario::BackgroundOutcome => Some(background_outcome_response(request)),
+        RoutingScenario::SpawnWait => Some(spawn_wait_response(request)),
         RoutingScenario::DirectStop => Some(direct_stop_response(request)),
         RoutingScenario::CancelCall => Some(cancel_call_response(request)),
         RoutingScenario::UnauthorizedStop => Some(unauthorized_stop_response(request)),
+        RoutingScenario::TreeInterruption => Some(tree_interruption_response(request)),
+        RoutingScenario::BackgroundInterruption => Some(background_interruption_response(request)),
     }
 }
 
@@ -356,6 +362,33 @@ fn background_outcome_response(request: &Value) -> Value {
   namespaces: []
 });
 lam.result("spawned")"#
+        });
+    }
+    json!({ "kind": "output", "value": "plain complete" })
+}
+
+fn spawn_wait_response(request: &Value) -> Value {
+    if has_message(request, "waited child task", Some("actor")) {
+        return json!({ "kind": "output", "value": "waited child complete" });
+    }
+    if has_message(request, "spawn wait root", Some("user")) {
+        if transition_payload_contains(request, "eval", "inboxMessageId")
+            && has_message(request, "waited child complete", Some("actor"))
+        {
+            return json!({ "kind": "output", "value": "WAIT_OK" });
+        }
+        if has_transition(request, "eval") {
+            return json!({ "kind": "output", "value": "WAIT_INCOMPLETE" });
+        }
+        return json!({
+            "kind": "eval",
+            "source": r#"const child = await lam.agents.spawn({
+  name: "waited",
+  task: "waited child task",
+  namespaces: []
+});
+const receipt = await lam.agents.wait({ addresses: [child.address] });
+lam.result(receipt)"#
         });
     }
     json!({ "kind": "output", "value": "plain complete" })
@@ -436,6 +469,59 @@ lam.result(rejected)"#
     json!({ "kind": "output", "value": "plain complete" })
 }
 
+fn tree_interruption_response(request: &Value) -> Value {
+    if has_message(request, "resume after interruption", Some("user")) {
+        return json!({ "kind": "output", "value": "plain complete" });
+    }
+    if has_message(request, "tree leaf task", Some("actor")) {
+        return json!({ "kind": "eval", "source": "await new Promise(() => {})" });
+    }
+    if has_message(request, "tree child task", Some("actor")) {
+        return json!({
+            "kind": "eval",
+            "source": r#"await lam.agents.call({
+  name: "leaf",
+  task: "tree leaf task",
+  namespaces: []
+});
+lam.result("unexpected child completion")"#
+        });
+    }
+    if has_message(request, "tree root task", Some("user")) {
+        return json!({
+            "kind": "eval",
+            "source": r#"await lam.agents.call({
+  name: "child",
+  task: "tree child task",
+  namespaces: ["lam.agents"]
+});
+lam.result("unexpected root completion")"#
+        });
+    }
+    json!({ "kind": "output", "value": "plain complete" })
+}
+
+fn background_interruption_response(request: &Value) -> Value {
+    if has_message(request, "background interrupt child", Some("actor")) {
+        return json!({ "kind": "eval", "source": "await new Promise(() => {})" });
+    }
+    if has_message(request, "background interrupt root", Some("user")) {
+        if transition_payload_contains(request, "eval", "spawned background child") {
+            return json!({ "kind": "eval", "source": "await new Promise(() => {})" });
+        }
+        return json!({
+            "kind": "eval",
+            "source": r#"await lam.agents.spawn({
+  name: "background",
+  task: "background interrupt child",
+  namespaces: []
+});
+lam.result("spawned background child")"#
+        });
+    }
+    json!({ "kind": "output", "value": "plain complete" })
+}
+
 #[derive(Clone, Copy)]
 struct TestCodec;
 
@@ -469,9 +555,18 @@ impl ModelCodec for TestCodec {
         })))
     }
 
-    fn interpret_response(&self, response: &EncodedPayload) -> Result<ModelDirective, Self::Error> {
-        match response.value.get("kind").and_then(Value::as_str) {
-            Some("eval") => Ok(ModelDirective::Eval(EvalRequest {
+    fn project_response(
+        &self,
+        response: &EncodedPayload,
+    ) -> Result<ModelResponseProjection, Self::Error> {
+        let directive = match response.value.get("kind").and_then(Value::as_str) {
+            Some("eval") => ModelDirective::Eval(EvalRequest {
+                intent: response
+                    .value
+                    .get("intent")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Evaluate TypeScript")
+                    .to_owned(),
                 source: response
                     .value
                     .get("source")
@@ -479,12 +574,16 @@ impl ModelCodec for TestCodec {
                     .ok_or(TestCodecError)?
                     .to_owned(),
                 timeout: None,
-            })),
-            Some("output") => Ok(ModelDirective::Output(
-                response.value.get("value").cloned().ok_or(TestCodecError)?,
-            )),
-            _ => Err(TestCodecError),
-        }
+            }),
+            Some("output") => {
+                ModelDirective::Output(response.value.get("value").cloned().ok_or(TestCodecError)?)
+            }
+            _ => return Err(TestCodecError),
+        };
+        Ok(ModelResponseProjection {
+            display: Vec::new(),
+            directive,
+        })
     }
 }
 
@@ -700,6 +799,71 @@ async fn background_outcome_steers_the_parent_and_system_waits_for_quiescence() 
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn spawn_wait_returns_with_the_durable_outcome_in_the_same_model_turn() {
+    let provider = RoutingProvider::for_scenario(RoutingScenario::SpawnWait);
+    let model = Model::new(provider.clone(), TestCodec)
+        .with_descriptor(ModelDescriptor::new("test", "model-a", "test/messages").unwrap());
+    let system = AgentSystem::builder(MemStore::new())
+        .max_agents(2)
+        .build()
+        .unwrap();
+    let subagents: SubagentConfig<MemStore> = SubagentConfig::builder(model.clone())
+        .agent_namespace(false)
+        .build()
+        .unwrap();
+    let root = system
+        .host_with_subagents(
+            Lam::builder(model)
+                .state_store(system.state_store())
+                .build()
+                .actor("/wait-root"),
+            subagents,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(root.call("spawn wait root").await.unwrap(), "WAIT_OK");
+
+    let requests = provider.requests();
+    let continuation = requests
+        .iter()
+        .find(|request| {
+            transition_payload_contains(&request.value, "eval", "inboxMessageId")
+                && has_message(&request.value, "waited child complete", Some("actor"))
+        })
+        .expect("one continuation must contain both the wait result and child outcome");
+    let context = continuation.value["context"]
+        .as_array()
+        .expect("test codec context should be an array");
+    let wait_result = context
+        .iter()
+        .position(|entry| transition_payload_contains(entry, "eval", "inboxMessageId"))
+        .expect("wait result should be model-visible");
+    let outcome = context
+        .iter()
+        .position(|entry| has_message(entry, "waited child complete", Some("actor")))
+        .expect("durable child outcome should be model-visible");
+    assert!(
+        wait_result < outcome,
+        "the wait result must precede the synchronously drained inbox outcome"
+    );
+    assert!(
+        requests.iter().any(|request| {
+            request.value["systemPrompt"]
+                .as_str()
+                .is_some_and(|prompt| {
+                    prompt.contains("lam.agents.wait")
+                        && prompt.contains("durably admitted")
+                        && prompt.contains("does not message, interrupt, stop")
+                })
+        }),
+        "generated API documentation should explain the wait contract"
+    );
+
+    system.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn direct_child_stop_cancels_work_and_releases_the_subtree_capacity() {
     let provider = RoutingProvider::for_scenario(RoutingScenario::DirectStop);
     let model = Model::new(provider, TestCodec)
@@ -794,6 +958,222 @@ async fn cancelling_child_call_retires_the_owned_subtree() {
         .await
         .expect("cancelled call should release child capacity");
     assert_eq!(replacement.address().as_str(), "/replacement");
+    system.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn tree_interruption_is_durable_and_keeps_only_the_root_resident() {
+    let provider = RoutingProvider::for_scenario(RoutingScenario::TreeInterruption);
+    let model = Model::new(provider.clone(), TestCodec)
+        .with_descriptor(ModelDescriptor::new("test", "model-a", "test/messages").unwrap());
+    let system = AgentSystem::builder(MemStore::new())
+        .max_agents(3)
+        .build()
+        .unwrap();
+    let mut events = system.take_events().unwrap();
+    let subagents: SubagentConfig<MemStore> = SubagentConfig::builder(model.clone())
+        .max_depth(2)
+        .build()
+        .unwrap();
+    let root = system
+        .host_with_subagents(
+            Lam::builder(model.clone())
+                .state_store(system.state_store())
+                .build()
+                .actor("/interrupt-root"),
+            subagents,
+        )
+        .await
+        .unwrap();
+    let caller = root.clone();
+    let call = tokio::spawn(async move { caller.call("tree root task").await });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        provider.wait_for_request("tree leaf task"),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("leaf did not start; requests: {:?}", provider.requests()));
+
+    let receipt = tokio::time::timeout(std::time::Duration::from_secs(2), root.interrupt())
+        .await
+        .expect("tree interruption should not wait for blocked evals")
+        .unwrap()
+        .expect("the root has an active run");
+    assert_eq!(receipt.root.as_str(), "/interrupt-root");
+    assert_eq!(
+        receipt
+            .actors
+            .iter()
+            .map(|actor| actor.address.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "/interrupt-root",
+            "/interrupt-root/child",
+            "/interrupt-root/child/leaf"
+        ]
+    );
+    assert!(
+        receipt
+            .actors
+            .iter()
+            .all(|actor| actor.interruption.is_some())
+    );
+    assert!(matches!(
+        call.await.unwrap(),
+        Err(AgentSystemError::Actor(lam::ActorError::Interrupted))
+    ));
+
+    let store = system.state_store();
+    for actor in &receipt.actors {
+        let interruption = actor.interruption.as_ref().unwrap();
+        let page = store
+            .read(
+                &ActorId::new(actor.address.as_str()).unwrap(),
+                Revision::ZERO,
+                NonZeroUsize::new(128).unwrap(),
+            )
+            .await
+            .unwrap();
+        let state = ActorState::new().fold_page(page).unwrap();
+        assert!(state.is_run_interrupted(&interruption.run_id));
+        assert!(state.active_run().is_none());
+    }
+
+    let retired = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let mut retired = BTreeSet::new();
+        while retired.len() < 2 {
+            if let AgentSystemEvent::Retired { address, reason } = events.next().await.unwrap()
+                && address.as_str().starts_with("/interrupt-root/")
+            {
+                assert_eq!(reason, StopReason::Interrupted);
+                retired.insert(address);
+            }
+        }
+        retired
+    })
+    .await
+    .expect("interrupted descendants should retire");
+    assert_eq!(retired.len(), 2);
+
+    assert_eq!(
+        root.call("resume after interruption").await.unwrap(),
+        "plain complete"
+    );
+    for address in ["/replacement-one", "/replacement-two"] {
+        system
+            .host(
+                Lam::builder(model.clone())
+                    .state_store(system.state_store())
+                    .build()
+                    .actor(address),
+            )
+            .await
+            .expect("interrupted descendants should release residency");
+    }
+    system.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn tree_interruption_is_a_noop_without_an_active_root_run() {
+    let model = Model::new(RoutingProvider::new(), TestCodec)
+        .with_descriptor(ModelDescriptor::new("test", "model-a", "test/messages").unwrap());
+    let system = AgentSystem::builder(MemStore::new()).build().unwrap();
+    let root = system
+        .host(
+            Lam::builder(model)
+                .state_store(system.state_store())
+                .build()
+                .actor("/idle-root"),
+        )
+        .await
+        .unwrap();
+
+    assert!(root.interrupt().await.unwrap().is_none());
+    assert_eq!(root.call("plain task").await.unwrap(), "plain complete");
+    system.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn interrupted_background_outcome_is_not_delivered_to_the_root() {
+    let provider = RoutingProvider::for_scenario(RoutingScenario::BackgroundInterruption);
+    let model = Model::new(provider.clone(), TestCodec)
+        .with_descriptor(ModelDescriptor::new("test", "model-a", "test/messages").unwrap());
+    let system = AgentSystem::builder(MemStore::new())
+        .max_agents(2)
+        .build()
+        .unwrap();
+    let mut events = system.take_events().unwrap();
+    let subagents: SubagentConfig<MemStore> = SubagentConfig::builder(model.clone())
+        .agent_namespace(false)
+        .build()
+        .unwrap();
+    let root = system
+        .host_with_subagents(
+            Lam::builder(model)
+                .state_store(system.state_store())
+                .build()
+                .actor("/background-interrupt-root"),
+            subagents,
+        )
+        .await
+        .unwrap();
+    let caller = root.clone();
+    let call = tokio::spawn(async move { caller.call("background interrupt root").await });
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        provider
+            .wait_for_request("background interrupt child")
+            .await;
+        provider.wait_for_request("spawned background child").await;
+    })
+    .await
+    .expect("the background child should start");
+
+    let receipt = root.interrupt().await.unwrap().unwrap();
+    assert_eq!(receipt.actors.len(), 2);
+    assert!(matches!(
+        call.await.unwrap(),
+        Err(AgentSystemError::Actor(lam::ActorError::Interrupted))
+    ));
+    tokio::time::timeout(std::time::Duration::from_secs(2), system.wait())
+        .await
+        .unwrap()
+        .unwrap();
+
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if let AgentSystemEvent::Outcome { outcome } = events.next().await.unwrap() {
+                break outcome;
+            }
+        }
+    })
+    .await
+    .expect("the interrupted task should emit a terminal outcome");
+    assert!(matches!(
+        outcome,
+        AgentOutcome::Cancelled { address, .. }
+            if address.as_str() == "/background-interrupt-root/background"
+    ));
+
+    let page = system
+        .state_store()
+        .read(
+            root.actor_id(),
+            Revision::ZERO,
+            NonZeroUsize::new(128).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(!page.events.iter().any(|stored| {
+        matches!(
+            stored.event.data(),
+            ActorEventData::MessageAdmitted { message }
+                if matches!(
+                    message.source(),
+                    MessageSource::Actor { actor_id }
+                        if actor_id.as_str() == "/background-interrupt-root/background"
+                )
+        )
+    }));
     system.shutdown().await.unwrap();
 }
 
@@ -1147,7 +1527,43 @@ async fn agent_system_rejects_noncanonical_host_addresses() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn abort_bypasses_the_call_lock_and_retires_the_resident() {
+async fn conflicting_agent_operations_do_not_wait_for_active_calls() {
+    let provider = RoutingProvider::new();
+    let model = Model::new(provider.clone(), TestCodec)
+        .with_descriptor(ModelDescriptor::new("test", "model-a", "test/messages").unwrap());
+    let system = AgentSystem::builder(MemStore::new()).build().unwrap();
+    let root = system
+        .host(
+            Lam::builder(model)
+                .state_store(system.state_store())
+                .build()
+                .actor("/blocked"),
+        )
+        .await
+        .unwrap();
+    let caller = root.clone();
+    let call = tokio::spawn(async move { caller.call("blocking task").await });
+    provider.wait_for_request("blocking task").await;
+
+    let error = tokio::time::timeout(std::time::Duration::from_secs(2), root.compact())
+        .await
+        .expect("a conflicting operation should not wait for inference")
+        .expect_err("compaction should conflict with the active call");
+    assert!(matches!(
+        error,
+        AgentSystemError::Actor(lam::ActorError::Busy)
+    ));
+
+    root.abort_handle().abort();
+    assert!(matches!(
+        call.await.unwrap(),
+        Err(AgentSystemError::Actor(lam::ActorError::Aborted))
+    ));
+    system.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn abort_retires_a_resident_with_an_active_owned_run() {
     let provider = RoutingProvider::new();
     let model = Model::new(provider.clone(), TestCodec)
         .with_descriptor(ModelDescriptor::new("test", "model-a", "test/messages").unwrap());
@@ -1171,7 +1587,7 @@ async fn abort_bypasses_the_call_lock_and_retires_the_resident() {
     root.abort_handle().abort();
     let result = tokio::time::timeout(std::time::Duration::from_secs(2), call)
         .await
-        .expect("abort should not wait for the call-owner lock")
+        .expect("abort should not wait for the active run")
         .unwrap();
     assert!(matches!(
         result,

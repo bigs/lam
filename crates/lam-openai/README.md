@@ -18,6 +18,12 @@ These are separate builders because the protocols have different replay and
 tool-call semantics. They share only transport, SSE parsing, context helpers,
 errors, and metadata extraction.
 
+Both declare the same strict `eval` input: a brief one-line `intent`, the
+TypeScript `source`, and a nullable `timeoutMs`. Intent is limited to 120
+characters for use as a compact user-facing operation title. Native responses
+recorded before this field was introduced remain replayable with a neutral
+fallback intent.
+
 ## OpenAI Responses
 
 ```rust,ignore

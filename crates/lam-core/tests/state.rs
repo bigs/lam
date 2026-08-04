@@ -26,6 +26,20 @@ fn message(id: &str, delivery: DeliveryMode, value: &str, time: i64) -> MessageE
     .expect("fixture envelope is valid")
 }
 
+fn host_message(id: &str, value: &str, time: i64) -> MessageEnvelope {
+    MessageEnvelope::new(
+        MessageId::new(id).expect("fixture id is valid"),
+        MessageSource::Host {
+            component: lam_core::ComponentId::new("lam/runtime")
+                .expect("fixture component is valid"),
+        },
+        DeliveryMode::Steer,
+        EncodedPayload::lam_json(json!({ "notice": value })).expect("fixture JSON is valid"),
+        Timestamp::from_unix_millis(time),
+    )
+    .expect("fixture envelope is valid")
+}
+
 fn message_ids(ids: &[&str]) -> Vec<MessageId> {
     ids.iter()
         .map(|id| MessageId::new(*id).expect("fixture id is valid"))
@@ -249,6 +263,156 @@ async fn steering_message_wins_against_stale_terminal_append() {
     assert!(state.active_run().is_none());
 }
 
+#[test]
+fn interruption_batch_records_pending_eval_and_closes_the_run_atomically() {
+    let run = RunId::new("run-interrupted").expect("fixture id is valid");
+    let initial = message("initial", DeliveryMode::Steer, "start", 1);
+    let pending = message("pending", DeliveryMode::Steer, "more", 3);
+    let notice = host_message("notice", "interrupted", 4);
+    let state = ActorState::new()
+        .fold_page(JournalPage {
+            head: Revision::new(3),
+            events: vec![
+                StoredEvent {
+                    revision: Revision::new(1),
+                    event: ActorEvent::message_admitted(initial),
+                },
+                StoredEvent {
+                    revision: Revision::new(2),
+                    event: ActorEvent::context_appended(context(
+                        ContextTransition::Messages {
+                            run_id: run.clone(),
+                            consumed_message_ids: message_ids(&["initial"]),
+                        },
+                        json!([{ "message": "start" }]),
+                        2,
+                    )),
+                },
+                StoredEvent {
+                    revision: Revision::new(3),
+                    event: ActorEvent::message_admitted(pending),
+                },
+            ],
+        })
+        .expect("active run should project");
+
+    let batch = EventBatch::new(
+        ActorEvent::message_admitted(notice),
+        vec![
+            ActorEvent::context_appended(context(
+                ContextTransition::Eval {
+                    run_id: run.clone(),
+                },
+                json!({ "status": "failure", "kind": "interrupted" }),
+                5,
+            )),
+            ActorEvent::context_appended(context(
+                ContextTransition::Interrupted {
+                    run_id: run.clone(),
+                    consumed_message_ids: message_ids(&["pending", "notice"]),
+                },
+                json!([{ "notice": "interrupted" }]),
+                6,
+            )),
+        ],
+    );
+    state
+        .validate_batch(&batch)
+        .expect("later events may depend on earlier batch state");
+    let events = batch
+        .into_vec()
+        .into_iter()
+        .enumerate()
+        .map(|(index, event)| StoredEvent {
+            revision: Revision::new(4 + u64::try_from(index).unwrap()),
+            event,
+        })
+        .collect();
+    let state = state
+        .fold_page(JournalPage {
+            head: Revision::new(6),
+            events,
+        })
+        .expect("interruption batch should project");
+
+    assert!(state.active_run().is_none());
+    assert!(state.is_run_interrupted(&run));
+    assert!(!state.is_run_completed(&run));
+    assert!(state.pending_messages().next().is_none());
+    assert!(matches!(
+        state.plan_context_append(context(
+            ContextTransition::Eval {
+                run_id: run.clone(),
+            },
+            json!({}),
+            7,
+        )),
+        Err(StateError::RunAlreadyInterrupted { .. })
+    ));
+}
+
+#[test]
+fn committed_completion_wins_over_a_late_interruption_batch() {
+    let run = RunId::new("run-completed").expect("fixture id is valid");
+    let state = ActorState::new()
+        .fold_page(JournalPage {
+            head: Revision::new(3),
+            events: vec![
+                StoredEvent {
+                    revision: Revision::new(1),
+                    event: ActorEvent::message_admitted(message(
+                        "initial",
+                        DeliveryMode::Steer,
+                        "start",
+                        1,
+                    )),
+                },
+                StoredEvent {
+                    revision: Revision::new(2),
+                    event: ActorEvent::context_appended(context(
+                        ContextTransition::Messages {
+                            run_id: run.clone(),
+                            consumed_message_ids: message_ids(&["initial"]),
+                        },
+                        json!([{ "message": "start" }]),
+                        2,
+                    )),
+                },
+                StoredEvent {
+                    revision: Revision::new(3),
+                    event: ActorEvent::context_appended(context(
+                        ContextTransition::Model {
+                            run_id: run.clone(),
+                            progress: RunProgress::Complete,
+                        },
+                        json!({ "output": "done" }),
+                        3,
+                    )),
+                },
+            ],
+        })
+        .expect("completed run should project");
+    let notice = host_message("notice", "interrupted", 4);
+    let batch = EventBatch::new(
+        ActorEvent::message_admitted(notice),
+        vec![ActorEvent::context_appended(context(
+            ContextTransition::Interrupted {
+                run_id: run.clone(),
+                consumed_message_ids: message_ids(&["notice"]),
+            },
+            json!([{ "notice": "interrupted" }]),
+            5,
+        ))],
+    );
+
+    assert!(state.is_run_completed(&run));
+    assert!(matches!(
+        state.validate_batch(&batch),
+        Err(StateError::TerminalWithoutActiveRun { .. })
+    ));
+    assert!(!state.is_run_interrupted(&run));
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn queued_message_does_not_block_current_run_completion() {
     let store = MemStore::new();
@@ -380,7 +544,7 @@ fn actor_events_have_a_stable_versioned_serde_shape() {
     let event =
         ActorEvent::message_admitted(message("serialized", DeliveryMode::Steer, "hello", 1));
     let encoded = serde_json::to_value(&event).expect("event should serialize");
-    assert_eq!(encoded["schemaVersion"], json!(2));
+    assert_eq!(encoded["schemaVersion"], json!(3));
     assert_eq!(encoded["event"]["type"], json!("messageAdmitted"));
     assert_eq!(
         serde_json::from_value::<ActorEvent>(encoded).expect("event should deserialize"),

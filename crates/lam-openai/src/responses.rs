@@ -6,7 +6,8 @@ use lam::{
     CodecId, CodecRef, CompactionArtifact, CompactionError, CompactionOutput, CompactionPlan,
     CompactionRequest, Compactor, ContextTransition, EncodedPayload, Model, ModelCodec, ModelDelta,
     ModelDescriptor, ModelDirective, ModelEventSink, ModelProvider, ModelRequestConfig,
-    ModelResponseMetadata, OutputContract, ProjectedContextEntry,
+    ModelResponseMetadata, ModelResponseProjection, OutputContract, ProjectedContextEntry,
+    ToolCallDelta,
 };
 use serde_json::{Map, Value, json};
 
@@ -168,6 +169,10 @@ impl ModelProvider for ResponsesProvider {
                         | "response.reasoning_summary_text.delta" => {
                             emit_delta(&events, &value, true);
                         }
+                        "response.output_item.added" => emit_tool_item(&events, &value),
+                        "response.function_call_arguments.delta" => {
+                            emit_tool_arguments(&events, &value);
+                        }
                         "response.completed" => {
                             completed = value.get("response").cloned();
                             if completed.is_none() {
@@ -213,7 +218,11 @@ impl ModelProvider for ResponsesProvider {
 }
 
 fn emit_delta(events: &ModelEventSink, value: &Value, reasoning: bool) {
-    if let Some(delta) = value.get("delta").and_then(Value::as_str) {
+    if let Some(delta) = value
+        .get("delta")
+        .and_then(Value::as_str)
+        .filter(|delta| !delta.is_empty())
+    {
         let delta = if reasoning {
             ModelDelta::Reasoning(delta.to_owned())
         } else {
@@ -221,6 +230,50 @@ fn emit_delta(events: &ModelEventSink, value: &Value, reasoning: bool) {
         };
         events.emit(delta);
     }
+}
+
+fn emit_tool_item(events: &ModelEventSink, value: &Value) {
+    let Some(item) = value.get("item") else {
+        return;
+    };
+    if item.get("type").and_then(Value::as_str) != Some("function_call") {
+        return;
+    }
+    let index = value
+        .get("output_index")
+        .and_then(Value::as_u64)
+        .and_then(|index| usize::try_from(index).ok())
+        .unwrap_or(0);
+    events.emit(ModelDelta::ToolCall(ToolCallDelta {
+        index,
+        call_id: item
+            .get("call_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        name: item.get("name").and_then(Value::as_str).map(str::to_owned),
+        arguments: item
+            .get("arguments")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+    }));
+}
+
+fn emit_tool_arguments(events: &ModelEventSink, value: &Value) {
+    let Some(arguments) = value.get("delta").and_then(Value::as_str) else {
+        return;
+    };
+    let index = value
+        .get("output_index")
+        .and_then(Value::as_u64)
+        .and_then(|index| usize::try_from(index).ok())
+        .unwrap_or(0);
+    events.emit(ModelDelta::ToolCall(ToolCallDelta {
+        index,
+        call_id: None,
+        name: None,
+        arguments: arguments.to_owned(),
+    }));
 }
 
 /// Pure Responses request/replay codec.
@@ -408,7 +461,10 @@ impl ModelCodec for ResponsesCodec {
         ))
     }
 
-    fn interpret_response(&self, response: &EncodedPayload) -> Result<ModelDirective, Self::Error> {
+    fn project_response(
+        &self,
+        response: &EncodedPayload,
+    ) -> Result<ModelResponseProjection, Self::Error> {
         let envelope = parse_response(response, RESPONSES_RESPONSE_CODEC_ID, "response")?;
         if let Some(status) = envelope.value.get("status").and_then(Value::as_str)
             && status != "completed"
@@ -423,16 +479,19 @@ impl ModelCodec for ResponsesCodec {
                 message: "the model requested more than one eval".to_owned(),
             });
         }
-        if let Some(call) = calls.first() {
+        let display = response_display_deltas(envelope.value);
+        let directive = if let Some(call) = calls.first() {
             if call.name != "eval" {
                 return Err(CodecError::InvalidDirective {
                     message: format!("the model requested unsupported function `{}`", call.name),
                 });
             }
-            return parse_eval_arguments(&call.arguments).map(ModelDirective::Eval);
-        }
-        let text = response_text(envelope.value)?;
-        output_value(envelope.output_kind, text).map(ModelDirective::Output)
+            parse_eval_arguments(&call.arguments).map(ModelDirective::Eval)?
+        } else {
+            let text = response_text(envelope.value)?;
+            output_value(envelope.output_kind, text).map(ModelDirective::Output)?
+        };
+        Ok(ModelResponseProjection { display, directive })
     }
 
     fn response_metadata(&self, response: &EncodedPayload) -> ModelResponseMetadata {
@@ -602,6 +661,57 @@ struct FunctionCall {
     arguments: String,
 }
 
+fn response_display_deltas(response: &Value) -> Vec<ModelDelta> {
+    let mut deltas = Vec::new();
+    let Some(output) = response.get("output").and_then(Value::as_array) else {
+        return deltas;
+    };
+    for (index, item) in output.iter().enumerate() {
+        match item.get("type").and_then(Value::as_str) {
+            Some("reasoning") => {
+                for field in ["content", "summary"] {
+                    let Some(parts) = item.get(field).and_then(Value::as_array) else {
+                        continue;
+                    };
+                    deltas.extend(parts.iter().filter_map(|part| {
+                        part.get("text")
+                            .and_then(Value::as_str)
+                            .filter(|text| !text.is_empty())
+                            .map(|text| ModelDelta::Reasoning(text.to_owned()))
+                    }));
+                }
+            }
+            Some("message") => {
+                let Some(content) = item.get("content").and_then(Value::as_array) else {
+                    continue;
+                };
+                deltas.extend(content.iter().filter_map(|part| {
+                    part.get("text")
+                        .and_then(Value::as_str)
+                        .or_else(|| part.get("refusal").and_then(Value::as_str))
+                        .filter(|text| !text.is_empty())
+                        .map(|text| ModelDelta::Text(text.to_owned()))
+                }));
+            }
+            Some("function_call") => deltas.push(ModelDelta::ToolCall(ToolCallDelta {
+                index,
+                call_id: item
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                name: item.get("name").and_then(Value::as_str).map(str::to_owned),
+                arguments: item
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+            })),
+            _ => {}
+        }
+    }
+    deltas
+}
+
 fn function_calls(response: &Value) -> Result<Vec<FunctionCall>, CodecError> {
     let output = response
         .get("output")
@@ -673,6 +783,26 @@ fn response_text(response: &Value) -> Result<String, CodecError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_streamed_text_is_a_noop_but_whitespace_is_preserved() {
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let output = std::sync::Arc::clone(&captured);
+        let events = ModelEventSink::new(move |delta| output.lock().unwrap().push(delta));
+
+        emit_delta(&events, &json!({ "delta": "" }), false);
+        emit_delta(&events, &json!({ "delta": "" }), true);
+        emit_delta(&events, &json!({ "delta": " " }), false);
+        emit_delta(&events, &json!({ "delta": "\n" }), true);
+
+        assert_eq!(
+            *captured.lock().unwrap(),
+            [
+                ModelDelta::Text(" ".to_owned()),
+                ModelDelta::Reasoning("\n".to_owned()),
+            ]
+        );
+    }
 
     #[test]
     fn public_codec_constants_are_stable() {

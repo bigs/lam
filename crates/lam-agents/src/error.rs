@@ -75,6 +75,12 @@ pub enum AgentSystemError {
         /// Conflicting canonical address.
         address: crate::ActorAddress,
     },
+    /// An overlapping agent-tree interruption is already in progress.
+    #[error("agent tree rooted at `{root}` is being interrupted")]
+    InterruptionInProgress {
+        /// Root of the interruption boundary.
+        root: crate::ActorAddress,
+    },
     /// A hosted actor has already stopped and cannot receive operations.
     #[error("actor `{address}` is not running")]
     ActorUnavailable {

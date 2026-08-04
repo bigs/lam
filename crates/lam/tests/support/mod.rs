@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use lam::{
     CompactionArtifact, EncodedPayload, EvalRequest, ModelCodec, ModelDelta, ModelDirective,
-    ModelEventSink, ModelProvider, ModelRequestConfig, ModelResponseMetadata, OutputContract,
-    TokenUsage,
+    ModelEventSink, ModelProvider, ModelRequestConfig, ModelResponseMetadata,
+    ModelResponseProjection, OutputContract, TokenUsage,
 };
 use serde_json::{Value, json};
 
@@ -115,11 +115,14 @@ impl ModelCodec for ScriptedCodec {
         })))
     }
 
-    fn interpret_response(&self, response: &EncodedPayload) -> Result<ModelDirective, Self::Error> {
+    fn project_response(
+        &self,
+        response: &EncodedPayload,
+    ) -> Result<ModelResponseProjection, Self::Error> {
         if response.codec != scripted_codec() {
             return Err(ScriptError("unexpected response codec".to_owned()));
         }
-        match response.value.get("kind").and_then(Value::as_str) {
+        let directive = match response.value.get("kind").and_then(Value::as_str) {
             Some("eval") => {
                 let source = response
                     .value
@@ -131,21 +134,31 @@ impl ModelCodec for ScriptedCodec {
                     .get("timeoutMs")
                     .and_then(Value::as_u64)
                     .map(Duration::from_millis);
-                Ok(ModelDirective::Eval(EvalRequest {
+                ModelDirective::Eval(EvalRequest {
+                    intent: response
+                        .value
+                        .get("intent")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Evaluate TypeScript")
+                        .to_owned(),
                     source: source.to_owned(),
                     timeout,
-                }))
+                })
             }
-            Some("output") => Ok(ModelDirective::Output(
+            Some("output") => ModelDirective::Output(
                 response
                     .value
                     .get("value")
                     .cloned()
                     .ok_or_else(|| ScriptError("output response has no value".to_owned()))?,
-            )),
-            Some(kind) => Err(ScriptError(format!("unknown directive `{kind}`"))),
-            None => Err(ScriptError("response has no directive".to_owned())),
-        }
+            ),
+            Some(kind) => return Err(ScriptError(format!("unknown directive `{kind}`"))),
+            None => return Err(ScriptError("response has no directive".to_owned())),
+        };
+        Ok(ModelResponseProjection {
+            display: Vec::new(),
+            directive,
+        })
     }
 
     fn response_metadata(&self, response: &EncodedPayload) -> ModelResponseMetadata {
@@ -196,8 +209,11 @@ impl ModelCodec for RejectingCompactionCodec {
         ScriptedCodec.encode_request(context, config)
     }
 
-    fn interpret_response(&self, response: &EncodedPayload) -> Result<ModelDirective, Self::Error> {
-        ScriptedCodec.interpret_response(response)
+    fn project_response(
+        &self,
+        response: &EncodedPayload,
+    ) -> Result<ModelResponseProjection, Self::Error> {
+        ScriptedCodec.project_response(response)
     }
 
     fn response_metadata(&self, response: &EncodedPayload) -> ModelResponseMetadata {

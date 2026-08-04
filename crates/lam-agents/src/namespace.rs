@@ -182,6 +182,78 @@ pub enum ListError {
     Unavailable,
 }
 
+/// Input accepted by `lam.agents.wait`.
+#[derive(Clone, Debug, JsonSchema, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WaitRequest {
+    /// Direct-child addresses returned by `lam.agents.spawn`.
+    pub addresses: Vec<ActorAddress>,
+}
+
+/// One completed spawned task whose outcome is durable in the caller's inbox.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WaitedTask {
+    /// Child which performed the initial spawned task.
+    pub address: ActorAddress,
+    /// Stable identity of the child's initial task message.
+    pub message_id: String,
+    /// Stable identity of the outcome message admitted to the caller.
+    pub inbox_message_id: String,
+    /// Caller-local journal revision containing the outcome message.
+    pub inbox_revision: u64,
+}
+
+/// Confirmation that every requested spawned outcome is durable in the inbox.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WaitReceipt {
+    /// Completed tasks in the same order as the requested addresses.
+    pub completed: Vec<WaitedTask>,
+}
+
+/// Structured failure returned to TypeScript by `lam.agents.wait`.
+#[derive(Clone, Debug, JsonSchema, Serialize, thiserror::Error)]
+#[serde(tag = "code", rename_all = "camelCase")]
+pub enum WaitError {
+    /// At least one child address is required.
+    #[error("at least one spawned child address is required")]
+    Empty,
+    /// The same child appeared more than once.
+    #[error("actor `{address}` was requested more than once")]
+    Duplicate {
+        /// Duplicate requested address.
+        address: ActorAddress,
+    },
+    /// Actors may await only their own direct children.
+    #[error("actor `{requester}` cannot wait for non-child `{address}`")]
+    NotDirectChild {
+        /// Actor requesting the wait.
+        requester: ActorAddress,
+        /// Rejected target.
+        address: ActorAddress,
+    },
+    /// The address was not created by this caller through `spawn`.
+    #[error("actor `{address}` is not a spawned task owned by `{requester}`")]
+    NotSpawned {
+        /// Actor requesting the wait.
+        requester: ActorAddress,
+        /// Unknown target.
+        address: ActorAddress,
+    },
+    /// The child finished but its outcome could not enter the caller's inbox.
+    #[error("outcome from `{address}` could not be delivered: {message}")]
+    DeliveryFailed {
+        /// Child whose outcome was not delivered.
+        address: ActorAddress,
+        /// Durable-delivery diagnostic.
+        message: String,
+    },
+    /// The owning agent system is no longer available.
+    #[error("the agent system is unavailable")]
+    Unavailable,
+}
+
 /// Input accepted by `lam.agents.stop`.
 #[derive(Clone, Debug, JsonSchema, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -255,6 +327,7 @@ where
         model_docs,
         namespace_docs,
     );
+    let wait_docs = "Wait without steering for the initial tasks of direct children returned by `lam.agents.spawn`. Resolves only after every terminal `AgentOutcome` is durably admitted to this actor's inbox; the next model continuation receives the wait tool result and those inbox messages together. Waiting does not message, interrupt, stop, or otherwise steer the children. If the surrounding eval is cancelled or times out, the children continue running and their outcomes are still delivered.";
 
     let mut namespace = Namespace::new(AGENTS_NAMESPACE, docs);
     namespace = namespace.function(
@@ -331,6 +404,18 @@ where
         },
     );
     if depth < config.max_depth {
+        namespace = namespace.function("wait", wait_docs, {
+            let system = system.clone();
+            let address = address.clone();
+            move |_context, request: WaitRequest| {
+                let system = system.clone();
+                let requester = address.clone();
+                async move {
+                    let system = system.upgrade().ok_or(WaitError::Unavailable)?;
+                    system.wait_for_spawned(&requester, request).await
+                }
+            }
+        });
         namespace = namespace.function("call", call_docs, {
             let system = system.clone();
             let address = address.clone();

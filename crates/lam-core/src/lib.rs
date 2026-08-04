@@ -32,8 +32,8 @@ pub use mem_store::MemStore;
 pub use message::{DeliveryMode, MessageEnvelope, MessageError, MessageSource};
 pub use model::{
     EvalRequest, ModelCodec, ModelCost, ModelCostSource, ModelDelta, ModelDirective,
-    ModelEventSink, ModelProvider, ModelRequestConfig, ModelResponseMetadata, OutputContract,
-    TokenUsage,
+    ModelEventSink, ModelProvider, ModelRequestConfig, ModelResponseMetadata,
+    ModelResponseProjection, OutputContract, TokenUsage, ToolCallDelta,
 };
 pub use projection::{
     ActorState, AdmissionDecision, AdmittedMessage, ProjectedContextEntry, StateError,

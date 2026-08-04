@@ -9,7 +9,10 @@ use crate::error::{BuildError, CodecError, ProviderError};
 use crate::metadata::ModelPricing;
 use crate::transport::HttpTransport;
 
-pub(crate) const EVAL_TOOL_DESCRIPTION: &str = "Run one TypeScript program with top-level await in a persistent Deno isolate. Top-level state persists across calls. Return a value with the final expression; `lam.result(value)` makes it explicit. Use registered lam APIs for host interaction. Put dependent work in one program and use `Promise.all` for independent work.";
+pub(crate) const EVAL_TOOL_DESCRIPTION: &str = "Run one TypeScript program with top-level await in a persistent Deno isolate. Include a brief one-line intent describing the operation for the user. Top-level state persists across calls. Return a value with the final expression; `lam.result(value)` makes it explicit. Use registered lam APIs for host interaction. Put dependent work in one program and use `Promise.all` for independent work.";
+
+const LEGACY_EVAL_INTENT: &str = "Evaluate TypeScript";
+const MAX_EVAL_INTENT_CHARS: usize = 120;
 
 pub(crate) const RESPONSES_REQUEST_CODEC_ID: &str = "openai/responses-request";
 pub(crate) const RESPONSES_RESPONSE_CODEC_ID: &str = "openai/responses";
@@ -248,6 +251,12 @@ pub(crate) fn eval_parameters() -> Value {
     json!({
         "type": "object",
         "properties": {
+            "intent": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": MAX_EVAL_INTENT_CHARS,
+                "description": "A brief one-line description of what this program is intended to accomplish, written for the user."
+            },
             "source": {
                 "type": "string",
                 "description": "A TypeScript program to evaluate in the persistent Deno isolate. Top-level await is supported."
@@ -258,7 +267,7 @@ pub(crate) fn eval_parameters() -> Value {
                 "description": "Requested timeout in milliseconds, bounded by the host, or null for the host default."
             }
         },
-        "required": ["source", "timeoutMs"],
+        "required": ["intent", "source", "timeoutMs"],
         "additionalProperties": false
     })
 }
@@ -267,6 +276,8 @@ pub(crate) fn parse_eval_arguments(arguments: &str) -> Result<EvalRequest, Codec
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase", deny_unknown_fields)]
     struct Arguments {
+        #[serde(default)]
+        intent: Option<String>,
         source: String,
         timeout_ms: Option<u64>,
     }
@@ -280,7 +291,34 @@ pub(crate) fn parse_eval_arguments(arguments: &str) -> Result<EvalRequest, Codec
             message: "eval source must not be empty".to_owned(),
         });
     }
+    let intent = match arguments.intent {
+        Some(intent) => {
+            let intent = intent.trim();
+            if intent.is_empty() {
+                return Err(CodecError::InvalidDirective {
+                    message: "eval intent must not be empty".to_owned(),
+                });
+            }
+            if intent.contains(['\n', '\r']) {
+                return Err(CodecError::InvalidDirective {
+                    message: "eval intent must be one line".to_owned(),
+                });
+            }
+            if intent.chars().count() > MAX_EVAL_INTENT_CHARS {
+                return Err(CodecError::InvalidDirective {
+                    message: format!(
+                        "eval intent must be at most {MAX_EVAL_INTENT_CHARS} characters"
+                    ),
+                });
+            }
+            intent.to_owned()
+        }
+        // Version-one journals may contain provider-native eval calls from
+        // before intent became part of the public tool schema.
+        None => LEGACY_EVAL_INTENT.to_owned(),
+    };
     Ok(EvalRequest {
+        intent,
         source: arguments.source,
         timeout: arguments.timeout_ms.map(Duration::from_millis),
     })
@@ -306,4 +344,41 @@ pub(crate) fn codec(id: &str) -> CodecRef {
 
 pub(crate) fn display_codec(codec: &CodecRef) -> String {
     format!("{}@{}", codec.id, codec.version)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn eval_intent_is_trimmed_and_must_be_one_brief_line() {
+        let request = parse_eval_arguments(
+            r#"{"intent":"  Inspect the workspace  ","source":"1 + 1","timeoutMs":null}"#,
+        )
+        .expect("valid eval arguments");
+        assert_eq!(request.intent, "Inspect the workspace");
+
+        let multiline = parse_eval_arguments(
+            r#"{"intent":"Inspect\nthe workspace","source":"1 + 1","timeoutMs":null}"#,
+        )
+        .expect_err("multiline intent should be rejected");
+        assert!(multiline.to_string().contains("must be one line"));
+
+        let too_long = "x".repeat(MAX_EVAL_INTENT_CHARS + 1);
+        let arguments = json!({
+            "intent": too_long,
+            "source": "1 + 1",
+            "timeoutMs": null
+        });
+        let too_long = parse_eval_arguments(&arguments.to_string())
+            .expect_err("overlong intent should be rejected");
+        assert!(too_long.to_string().contains("at most 120 characters"));
+    }
+
+    #[test]
+    fn legacy_eval_arguments_receive_a_stable_fallback_intent() {
+        let request = parse_eval_arguments(r#"{"source":"1 + 1","timeoutMs":null}"#)
+            .expect("version-one eval arguments remain readable");
+        assert_eq!(request.intent, LEGACY_EVAL_INTENT);
+    }
 }

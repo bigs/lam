@@ -9,10 +9,9 @@ execution, application APIs, subagents—is a typed Rust capability surfaced to
 that TypeScript environment. This keeps the model interface tiny without
 limiting what an embedding can safely choose to provide.
 
-**Status:** Milestone 1, the embeddable agent engine, is complete. The APIs are
-usable and extensively tested, but the project is still experimental and may
-change before a stable release. The interactive `lam` TUI is the next major
-phase.
+**Status:** Milestone 1, the embeddable agent engine, is complete. The first
+interactive `lam` TUI milestone is also available. The project is still
+experimental and may change before a stable release.
 
 The complete architecture and decision record lives in
 [`docs/PLAN.md`](docs/PLAN.md).
@@ -33,10 +32,11 @@ model ──eval(TypeScript)──→ persistent Deno isolate
                          typed Rust capabilities
 ```
 
-A single eval can sequence dependent work, use `Promise.all` for independent
-work, retain variables between calls, catch structured errors, and return JSON
-with `lam.result(value)`. Rust remains authoritative over which capabilities
-exist and what types cross the boundary.
+A single eval carries a brief user-facing intent alongside its TypeScript. It
+can sequence dependent work, use `Promise.all` for independent work, retain
+variables between calls, catch structured errors, and return JSON with
+`lam.result(value)`. Rust remains authoritative over which capabilities exist
+and what types cross the boundary.
 
 The isolate exposes `lam.dir()` for complete runtime discovery. Its compact
 system-prompt synopsis is generated from the same manifest, including inferred
@@ -123,6 +123,7 @@ let output = isolate
 | [`lam-openai`](crates/lam-openai/README.md) | Lossless Responses and compatible Chat Completions adapters | Connecting OpenAI or a compatible inference provider |
 | [`lam-agents`](crates/lam-agents/README.md) | Bounded isolate scheduler, actor addressing, and `lam.agents` capabilities | Hosting roots and subagents together |
 | [`lam-code`](crates/lam-code/README.md) | Optional filesystem, editing, and command execution capabilities | Building a coding-agent application |
+| [`lam-tui`](crates/lam-tui/README.md) | Ratatui executable, provider configuration, and interactive transcript | Running Lam as a coding agent |
 
 The dependency boundary is intentional: `lam` remains a straightforward
 single-actor library; provider, persistence, coding, and multi-agent features
@@ -149,11 +150,19 @@ messages, full provider-native context, and compaction records. A
 `JournalStore` needs only ordered reads and compare-and-append batches. Pure
 projections derive pending work and the effective context.
 
-`Actor::call` is linear and waits for one tool-calling loop to finish.
+`ActorHandle::call` returns an owned run for one tool-calling loop, while the
+linear `Actor` retains runtime lifecycle and event-stream ownership.
 `ActorRef::send` returns after durable admission. Steering messages join the
 active run at its next boundary; queued messages wait for that run to finish.
-Recovery creates a fresh isolate, preserves the complete journal, and inserts a
-model-visible notice when an interrupted eval may have had partial effects.
+`ActorHandle::interrupt` recoverably closes live work with an atomic,
+model-visible terminal boundary while leaving the actor usable for a new run.
+Recovery creates a fresh isolate, preserves the complete journal, and inserts
+a model-visible notice when an interrupted eval may have had partial effects.
+
+A recoverable interruption drops incomplete provider or compactor output,
+replaces an isolate interrupted during eval, and records an explicit failed
+eval result when needed. A completion already committed at the journal
+boundary wins the race.
 
 ### Provider-native history
 
@@ -190,7 +199,9 @@ Actors have canonical paths such as `/root/researcher`. `lam.agents.call`
 creates a persistent child and waits directly for its initial task.
 `lam.agents.spawn` returns after durable admission and later steers a typed
 outcome into the parent's mailbox. Addressed sends are always actor-authenticated
-and steering. Direct-child stop recursively retires a subtree.
+and steering. Direct-child stop recursively retires a subtree. Host-side tree
+interruption fans out recoverable run boundaries, retires descendants, and
+leaves the addressed root available for later input.
 
 ## Capability and safety model
 
@@ -237,11 +248,16 @@ The default suite is deterministic and does not require network access. Ignored
 live tests use `OPENAI_API_KEY` or `FIREWORKS_API_KEY` and make bounded provider
 requests; they must be enabled explicitly.
 
-## Roadmap
+## Interactive TUI
 
-Milestone 1 covers the complete embeddable engine. The next phase is a separate
-TUI package which will produce the `lam` executable while depending on the
-library crate of the same name.
+The separate `lam-tui` package produces the `lam` executable while depending
+on the library crate of the same name. It loads `~/.lam/providers.toml`, starts
+the coding and multi-agent capability packs in the current directory, and
+renders a responsive conversation with expandable eval and lifecycle rows.
+See [`crates/lam-tui/README.md`](crates/lam-tui/README.md) for configuration and
+key bindings.
+
+## Roadmap
 
 Independent follow-ups include HTTP/webhook capabilities, async monitors,
 interactive approvals, agent-writable storage and content-addressed blobs,

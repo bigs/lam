@@ -76,7 +76,11 @@ new generation. `RestartFailed` or `Poisoned` means no healthy continuation is
 available. Host effects completed before interruption are not rolled back.
 
 `IsolateInterrupt` provides out-of-band cancellation without waiting for the
-mutable isolate owner.
+mutable isolate owner. Its termination signal also covers the handoff from a
+completed async builtin back into JavaScript. After the eval future has been
+dropped, `Isolate::restart_after_interruption` discards the poisoned heap and
+installs a fresh generation. Deliberate interruption, like timeout, does not
+roll back host effects which may already have completed.
 
 ## Thread affinity
 

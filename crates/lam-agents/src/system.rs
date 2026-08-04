@@ -7,8 +7,9 @@ use std::thread::JoinHandle;
 use futures_util::future::join_all;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use lam::{
-    AbortHandle, Actor, ActorBuilder, ActorId, ActorRef, ActorState, DeliveryMode, JournalStore,
-    MessageReceipt, RunEvents, RuntimeEvents,
+    AbortHandle, Actor, ActorBuilder, ActorHandle, ActorId, ActorRef, ActorState,
+    CompactionReceipt, DeliveryMode, JournalStore, MessageId, MessageReceipt, ModelSwitchPolicy,
+    ModelSwitchReceipt, RunEvents, RuntimeEvents,
 };
 use schemars::JsonSchema;
 use serde::Serialize;
@@ -16,10 +17,14 @@ use serde::de::DeserializeOwned;
 use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc, oneshot};
 
 use crate::config::{AGENTS_NAMESPACE, ChildActorSpec};
-use crate::namespace::{SpawnError, SpawnReceipt, SpawnRequest, StopError, agents_namespace};
+use crate::namespace::{
+    SpawnError, SpawnReceipt, SpawnRequest, StopError, WaitError, WaitReceipt, WaitRequest,
+    WaitedTask, agents_namespace,
+};
 use crate::{
-    ActorAddress, AgentIdentity, AgentOutcome, AgentSystemBuildError, AgentSystemError,
-    AgentSystemEvent, AgentSystemEvents, StopReason, SubagentConfig,
+    ActorAddress, AgentIdentity, AgentInterruptionReceipt, AgentOutcome, AgentSystemBuildError,
+    AgentSystemError, AgentSystemEvent, AgentSystemEvents, AgentTreeInterruptionReceipt,
+    StopReason, SubagentConfig,
 };
 
 const DEFAULT_MAX_AGENTS: usize = 64;
@@ -31,7 +36,7 @@ where
 {
     address: ActorAddress,
     owner: AsyncMutex<Option<Actor<Arc<S>>>>,
-    actor_ref: ActorRef<Arc<S>>,
+    handle: ActorHandle<Arc<S>>,
     abort: AbortHandle,
     status: Arc<ActorTaskStatus>,
 }
@@ -60,7 +65,7 @@ where
     fn new(address: ActorAddress, actor: Actor<Arc<S>>, status: Arc<ActorTaskStatus>) -> Arc<Self> {
         Arc::new(Self {
             address,
-            actor_ref: actor.actor_ref(),
+            handle: actor.handle(),
             abort: actor.abort_handle(),
             owner: AsyncMutex::new(Some(actor)),
             status,
@@ -88,8 +93,22 @@ where
     }
 
     fn request_stop(&self, reason: StopReason) {
-        self.set_stop_reason(reason);
+        let mut current = lock(&self.status.reason);
+        if matches!(*current, Some(StopReason::Interrupted))
+            && matches!(reason, StopReason::Stopped | StopReason::Cancelled)
+        {
+            return;
+        }
+        *current = Some(reason);
+        drop(current);
         self.abort.abort();
+    }
+
+    fn mark_interrupted(&self) {
+        let mut reason = lock(&self.status.reason);
+        if reason.is_none() {
+            *reason = Some(StopReason::Interrupted);
+        }
     }
 
     async fn wait_stopped(&self, activity: &Notify) {
@@ -285,8 +304,19 @@ where
 
     /// Forcefully retires one addressed actor and all of its descendants.
     pub async fn stop(&self, address: &ActorAddress) -> Result<(), AgentSystemError> {
-        let _activity = self.inner.begin_activity()?;
+        let _activity = self.inner.begin_actor_activity(address)?;
         self.inner.stop_subtree(address, StopReason::Stopped).await
+    }
+
+    /// Recoverably interrupts one active tree and retires its descendants.
+    ///
+    /// The addressed root remains resident and can accept a later prompt.
+    /// Returns `None` when its durable projection has no active run.
+    pub async fn interrupt(
+        &self,
+        address: &ActorAddress,
+    ) -> Result<Option<AgentTreeInterruptionReceipt>, AgentSystemError> {
+        self.inner.interrupt_tree(address).await
     }
 }
 
@@ -324,13 +354,13 @@ where
     /// Returns the underlying single-actor journal identity.
     #[must_use]
     pub fn actor_id(&self) -> &ActorId {
-        self.resident.actor_ref.actor_id()
+        self.resident.handle.actor_id()
     }
 
     /// Returns a cloneable send-only mailbox address.
     #[must_use]
     pub fn actor_ref(&self) -> ActorRef<Arc<S>> {
-        self.resident.actor_ref.clone()
+        self.resident.handle.actor_ref()
     }
 
     /// Returns explicit force-cancellation authority while the actor is live.
@@ -352,10 +382,10 @@ where
         T: Serialize,
     {
         self.resident.ensure_running()?;
-        let _activity = self._system.begin_activity()?;
+        let _activity = self._system.begin_actor_activity(&self.resident.address)?;
         let receipt = self
             .resident
-            .actor_ref
+            .handle
             .send(input, delivery)
             .await
             .map_err(AgentSystemError::from)?;
@@ -369,10 +399,8 @@ where
         T: Serialize,
     {
         self.resident.ensure_running()?;
-        let _activity = self._system.begin_activity()?;
-        let mut actor = self.resident.owner.lock().await;
-        let actor = actor.as_mut().ok_or(AgentSystemError::ShuttingDown)?;
-        actor.call(input).await.map_err(Into::into)
+        let _activity = self._system.begin_actor_activity(&self.resident.address)?;
+        self.resident.handle.call(input).await.map_err(Into::into)
     }
 
     /// Runs one linear schema-constrained call to completion.
@@ -382,16 +410,60 @@ where
         O: DeserializeOwned + JsonSchema,
     {
         self.resident.ensure_running()?;
-        let _activity = self._system.begin_activity()?;
-        let mut actor = self.resident.owner.lock().await;
-        let actor = actor.as_mut().ok_or(AgentSystemError::ShuttingDown)?;
-        actor.call(input).output::<O>().await.map_err(Into::into)
+        let _activity = self._system.begin_actor_activity(&self.resident.address)?;
+        self.resident
+            .handle
+            .call(input)
+            .output::<O>()
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Explicitly compacts this actor's current model-visible context.
+    pub async fn compact(&self) -> Result<Option<CompactionReceipt>, AgentSystemError> {
+        self.resident.ensure_running()?;
+        let _activity = self._system.begin_actor_activity(&self.resident.address)?;
+        self.resident.handle.compact().await.map_err(Into::into)
+    }
+
+    /// Compacts existing history and selects another registered root model.
+    pub async fn switch_model(
+        &self,
+        model_id: impl Into<String>,
+    ) -> Result<ModelSwitchReceipt, AgentSystemError> {
+        self.switch_model_with_policy(model_id, ModelSwitchPolicy::Compact)
+            .await
+    }
+
+    /// Selects another registered root model using an explicit context policy.
+    pub async fn switch_model_with_policy(
+        &self,
+        model_id: impl Into<String>,
+        policy: ModelSwitchPolicy,
+    ) -> Result<ModelSwitchReceipt, AgentSystemError> {
+        self.resident.ensure_running()?;
+        let _activity = self._system.begin_actor_activity(&self.resident.address)?;
+        self.resident
+            .handle
+            .switch_model_with_policy(model_id, policy)
+            .await
+            .map_err(Into::into)
     }
 
     /// Rebuilds this actor's current projection from its journal.
     pub async fn state(&self) -> Result<ActorState, AgentSystemError> {
         self.resident.ensure_running()?;
-        self.resident.actor_ref.state().await.map_err(Into::into)
+        self.resident.handle.state().await.map_err(Into::into)
+    }
+
+    /// Recoverably interrupts this actor and every resident descendant.
+    ///
+    /// This actor remains resident; descendants retire after committing their
+    /// own interruption boundaries.
+    pub async fn interrupt(
+        &self,
+    ) -> Result<Option<AgentTreeInterruptionReceipt>, AgentSystemError> {
+        self._system.interrupt_tree(&self.resident.address).await
     }
 }
 
@@ -419,6 +491,19 @@ where
     shutting_down: bool,
     stopped: bool,
     active_operations: usize,
+    spawned_tasks: BTreeMap<ActorAddress, SpawnedTask>,
+    interrupting: BTreeSet<ActorAddress>,
+}
+
+struct SpawnedTask {
+    message_id: MessageId,
+    delivery: OutcomeDelivery,
+}
+
+enum OutcomeDelivery {
+    Pending,
+    Delivered(MessageReceipt),
+    Failed { message: String },
 }
 
 struct ChildLaunch<S>
@@ -445,6 +530,8 @@ where
             shutting_down: false,
             stopped: false,
             active_operations: 0,
+            spawned_tasks: BTreeMap::new(),
+            interrupting: BTreeSet::new(),
         }
     }
 }
@@ -456,6 +543,26 @@ where
     fn prune_stopped(&mut self) {
         self.residents.retain(|_, resident| !resident.is_stopped());
     }
+
+    fn interruption_root(&self, address: &ActorAddress) -> Option<&ActorAddress> {
+        self.interrupting
+            .iter()
+            .find(|root| *root == address || address.is_descendant_of(root))
+    }
+
+    fn overlapping_interruption(&self, address: &ActorAddress) -> Option<&ActorAddress> {
+        self.interrupting.iter().find(|root| {
+            *root == address || address.is_descendant_of(root) || root.is_descendant_of(address)
+        })
+    }
+
+    fn residents_in_subtree(&self, address: &ActorAddress) -> Vec<Arc<ResidentActor<S>>> {
+        self.residents
+            .iter()
+            .filter(|(candidate, _)| *candidate == address || candidate.is_descendant_of(address))
+            .map(|(_, resident)| Arc::clone(resident))
+            .collect()
+    }
 }
 
 impl<S> SystemInner<S>
@@ -463,10 +570,29 @@ where
     S: JournalStore + 'static,
 {
     fn begin_activity(self: &Arc<Self>) -> Result<ActivityGuard<S>, AgentSystemError> {
+        self.begin_activity_for(None)
+    }
+
+    fn begin_actor_activity(
+        self: &Arc<Self>,
+        address: &ActorAddress,
+    ) -> Result<ActivityGuard<S>, AgentSystemError> {
+        self.begin_activity_for(Some(address))
+    }
+
+    fn begin_activity_for(
+        self: &Arc<Self>,
+        address: Option<&ActorAddress>,
+    ) -> Result<ActivityGuard<S>, AgentSystemError> {
         {
             let mut state = lock(&self.state);
             if state.shutting_down {
                 return Err(AgentSystemError::ShuttingDown);
+            }
+            if let Some(address) = address
+                && let Some(root) = state.overlapping_interruption(address)
+            {
+                return Err(AgentSystemError::InterruptionInProgress { root: root.clone() });
             }
             state.active_operations += 1;
         }
@@ -530,13 +656,16 @@ where
         let run_events = pending.actor.take_run_events();
         let runtime_events = pending.actor.take_runtime_events();
         let resident = ResidentActor::new(address.clone(), pending.actor, pending.status);
-        debug_assert_eq!(resident.actor_ref.actor_id().as_str(), address.as_str());
+        debug_assert_eq!(resident.handle.actor_id().as_str(), address.as_str());
         {
             let mut state = lock(&self.state);
             state.reservations.remove(&address);
             reservation.active = false;
             if state.shutting_down {
                 return Err(AgentSystemError::ShuttingDown);
+            }
+            if let Some(root) = state.interruption_root(&address) {
+                return Err(AgentSystemError::InterruptionInProgress { root: root.clone() });
             }
             state.prune_stopped();
             match state.residents.entry(address.clone()) {
@@ -678,9 +807,8 @@ where
             .await?;
         let admission_guard = ChildAdmissionGuard::new(self, &child);
         let _activity = self.begin_activity().map_err(spawn_system_error)?;
-        let mut owner = child.resident.owner.lock().await;
-        let actor = owner.as_mut().ok_or(SpawnError::Unavailable)?;
-        let mut run = actor.call_from_actor(&parent.actor_ref, task);
+        let parent_ref = parent.handle.actor_ref();
+        let mut run = child.resident.handle.call_from_actor(&parent_ref, task);
         let message_id = run.message_id().clone();
         run.wait_admitted()
             .await
@@ -688,7 +816,6 @@ where
                 message: error.to_string(),
             })?;
         let result = run.await;
-        drop(owner);
         let outcome = AgentOutcome::from_result(address, &message_id, result);
         self.emit(AgentSystemEvent::Outcome {
             outcome: outcome.clone(),
@@ -706,12 +833,8 @@ where
         accepted: oneshot::Receiver<()>,
         _activity: ActivityGuard<S>,
     ) {
-        let mut owner = child.resident.owner.lock().await;
-        let Some(actor) = owner.as_mut() else {
-            let _ = ready.send(Err(lam::ActorError::Unavailable));
-            return;
-        };
-        let mut run = actor.call_from_actor(&parent.actor_ref, task);
+        let parent_ref = parent.handle.actor_ref();
+        let mut run = child.resident.handle.call_from_actor(&parent_ref, task);
         let message_id = run.message_id().clone();
         let receipt = match run.wait_admitted().await {
             Ok(receipt) => receipt,
@@ -720,25 +843,77 @@ where
                 return;
             }
         };
+        self.track_spawned_task(child.resident.address.clone(), message_id.clone());
         if ready.send(Ok(receipt)).is_err() || accepted.await.is_err() {
-            drop(owner);
+            self.set_spawned_delivery(
+                &child.resident.address,
+                OutcomeDelivery::Failed {
+                    message: "spawn was cancelled before its admission receipt was accepted"
+                        .to_owned(),
+                },
+            );
             self.cancel_subtree(&child.resident.address, StopReason::Cancelled);
             return;
         }
         let result = run.await;
-        drop(owner);
+        let was_interrupted = matches!(&result, Err(lam::ActorError::Interrupted));
         let outcome =
             AgentOutcome::from_result(child.resident.address.clone(), &message_id, result);
         self.emit(AgentSystemEvent::Outcome {
             outcome: outcome.clone(),
         });
-        if parent.ensure_running().is_ok() {
-            let _ = parent
-                .actor_ref
-                .send_from_actor(&child.resident.actor_ref, outcome)
-                .await;
-            self.activity.notify_waiters();
+        if was_interrupted {
+            self.set_spawned_delivery(
+                &child.resident.address,
+                OutcomeDelivery::Failed {
+                    message: "agent tree was interrupted before outcome delivery".to_owned(),
+                },
+            );
+            return;
         }
+        let delivery = match parent.ensure_running() {
+            Ok(()) => {
+                let child_ref = child.resident.handle.actor_ref();
+                parent
+                    .handle
+                    .actor_ref()
+                    .send_from_actor(&child_ref, outcome)
+                    .await
+                    .map_err(AgentSystemError::from)
+            }
+            Err(error) => Err(error),
+        };
+        match delivery {
+            Ok(receipt) => self
+                .set_spawned_delivery(&child.resident.address, OutcomeDelivery::Delivered(receipt)),
+            Err(error) => self.set_spawned_delivery(
+                &child.resident.address,
+                OutcomeDelivery::Failed {
+                    message: error.to_string(),
+                },
+            ),
+        }
+    }
+
+    fn track_spawned_task(&self, address: ActorAddress, message_id: MessageId) {
+        let previous = lock(&self.state).spawned_tasks.insert(
+            address,
+            SpawnedTask {
+                message_id,
+                delivery: OutcomeDelivery::Pending,
+            },
+        );
+        debug_assert!(previous.is_none(), "spawned addresses are create-only");
+        self.activity.notify_waiters();
+    }
+
+    fn set_spawned_delivery(&self, address: &ActorAddress, delivery: OutcomeDelivery) {
+        lock(&self.state)
+            .spawned_tasks
+            .get_mut(address)
+            .expect("spawned tasks are tracked before outcome delivery")
+            .delivery = delivery;
+        self.activity.notify_waiters();
     }
 
     async fn prepare_child(
@@ -878,13 +1053,79 @@ where
     ) -> Result<MessageReceipt, AgentSystemError> {
         let sender = self.resident(sender_address)?;
         let target = self.resident(target_address)?;
+        let sender_ref = sender.handle.actor_ref();
         let receipt = target
-            .actor_ref
-            .send_from_actor(&sender.actor_ref, message)
+            .handle
+            .actor_ref()
+            .send_from_actor(&sender_ref, message)
             .await
             .map_err(AgentSystemError::from)?;
         self.activity.notify_waiters();
         Ok(receipt)
+    }
+
+    pub(crate) async fn wait_for_spawned(
+        &self,
+        requester: &ActorAddress,
+        request: WaitRequest,
+    ) -> Result<WaitReceipt, WaitError> {
+        if request.addresses.is_empty() {
+            return Err(WaitError::Empty);
+        }
+        let mut unique = BTreeSet::new();
+        for address in &request.addresses {
+            if !address.is_direct_child_of(requester) {
+                return Err(WaitError::NotDirectChild {
+                    requester: requester.clone(),
+                    address: address.clone(),
+                });
+            }
+            if !unique.insert(address.clone()) {
+                return Err(WaitError::Duplicate {
+                    address: address.clone(),
+                });
+            }
+        }
+
+        loop {
+            let notified = self.activity.notified();
+            let completed = {
+                let state = lock(&self.state);
+                if state.shutting_down {
+                    return Err(WaitError::Unavailable);
+                }
+                let mut completed = Vec::with_capacity(request.addresses.len());
+                let mut pending = false;
+                for address in &request.addresses {
+                    let Some(task) = state.spawned_tasks.get(address) else {
+                        return Err(WaitError::NotSpawned {
+                            requester: requester.clone(),
+                            address: address.clone(),
+                        });
+                    };
+                    match &task.delivery {
+                        OutcomeDelivery::Pending => pending = true,
+                        OutcomeDelivery::Delivered(receipt) => completed.push(WaitedTask {
+                            address: address.clone(),
+                            message_id: task.message_id.to_string(),
+                            inbox_message_id: receipt.message_id.to_string(),
+                            inbox_revision: receipt.revision.get(),
+                        }),
+                        OutcomeDelivery::Failed { message } => {
+                            return Err(WaitError::DeliveryFailed {
+                                address: address.clone(),
+                                message: message.clone(),
+                            });
+                        }
+                    }
+                }
+                (!pending).then_some(completed)
+            };
+            if let Some(completed) = completed {
+                return Ok(WaitReceipt { completed });
+            }
+            notified.await;
+        }
     }
 
     pub(crate) fn list_children(
@@ -944,7 +1185,7 @@ where
                 if resident.is_stopped() {
                     continue;
                 }
-                let state = resident.actor_ref.state().await?;
+                let state = resident.handle.state().await?;
                 if state.active_run().is_some() || state.eligible_messages().next().is_some() {
                     idle = false;
                     break;
@@ -964,6 +1205,100 @@ where
         }
     }
 
+    async fn interrupt_tree(
+        self: &Arc<Self>,
+        address: &ActorAddress,
+    ) -> Result<Option<AgentTreeInterruptionReceipt>, AgentSystemError> {
+        let _activity = self.begin_activity()?;
+        let (_interruption, root) = InterruptionGuard::acquire(Arc::clone(self), address.clone())?;
+        if root.handle.state().await?.active_run().is_none() {
+            return Ok(None);
+        }
+
+        let mut residents = {
+            let mut state = lock(&self.state);
+            state.prune_stopped();
+            state.residents_in_subtree(address)
+        };
+        for resident in &residents {
+            if resident.address != *address {
+                resident.mark_interrupted();
+            }
+        }
+
+        residents.sort_by(|left, right| {
+            right
+                .address
+                .depth()
+                .cmp(&left.address.depth())
+                .then_with(|| left.address.cmp(&right.address))
+        });
+        let interrupted = join_all(residents.iter().map(|resident| async move {
+            (resident.address.clone(), resident.handle.interrupt().await)
+        }))
+        .await;
+
+        let descendants = residents
+            .iter()
+            .filter(|resident| resident.address != *address)
+            .cloned()
+            .collect::<Vec<_>>();
+        let shutdown = join_all(descendants.iter().map(|resident| async move {
+            match resident.owner.lock().await.take() {
+                Some(actor) => actor.shutdown().await,
+                None => Ok(()),
+            }
+        }))
+        .await;
+        join_all(
+            descendants
+                .iter()
+                .map(|resident| resident.wait_stopped(&self.activity)),
+        )
+        .await;
+        {
+            let mut state = lock(&self.state);
+            for resident in &descendants {
+                if state
+                    .residents
+                    .get(&resident.address)
+                    .is_some_and(|current| Arc::ptr_eq(current, resident))
+                {
+                    state.residents.remove(&resident.address);
+                }
+            }
+        }
+        self.activity.notify_waiters();
+        let mut receipts = Vec::with_capacity(interrupted.len());
+        let mut first_error = None;
+        for (address, result) in interrupted {
+            match result {
+                Ok(interruption) => receipts.push(AgentInterruptionReceipt {
+                    address,
+                    interruption,
+                }),
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(AgentSystemError::from(error));
+                    }
+                }
+            }
+        }
+        if first_error.is_none()
+            && let Some(error) = shutdown.into_iter().find_map(Result::err)
+        {
+            first_error = Some(error.into());
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        receipts.sort_by(|left, right| left.address.cmp(&right.address));
+        Ok(Some(AgentTreeInterruptionReceipt {
+            root: address.clone(),
+            actors: receipts,
+        }))
+    }
+
     async fn stop_subtree(
         &self,
         address: &ActorAddress,
@@ -975,14 +1310,10 @@ where
             if state.shutting_down {
                 return Err(AgentSystemError::ShuttingDown);
             }
-            let residents = state
-                .residents
-                .iter()
-                .filter(|(candidate, _)| {
-                    *candidate == address || candidate.is_descendant_of(address)
-                })
-                .map(|(_, resident)| Arc::clone(resident))
-                .collect::<Vec<_>>();
+            if let Some(root) = state.overlapping_interruption(address) {
+                return Err(AgentSystemError::InterruptionInProgress { root: root.clone() });
+            }
+            let residents = state.residents_in_subtree(address);
             if residents.is_empty() {
                 return Err(AgentSystemError::ActorUnavailable {
                     address: address.clone(),
@@ -1030,14 +1361,10 @@ where
     fn cancel_subtree(&self, address: &ActorAddress, reason: StopReason) {
         let residents = {
             let state = lock(&self.state);
-            state
-                .residents
-                .iter()
-                .filter(|(candidate, _)| {
-                    *candidate == address || candidate.is_descendant_of(address)
-                })
-                .map(|(_, resident)| Arc::clone(resident))
-                .collect::<Vec<_>>()
+            if state.overlapping_interruption(address).is_some() {
+                return;
+            }
+            state.residents_in_subtree(address)
         };
         for resident in residents {
             resident.request_stop(reason.clone());
@@ -1152,6 +1479,56 @@ where
     }
 }
 
+struct InterruptionGuard<S>
+where
+    S: JournalStore + 'static,
+{
+    system: Arc<SystemInner<S>>,
+    root: ActorAddress,
+}
+
+impl<S> InterruptionGuard<S>
+where
+    S: JournalStore + 'static,
+{
+    fn acquire(
+        system: Arc<SystemInner<S>>,
+        root: ActorAddress,
+    ) -> Result<(Self, Arc<ResidentActor<S>>), AgentSystemError> {
+        let resident = {
+            let mut state = lock(&system.state);
+            if state.shutting_down {
+                return Err(AgentSystemError::ShuttingDown);
+            }
+            state.prune_stopped();
+            if let Some(active) = state.overlapping_interruption(&root) {
+                return Err(AgentSystemError::InterruptionInProgress {
+                    root: active.clone(),
+                });
+            }
+            let resident = state.residents.get(&root).cloned().ok_or_else(|| {
+                AgentSystemError::ActorUnavailable {
+                    address: root.clone(),
+                }
+            })?;
+            state.interrupting.insert(root.clone());
+            resident
+        };
+        system.activity.notify_waiters();
+        Ok((Self { system, root }, resident))
+    }
+}
+
+impl<S> Drop for InterruptionGuard<S>
+where
+    S: JournalStore + 'static,
+{
+    fn drop(&mut self) {
+        lock(&self.system.state).interrupting.remove(&self.root);
+        self.system.activity.notify_waiters();
+    }
+}
+
 struct ChildAdmissionGuard<S>
 where
     S: JournalStore + 'static,
@@ -1213,6 +1590,9 @@ where
                 return Err(AgentSystemError::ShuttingDown);
             }
             state.prune_stopped();
+            if let Some(root) = state.interruption_root(&address) {
+                return Err(AgentSystemError::InterruptionInProgress { root: root.clone() });
+            }
             if state.residents.contains_key(&address) || state.reservations.contains(&address) {
                 return Err(AgentSystemError::AddressInUse { address });
             }
@@ -1417,6 +1797,7 @@ fn spawn_system_error(error: AgentSystemError) -> SpawnError {
         AgentSystemError::ShuttingDown | AgentSystemError::WorkerUnavailable => {
             SpawnError::Unavailable
         }
+        AgentSystemError::InterruptionInProgress { .. } => SpawnError::Unavailable,
         error => SpawnError::StartFailed {
             message: error.to_string(),
         },

@@ -68,6 +68,7 @@ The exact installed functions are manifest-discoverable through `lam.dir()`:
 | `lam.agents.identity()` | Return the current address and automatic parent |
 | `lam.agents.list(request?)` | List direct resident children |
 | `lam.agents.spawn(request)` | Create a detached persistent child and return after initial task admission |
+| `lam.agents.wait({ addresses })` | Await spawned direct children without steering them |
 | `lam.agents.call(request)` | Create a persistent child and wait directly for its initial task outcome |
 | `lam.agents.send({ to, message })` | Durably send an authenticated steering message to any resident address |
 | `lam.agents.stop({ address })` | Stop one direct child and its descendants, waiting for residency release |
@@ -96,6 +97,14 @@ then sends one actor-authenticated outcome into the parent's durable mailbox,
 waking or steering the parent. A detached child remains addressable after its
 initial run completes.
 
+`wait` accepts one or more direct-child addresses returned by `spawn` and waits
+for all of their initial tasks without sending, interrupting, or otherwise
+steering those children. It resolves only after every terminal outcome is
+durably admitted to the caller's inbox. At the next model boundary, the wait
+receipt and those inbox messages are therefore visible together in the same
+continuation. Cancelling or timing out the surrounding eval does not cancel the
+spawned work; its eventual outcomes are still delivered.
+
 ## Scheduler model
 
 Each worker is one OS thread with a Tokio current-thread runtime and `LocalSet`.
@@ -110,14 +119,25 @@ task retires—not merely when its inner runner observes cancellation.
 
 ## Embedded control and events
 
-`Agent` is a cloneable embedded handle with serialized `call`, structured
-`call_structured`, durable `send`, state projection, and out-of-band abort.
+`Agent` is a cloneable embedded handle with `call`, structured
+`call_structured`, explicit compaction, model switching, durable `send`, state
+projection, recoverable tree interruption, and out-of-band abort. Correlated
+operations use Lam's shared actor operation lease; a conflict returns
+`ActorError::Busy` rather than waiting behind the resident lifecycle owner.
 
 `AgentSystem::wait()` waits for quiescence: no active host operations,
 reservations, actor runs, or eligible mailbox work. It does not retire idle
 actors. `shutdown()` stops admission, gracefully retires actors, and joins all
 workers; `abort()` interrupts active work first. Administrative `stop(address)`
 retires an addressed subtree.
+
+`Agent::interrupt()` (or `AgentSystem::interrupt(address)`) fans recoverable
+interruption out across the complete resident subtree before awaiting any one
+actor. Each active run commits its own durable interruption boundary. A model
+or eval completion already committed at that boundary wins normally. Once the
+fan-in completes, descendants retire and release capacity while the addressed
+root remains available for a later call. Interrupted detached outcomes are not
+delivered into the root mailbox; already completed outcomes remain eligible.
 
 `take_events()` yields one single-consumer, addressed, ephemeral stream:
 
@@ -134,8 +154,6 @@ authority.
 - Durable reconstruction of the live topology after process restart.
 - Overload queues beyond explicit capacity failure.
 - Dynamic rebalancing or isolate migration.
-- Model-visible polling/wait primitives; synchronous work uses `call`, while
-  detached work pushes its outcome.
 
 See the public [`lam`](../lam/README.md) facade, optional
 [`lam-code`](../lam-code/README.md) capabilities, and repository

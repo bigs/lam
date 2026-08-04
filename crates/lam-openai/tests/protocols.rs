@@ -11,7 +11,7 @@ use lam::{
     CompactionRequest, Compactor, ContextEntry, ContextSequence, ContextTransition, EncodedPayload,
     ModelCodec, ModelCostSource, ModelDelta, ModelDirective, ModelEventSink, ModelProvider,
     ModelRequestConfig, ModelResponseMetadata, OutputContract, ProjectedContextEntry, Revision,
-    RunEvent, RunId, RunProgress, Timestamp,
+    RunEvent, RunId, RunProgress, Timestamp, ToolCallDelta,
 };
 use lam_openai::chat_completions::{
     ChatCompletions, REQUEST_CODEC_ID as CHAT_REQUEST_CODEC_ID,
@@ -21,7 +21,7 @@ use lam_openai::responses::{
     OpenAiResponsesCompactor, REQUEST_CODEC_ID as RESPONSES_REQUEST_CODEC_ID,
     RESPONSE_CODEC_ID as RESPONSES_RESPONSE_CODEC_ID, Responses,
 };
-use lam_openai::{BuildError, ModelPricing};
+use lam_openai::{BuildError, ModelPricing, ProviderError};
 use serde_json::{Value, json};
 
 #[test]
@@ -40,7 +40,7 @@ fn responses_request_is_stateless_and_replays_encrypted_reasoning_unchanged() {
     let reasoning = json!({
         "type": "reasoning",
         "id": "rs_1",
-        "summary": [],
+        "summary": [{ "type": "summary_text", "text": "Inspect the result" }],
         "encrypted_content": "opaque-ciphertext"
     });
     let function_call = json!({
@@ -48,7 +48,7 @@ fn responses_request_is_stateless_and_replays_encrypted_reasoning_unchanged() {
         "id": "fc_1",
         "call_id": "call_1",
         "name": "eval",
-        "arguments": "{\"source\":\"1 + 1\",\"timeoutMs\":250}",
+        "arguments": "{\"intent\":\"Calculate the result\",\"source\":\"1 + 1\",\"timeoutMs\":250}",
         "status": "completed"
     });
     let native_response = json!({
@@ -64,12 +64,28 @@ fn responses_request_is_stateless_and_replays_encrypted_reasoning_unchanged() {
         "response",
         native_response,
     );
+    let projection = codec.project_response(&response).expect("valid eval");
     assert_eq!(
-        codec.interpret_response(&response).expect("valid eval"),
+        projection.directive,
         ModelDirective::Eval(lam::EvalRequest {
+            intent: "Calculate the result".to_owned(),
             source: "1 + 1".to_owned(),
             timeout: Some(Duration::from_millis(250)),
         })
+    );
+    assert_eq!(
+        projection.display,
+        [
+            ModelDelta::Reasoning("Inspect the result".to_owned()),
+            ModelDelta::ToolCall(ToolCallDelta {
+                index: 1,
+                call_id: Some("call_1".to_owned()),
+                name: Some("eval".to_owned()),
+                arguments:
+                    "{\"intent\":\"Calculate the result\",\"source\":\"1 + 1\",\"timeoutMs\":250}"
+                        .to_owned(),
+            }),
+        ]
     );
 
     let context = vec![
@@ -92,6 +108,14 @@ fn responses_request_is_stateless_and_replays_encrypted_reasoning_unchanged() {
     assert_eq!(body["stream"], true);
     assert_eq!(body["parallel_tool_calls"], false);
     assert_eq!(body["instructions"], "runtime instructions");
+    assert_eq!(
+        body["tools"][0]["parameters"]["required"],
+        json!(["intent", "source", "timeoutMs"])
+    );
+    assert_eq!(
+        body["tools"][0]["parameters"]["properties"]["intent"]["maxLength"],
+        120
+    );
     assert_eq!(body["reasoning"]["effort"], "high");
     assert!(
         body["include"]
@@ -143,7 +167,10 @@ fn responses_structured_output_uses_json_schema_and_decodes_json() {
         }),
     );
     assert_eq!(
-        codec.interpret_response(&response).expect("valid output"),
+        codec
+            .project_response(&response)
+            .expect("valid output")
+            .directive,
         ModelDirective::Output(json!({ "answer": 42 }))
     );
 }
@@ -439,12 +466,33 @@ fn chat_replays_reasoning_extensions_and_tool_calls_from_native_chunks() {
     ]);
     let response = response_payload(CHAT_RESPONSE_CODEC_ID, "text", "chunks", chunks.clone());
     assert_eq!(response.value["chunks"], chunks);
+    let projection = codec.project_response(&response).expect("valid eval");
     assert_eq!(
-        codec.interpret_response(&response).expect("valid eval"),
+        projection.directive,
         ModelDirective::Eval(lam::EvalRequest {
+            intent: "Evaluate TypeScript".to_owned(),
             source: "2 + 2".to_owned(),
             timeout: None,
         })
+    );
+    assert_eq!(
+        projection.display,
+        [
+            ModelDelta::Reasoning("inspect ".to_owned()),
+            ModelDelta::ToolCall(ToolCallDelta {
+                index: 0,
+                call_id: Some("call_1".to_owned()),
+                name: Some("eval".to_owned()),
+                arguments: "{\"source\":\"".to_owned(),
+            }),
+            ModelDelta::Reasoning("state".to_owned()),
+            ModelDelta::ToolCall(ToolCallDelta {
+                index: 0,
+                call_id: None,
+                name: None,
+                arguments: "2 + 2\"}".to_owned(),
+            }),
+        ]
     );
 
     let request = codec
@@ -465,6 +513,10 @@ fn chat_replays_reasoning_extensions_and_tool_calls_from_native_chunks() {
     assert_eq!(body["stream"], true);
     assert_eq!(body["stream_options"]["include_usage"], true);
     assert_eq!(body["parallel_tool_calls"], false);
+    assert_eq!(
+        body["tools"][0]["function"]["parameters"]["required"],
+        json!(["intent", "source", "timeoutMs"])
+    );
     assert_eq!(body["reasoning_effort"], "high");
     assert_eq!(body["reasoning_history"], "preserved");
     let assistant = &body["messages"][0];
@@ -528,7 +580,10 @@ fn chat_structured_output_uses_json_schema_and_decodes_json() {
         }),
     );
     assert_eq!(
-        codec.interpret_response(&response).expect("valid output"),
+        codec
+            .project_response(&response)
+            .expect("valid output")
+            .directive,
         ModelDirective::Output(json!([1, 2, 3]))
     );
 }
@@ -702,6 +757,108 @@ fn resumption_notice_closes_pending_eval_in_both_native_protocols() {
     );
 }
 
+#[test]
+fn durable_interruption_replays_eval_failure_and_notice_in_both_protocols() {
+    let failure = payload(
+        "lam/eval",
+        json!({
+            "status": "failure",
+            "error": {
+                "kind": "interrupted",
+                "effects_may_have_completed": true,
+                "previous_generation": 1,
+                "new_generation": 2
+            }
+        }),
+    );
+    let notice = interruption_notice_message();
+
+    let (_, responses) = Responses::builder("gpt-test")
+        .api_key("test-key")
+        .build_parts()
+        .expect("valid adapter");
+    let responses_call = response_payload(
+        RESPONSES_RESPONSE_CODEC_ID,
+        "text",
+        "response",
+        json!({
+            "status": "completed",
+            "output": [{
+                "type": "function_call",
+                "call_id": "call_responses",
+                "name": "eval",
+                "arguments": "{\"source\":\"sideEffect()\"}"
+            }]
+        }),
+    );
+    let request = responses
+        .encode_request(
+            &[
+                projected(1, model_transition(), responses_call),
+                projected(2, eval_transition(), failure.clone()),
+                projected(3, interruption_transition(), notice.clone()),
+            ],
+            &ModelRequestConfig::agent(&OutputContract::Text, ""),
+        )
+        .expect("durable interruption should replay through Responses");
+    let input = request.value["body"]["input"].as_array().unwrap();
+    assert_eq!(input[1]["type"], "function_call_output");
+    assert_eq!(input[1]["call_id"], "call_responses");
+    assert!(input[1]["output"].as_str().unwrap().contains("interrupted"));
+    assert_eq!(input[2]["role"], "developer");
+    assert!(input[2].to_string().contains("runInterrupted"));
+
+    let (_, chat) = ChatCompletions::builder("test-model")
+        .build_parts()
+        .expect("valid adapter");
+    let chat_call = response_payload(
+        CHAT_RESPONSE_CODEC_ID,
+        "text",
+        "response",
+        json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call_chat",
+                        "type": "function",
+                        "function": {
+                            "name": "eval",
+                            "arguments": "{\"source\":\"sideEffect()\"}"
+                        }
+                    }]
+                }
+            }]
+        }),
+    );
+    let request = chat
+        .encode_request(
+            &[
+                projected(1, model_transition(), chat_call),
+                projected(2, eval_transition(), failure),
+                projected(3, interruption_transition(), notice),
+            ],
+            &ModelRequestConfig::agent(&OutputContract::Text, ""),
+        )
+        .expect("durable interruption should replay through Chat Completions");
+    let messages = request.value["body"]["messages"].as_array().unwrap();
+    assert_eq!(messages[1]["role"], "tool");
+    assert_eq!(messages[1]["tool_call_id"], "call_chat");
+    assert!(
+        messages[1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("interrupted")
+    );
+    assert_eq!(messages[2]["role"], "system");
+    assert!(
+        messages[2]["content"]
+            .as_str()
+            .unwrap()
+            .contains("runInterrupted")
+    );
+}
+
 #[tokio::test]
 async fn responses_provider_sends_store_false_and_returns_completed_native_response() {
     let completed = json!({
@@ -724,7 +881,22 @@ async fn responses_provider_sends_store_false_and_returns_completed_native_respo
         }
     });
     let stream = format!(
-        "event: response.output_text.delta\ndata: {}\n\nevent: response.completed\ndata: {}\n\n",
+        "event: response.output_item.added\ndata: {}\n\nevent: response.function_call_arguments.delta\ndata: {}\n\nevent: response.output_text.delta\ndata: {}\n\nevent: response.completed\ndata: {}\n\n",
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 1,
+            "item": {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "eval",
+                "arguments": ""
+            }
+        }),
+        json!({
+            "type": "response.function_call_arguments.delta",
+            "output_index": 1,
+            "delta": "{\"source\":\"1 + 1\"}"
+        }),
         json!({ "type": "response.output_text.delta", "delta": "hello" }),
         json!({ "type": "response.completed", "response": completed })
     );
@@ -767,7 +939,21 @@ async fn responses_provider_sends_store_false_and_returns_completed_native_respo
     assert!((cost.amount_usd - 0.000_051).abs() < f64::EPSILON);
     assert_eq!(
         *deltas.lock().unwrap(),
-        vec![ModelDelta::Text("hello".to_owned())]
+        vec![
+            ModelDelta::ToolCall(ToolCallDelta {
+                index: 1,
+                call_id: Some("call_1".to_owned()),
+                name: Some("eval".to_owned()),
+                arguments: String::new(),
+            }),
+            ModelDelta::ToolCall(ToolCallDelta {
+                index: 1,
+                call_id: None,
+                name: None,
+                arguments: "{\"source\":\"1 + 1\"}".to_owned(),
+            }),
+            ModelDelta::Text("hello".to_owned()),
+        ]
     );
 }
 
@@ -777,7 +963,15 @@ async fn chat_provider_preserves_every_chunk_and_streams_reasoning() {
         "id": "chat_1",
         "choices": [{
             "index": 0,
-            "delta": { "role": "assistant", "reasoning_content": "think" },
+            "delta": {
+                "role": "assistant",
+                "reasoning_content": "think",
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "function": { "name": "eval", "arguments": "{\"source\":" }
+                }]
+            },
             "finish_reason": null
         }]
     });
@@ -786,7 +980,13 @@ async fn chat_provider_preserves_every_chunk_and_streams_reasoning() {
         "model": "accounts/test/resolved-model",
         "choices": [{
             "index": 0,
-            "delta": { "content": "done" },
+            "delta": {
+                "content": "done",
+                "tool_calls": [{
+                    "index": 0,
+                    "function": { "arguments": "\"1 + 1\"}" }
+                }]
+            },
             "finish_reason": "stop"
         }],
         "usage": {
@@ -845,9 +1045,86 @@ async fn chat_provider_preserves_every_chunk_and_streams_reasoning() {
         *deltas.lock().unwrap(),
         vec![
             ModelDelta::Reasoning("think".to_owned()),
-            ModelDelta::Text("done".to_owned())
+            ModelDelta::ToolCall(ToolCallDelta {
+                index: 0,
+                call_id: Some("call_1".to_owned()),
+                name: Some("eval".to_owned()),
+                arguments: "{\"source\":".to_owned(),
+            }),
+            ModelDelta::Text("done".to_owned()),
+            ModelDelta::ToolCall(ToolCallDelta {
+                index: 0,
+                call_id: None,
+                name: None,
+                arguments: "\"1 + 1\"}".to_owned(),
+            })
         ]
     );
+}
+
+#[tokio::test]
+async fn chat_provider_accepts_a_terminal_chunk_before_a_truncated_body() {
+    let terminal = json!({
+        "id": "chat_complete",
+        "choices": [{
+            "index": 0,
+            "delta": { "role": "assistant", "content": "complete" },
+            "finish_reason": "stop"
+        }]
+    });
+    let stream = format!("data: {terminal}\n\n");
+    let server = MockServer::start_truncated("text/event-stream", stream);
+    let (provider, codec) = ChatCompletions::builder("test-model")
+        .base_url(format!("{}/v1", server.origin))
+        .build_parts()
+        .expect("valid adapter");
+    let request = codec
+        .encode_request(
+            &[user_message("hello")],
+            &ModelRequestConfig::agent(&OutputContract::Text, ""),
+        )
+        .expect("valid request");
+
+    let response = provider
+        .invoke(request, ModelEventSink::new(|_| {}))
+        .await
+        .expect("terminal response should survive a trailing body failure");
+
+    assert_eq!(response.value["chunks"], json!([terminal]));
+    server.finish();
+}
+
+#[tokio::test]
+async fn chat_provider_rejects_a_truncated_body_before_a_terminal_chunk() {
+    let partial = json!({
+        "id": "chat_partial",
+        "choices": [{
+            "index": 0,
+            "delta": { "role": "assistant", "content": "partial" },
+            "finish_reason": null
+        }]
+    });
+    let stream = format!("data: {partial}\n\n");
+    let server = MockServer::start_truncated("text/event-stream", stream);
+    let (provider, codec) = ChatCompletions::builder("test-model")
+        .base_url(format!("{}/v1", server.origin))
+        .build_parts()
+        .expect("valid adapter");
+    let request = codec
+        .encode_request(
+            &[user_message("hello")],
+            &ModelRequestConfig::agent(&OutputContract::Text, ""),
+        )
+        .expect("valid request");
+
+    let error = provider
+        .invoke(request, ModelEventSink::new(|_| {}))
+        .await
+        .expect_err("an incomplete response must still fail");
+
+    assert!(matches!(error, ProviderError::Http(_)));
+    assert!(error.to_string().contains("decoding response body"));
+    server.finish();
 }
 
 #[tokio::test]
@@ -1009,12 +1286,31 @@ async fn chat_adapter_drives_a_complete_lam_eval_loop() {
             "id": "chat_done",
             "choices": [{
                 "index": 0,
-                "delta": { "role": "assistant", "content": "42" },
+                "delta": {
+                    "role": "assistant",
+                    "content": "42",
+                    "reasoning_content": null,
+                    "tool_calls": null
+                },
                 "finish_reason": "stop"
             }]
         })
     );
-    let server = MockServer::start_sequence("text/event-stream", vec![first_chunks, second_chunks]);
+    let third_chunks = format!(
+        "data: {}\n\ndata: [DONE]\n\n",
+        json!({
+            "id": "chat_follow_up",
+            "choices": [{
+                "index": 0,
+                "delta": { "role": "assistant", "content": "ready" },
+                "finish_reason": "stop"
+            }]
+        })
+    );
+    let server = MockServer::start_sequence(
+        "text/event-stream",
+        vec![first_chunks, second_chunks, third_chunks],
+    );
     let model = ChatCompletions::builder("accounts/test/model")
         .api_key("test-key")
         .base_url(format!("{}/inference/v1", server.origin))
@@ -1032,10 +1328,15 @@ async fn chat_adapter_drives_a_complete_lam_eval_loop() {
         .await
         .expect("run completes");
     assert_eq!(answer, "42");
+    let follow_up: String = actor
+        .call("are you ready for another request?")
+        .await
+        .expect("follow-up run completes");
+    assert_eq!(follow_up, "ready");
     actor.shutdown().await.expect("actor shuts down");
 
     let requests = server.finish_all();
-    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.len(), 3);
     assert_eq!(requests[1].body["reasoning_history"], "preserved");
     let messages = requests[1].body["messages"].as_array().unwrap();
     assert!(
@@ -1060,6 +1361,12 @@ async fn chat_adapter_drives_a_complete_lam_eval_loop() {
             },
         })
     );
+    let follow_up_messages = requests[2].body["messages"].as_array().unwrap();
+    assert_eq!(follow_up_messages[4]["role"], "assistant");
+    assert_eq!(follow_up_messages[4]["content"], "42");
+    assert!(follow_up_messages[4].get("reasoning_content").is_none());
+    assert!(follow_up_messages[4].get("tool_calls").is_none());
+    assert_eq!(follow_up_messages[5]["role"], "user");
 }
 
 fn user_message(text: &str) -> ProjectedContextEntry {
@@ -1101,6 +1408,13 @@ fn recovery_transition() -> ContextTransition {
     }
 }
 
+fn interruption_transition() -> ContextTransition {
+    ContextTransition::Interrupted {
+        run_id: run_id(),
+        consumed_message_ids: vec![lam::MessageId::new("interruption-message").unwrap()],
+    }
+}
+
 fn recovery_notice_message() -> EncodedPayload {
     payload(
         "lam/messages",
@@ -1114,6 +1428,26 @@ fn recovery_notice_message() -> EncodedPayload {
                     "isolateState": "reset",
                     "resumedRunId": "run-1",
                     "interruptedEvalOutcome": "unknown"
+                }
+            }
+        }]),
+    )
+}
+
+fn interruption_notice_message() -> EncodedPayload {
+    payload(
+        "lam/messages",
+        json!([{
+            "messageId": "interruption-message",
+            "source": { "kind": "host", "component": "lam/runtime" },
+            "payload": {
+                "codec": { "id": "lam/system-notice", "version": 1 },
+                "value": {
+                    "type": "runInterrupted",
+                    "runId": "run-1",
+                    "reason": "user",
+                    "isolateState": "reset",
+                    "interruptedEvalOutcome": "failureRecorded"
                 }
             }
         }]),
@@ -1190,19 +1524,38 @@ impl MockServer {
         )
     }
 
+    fn start_truncated(content_type: &'static str, response_body: String) -> Self {
+        Self::start_responses(vec![(
+            content_type,
+            response_body.clone(),
+            response_body.len() + 128,
+        )])
+    }
+
     fn start_mixed(responses: Vec<(&'static str, String)>) -> Self {
+        Self::start_responses(
+            responses
+                .into_iter()
+                .map(|(content_type, response_body)| {
+                    let content_length = response_body.len();
+                    (content_type, response_body, content_length)
+                })
+                .collect(),
+        )
+    }
+
+    fn start_responses(responses: Vec<(&'static str, String, usize)>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
         let address = listener.local_addr().expect("mock address");
         let (sender, request) = mpsc::channel();
         let expected_requests = responses.len();
         let join = std::thread::spawn(move || {
-            for (content_type, response_body) in responses {
+            for (content_type, response_body, content_length) in responses {
                 let (mut stream, _) = listener.accept().expect("accept request");
                 let captured = read_request(&mut stream);
                 sender.send(captured).expect("capture request");
                 let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
-                    response_body.len()
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {content_length}\r\nConnection: close\r\n\r\n{response_body}"
                 );
                 stream
                     .write_all(response.as_bytes())

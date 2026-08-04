@@ -8,6 +8,7 @@ mod address;
 mod config;
 mod error;
 mod event;
+mod interruption;
 mod namespace;
 mod outcome;
 mod system;
@@ -16,9 +17,11 @@ pub use address::{ActorAddress, InvalidActorAddress};
 pub use config::{ModelTarget, SubagentConfig, SubagentConfigBuilder};
 pub use error::{AgentSystemBuildError, AgentSystemError, SubagentConfigError};
 pub use event::{AgentSystemEvent, AgentSystemEvents, StopReason};
+pub use interruption::{AgentInterruptionReceipt, AgentTreeInterruptionReceipt};
 pub use namespace::{
     AgentIdentity, ListError, ListRequest, SendError, SendReceipt, SendRequest, SpawnError,
-    SpawnReceipt, SpawnRequest, StopError, StopReceipt, StopRequest,
+    SpawnReceipt, SpawnRequest, StopError, StopReceipt, StopRequest, WaitError, WaitReceipt,
+    WaitRequest, WaitedTask,
 };
 pub use outcome::AgentOutcome;
 pub use system::{Agent, AgentAbortHandle, AgentSystem, AgentSystemBuilder};

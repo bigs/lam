@@ -3,7 +3,8 @@
 use lam::{
     CodecId, CodecRef, CompactionArtifact, ContextTransition, EncodedPayload, Model, ModelCodec,
     ModelDelta, ModelDescriptor, ModelDirective, ModelEventSink, ModelProvider, ModelRequestConfig,
-    ModelResponseMetadata, OutputContract, ProjectedContextEntry,
+    ModelResponseMetadata, ModelResponseProjection, OutputContract, ProjectedContextEntry,
+    ToolCallDelta,
 };
 use serde_json::{Map, Value, json};
 
@@ -164,15 +165,72 @@ impl ModelProvider for ChatCompletionsProvider {
                     message: "Chat Completions request has no model".to_owned(),
                 })?
                 .to_owned();
+            let request_body_bytes = serde_json::to_vec(&request.body).map_or(0, |body| body.len());
+            let message_count = request
+                .body
+                .get("messages")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            let tool_count = request
+                .body
+                .get("tools")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            let stream = request.body.get("stream").and_then(Value::as_bool);
+            let include_usage = request
+                .body
+                .pointer("/stream_options/include_usage")
+                .and_then(Value::as_bool);
+            let reasoning_effort = request.body.get("reasoning_effort").and_then(Value::as_str);
+            let max_tokens = request.body.get("max_tokens").and_then(Value::as_u64);
+            let max_completion_tokens = request
+                .body
+                .get("max_completion_tokens")
+                .and_then(Value::as_u64);
+            tracing::debug!(
+                target: "lam_openai::chat_completions",
+                event = "chat.request_metadata",
+                model,
+                output_kind = ?request.output_kind,
+                body_bytes = request_body_bytes,
+                message_count,
+                tool_count,
+                stream,
+                include_usage,
+                reasoning_effort,
+                max_tokens,
+                max_completion_tokens,
+                "prepared Chat Completions request"
+            );
             let mut chunks = Vec::new();
-            let mut saw_terminal = false;
+            let mut event_count = 0_u64;
+            let mut saw_done = false;
+            let mut saw_finish_reason = false;
+            let mut saw_usage = false;
+            let mut emitted = DeltaSummary::default();
             let body = transport
                 .post_stream("chat_completions", &request.body, |event| {
+                    event_count += 1;
                     if event.data == "[DONE]" {
-                        saw_terminal = true;
+                        saw_done = true;
+                        tracing::debug!(
+                            target: "lam_openai::chat_completions",
+                            event = "chat.done_received",
+                            event_index = event_count,
+                            chunks = chunks.len(),
+                            "received Chat Completions done marker"
+                        );
                         return Ok(());
                     }
                     let chunk: Value = serde_json::from_str(&event.data).map_err(|error| {
+                        tracing::error!(
+                            target: "lam_openai::chat_completions",
+                            event = "chat.invalid_event_json",
+                            event_index = event_count,
+                            data_bytes = event.data.len(),
+                            error = %error,
+                            "Chat Completions event was not valid JSON"
+                        );
                         ProviderError::InvalidEventJson {
                             message: error.to_string(),
                         }
@@ -189,29 +247,123 @@ impl ModelProvider for ChatCompletionsProvider {
                             message: error.to_string(),
                         });
                     }
+                    let summary = summarize_chunk(&chunk);
+                    emitted.add(summary);
+                    saw_usage |= chunk.get("usage").is_some_and(|usage| !usage.is_null());
+                    let finish_reasons = chunk
+                        .get("choices")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|choice| choice.get("finish_reason").and_then(Value::as_str))
+                        .collect::<Vec<_>>();
+                    let has_finish_reason = chunk
+                        .get("choices")
+                        .and_then(Value::as_array)
+                        .is_some_and(|choices| {
+                            choices.iter().any(|choice| {
+                                choice
+                                    .get("finish_reason")
+                                    .is_some_and(|reason| !reason.is_null())
+                            })
+                        });
+                    saw_finish_reason |= has_finish_reason;
+                    let top_level_type = chunk.get("type").and_then(Value::as_str);
+                    let choice_count = chunk
+                        .get("choices")
+                        .and_then(Value::as_array)
+                        .map_or(0, Vec::len);
+                    let usage_present = chunk.get("usage").is_some_and(|usage| !usage.is_null());
+                    tracing::trace!(
+                        target: "lam_openai::chat_completions",
+                        event = "chat.chunk_decoded",
+                        event_index = event_count,
+                        native_chunk_index = chunks.len() + 1,
+                        top_level_type,
+                        choice_count,
+                        finish_reasons = ?finish_reasons,
+                        usage_present,
+                        text_bytes = summary.text_bytes,
+                        reasoning_bytes = summary.reasoning_bytes,
+                        tool_call_count = summary.tool_call_count,
+                        tool_argument_bytes = summary.tool_argument_bytes,
+                        "decoded Chat Completions chunk"
+                    );
                     emit_chunk_deltas(&events, &chunk);
-                    saw_terminal |=
-                        chunk
-                            .get("choices")
-                            .and_then(Value::as_array)
-                            .is_some_and(|choices| {
-                                choices.iter().any(|choice| {
-                                    choice
-                                        .get("finish_reason")
-                                        .is_some_and(|reason| !reason.is_null())
-                                })
-                            });
                     chunks.push(chunk);
                     Ok(())
                 })
-                .await?;
+                .await;
+            let saw_terminal = saw_done || saw_finish_reason;
+            let body = match body {
+                Ok(body) => body,
+                Err(error)
+                    if saw_terminal && !chunks.is_empty() && error.is_response_body_failure() =>
+                {
+                    tracing::warn!(
+                        target: "lam_openai::chat_completions",
+                        event = "chat.trailing_body_failure_accepted",
+                        error = %error,
+                        chunks = chunks.len(),
+                        event_count,
+                        saw_done,
+                        saw_finish_reason,
+                        saw_usage,
+                        "accepting a semantically complete Chat Completions response after a trailing body failure"
+                    );
+                    StreamBody::Events
+                }
+                Err(error) => {
+                    tracing::error!(
+                        target: "lam_openai::chat_completions",
+                        event = "chat.stream_failed",
+                        error_kind = provider_error_kind(&error),
+                        response_body_failure = error.is_response_body_failure(),
+                        chunks = chunks.len(),
+                        event_count,
+                        saw_done,
+                        saw_finish_reason,
+                        saw_usage,
+                        text_bytes = emitted.text_bytes,
+                        reasoning_bytes = emitted.reasoning_bytes,
+                        tool_call_count = emitted.tool_call_count,
+                        tool_argument_bytes = emitted.tool_argument_bytes,
+                        "Chat Completions stream failed"
+                    );
+                    return Err(error);
+                }
+            };
             match body {
                 StreamBody::Events => {
                     if chunks.is_empty() || !saw_terminal {
+                        tracing::error!(
+                            target: "lam_openai::chat_completions",
+                            event = "chat.missing_terminal",
+                            chunks = chunks.len(),
+                            event_count,
+                            saw_done,
+                            saw_finish_reason,
+                            saw_usage,
+                            "Chat Completions stream ended without a terminal chunk"
+                        );
                         return Err(ProviderError::MissingTerminal {
                             expected: "a final Chat Completions chunk",
                         });
                     }
+                    tracing::debug!(
+                        target: "lam_openai::chat_completions",
+                        event = "chat.stream_completed",
+                        chunks = chunks.len(),
+                        event_count,
+                        saw_done,
+                        saw_finish_reason,
+                        saw_usage,
+                        text_bytes = emitted.text_bytes,
+                        reasoning_bytes = emitted.reasoning_bytes,
+                        tool_call_count = emitted.tool_call_count,
+                        tool_argument_bytes = emitted.tool_argument_bytes,
+                        "completed Chat Completions stream"
+                    );
                     Ok(response_payload(
                         CHAT_RESPONSE_CODEC_ID,
                         request.output_kind,
@@ -243,23 +395,131 @@ impl ModelProvider for ChatCompletionsProvider {
     }
 }
 
-fn emit_chunk_deltas(events: &ModelEventSink, chunk: &Value) {
+#[derive(Clone, Copy, Default)]
+struct DeltaSummary {
+    text_bytes: u64,
+    reasoning_bytes: u64,
+    tool_call_count: u64,
+    tool_argument_bytes: u64,
+}
+
+impl DeltaSummary {
+    fn add(&mut self, other: Self) {
+        self.text_bytes = self.text_bytes.saturating_add(other.text_bytes);
+        self.reasoning_bytes = self.reasoning_bytes.saturating_add(other.reasoning_bytes);
+        self.tool_call_count = self.tool_call_count.saturating_add(other.tool_call_count);
+        self.tool_argument_bytes = self
+            .tool_argument_bytes
+            .saturating_add(other.tool_argument_bytes);
+    }
+}
+
+fn summarize_chunk(chunk: &Value) -> DeltaSummary {
+    let mut summary = DeltaSummary::default();
     let Some(choices) = chunk.get("choices").and_then(Value::as_array) else {
-        return;
+        return summary;
     };
     for delta in choices
         .iter()
         .filter_map(|choice| choice.get("delta").and_then(Value::as_object))
     {
-        if let Some(text) = delta.get("content").and_then(Value::as_str) {
-            events.emit(ModelDelta::Text(text.to_owned()));
-        }
+        summary.text_bytes = summary.text_bytes.saturating_add(
+            delta
+                .get("content")
+                .and_then(Value::as_str)
+                .map_or(0, |text| text.len() as u64),
+        );
         for field in ["reasoning_content", "reasoning", "thinking"] {
-            if let Some(text) = delta.get(field).and_then(Value::as_str) {
-                events.emit(ModelDelta::Reasoning(text.to_owned()));
+            summary.reasoning_bytes = summary.reasoning_bytes.saturating_add(
+                delta
+                    .get(field)
+                    .and_then(Value::as_str)
+                    .map_or(0, |text| text.len() as u64),
+            );
+        }
+        if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
+            summary.tool_call_count = summary.tool_call_count.saturating_add(calls.len() as u64);
+            for call in calls {
+                summary.tool_argument_bytes = summary.tool_argument_bytes.saturating_add(
+                    call.pointer("/function/arguments")
+                        .and_then(Value::as_str)
+                        .map_or(0, |arguments| arguments.len() as u64),
+                );
             }
         }
     }
+    summary
+}
+
+const fn provider_error_kind(error: &ProviderError) -> &'static str {
+    match error {
+        ProviderError::UnexpectedRequestCodec { .. } => "unexpected_request_codec",
+        ProviderError::InvalidRequest { .. } => "invalid_request",
+        ProviderError::Http(_) => "http",
+        ProviderError::HttpStatus { .. } => "http_status",
+        ProviderError::InvalidEventStream { .. } => "invalid_event_stream",
+        ProviderError::InvalidEventJson { .. } => "invalid_event_json",
+        ProviderError::Api { .. } => "api",
+        ProviderError::MissingTerminal { .. } => "missing_terminal",
+    }
+}
+
+fn emit_chunk_deltas(events: &ModelEventSink, chunk: &Value) {
+    for delta in chunk_deltas(chunk) {
+        events.emit(delta);
+    }
+}
+
+fn chunk_deltas(chunk: &Value) -> Vec<ModelDelta> {
+    let mut output = Vec::new();
+    let Some(choices) = chunk.get("choices").and_then(Value::as_array) else {
+        return output;
+    };
+    for delta in choices
+        .iter()
+        .filter_map(|choice| choice.get("delta").and_then(Value::as_object))
+    {
+        if let Some(text) = delta
+            .get("content")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+        {
+            output.push(ModelDelta::Text(text.to_owned()));
+        }
+        for field in ["reasoning_content", "reasoning", "thinking"] {
+            if let Some(text) = delta
+                .get(field)
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+            {
+                output.push(ModelDelta::Reasoning(text.to_owned()));
+            }
+        }
+        if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
+            for (position, call) in calls.iter().enumerate() {
+                let index = call
+                    .get("index")
+                    .and_then(Value::as_u64)
+                    .and_then(|index| usize::try_from(index).ok())
+                    .unwrap_or(position);
+                let function = call.get("function");
+                output.push(ModelDelta::ToolCall(ToolCallDelta {
+                    index,
+                    call_id: call.get("id").and_then(Value::as_str).map(str::to_owned),
+                    name: function
+                        .and_then(|function| function.get("name"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    arguments: function
+                        .and_then(|function| function.get("arguments"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                }));
+            }
+        }
+    }
+    output
 }
 
 /// Pure Chat Completions request/replay codec.
@@ -356,7 +616,10 @@ impl ModelCodec for ChatCompletionsCodec {
         ))
     }
 
-    fn interpret_response(&self, response: &EncodedPayload) -> Result<ModelDirective, Self::Error> {
+    fn project_response(
+        &self,
+        response: &EncodedPayload,
+    ) -> Result<ModelResponseProjection, Self::Error> {
         let (output_kind, message, finish_reason) = response_message(response)?;
         if let Some(reason) = finish_reason
             && !matches!(reason.as_str(), "stop" | "tool_calls" | "function_call")
@@ -371,15 +634,18 @@ impl ModelCodec for ChatCompletionsCodec {
                 message: "the model requested more than one eval".to_owned(),
             });
         }
-        if let Some(call) = calls.first() {
+        let display = response_display_deltas(response, &message, &calls);
+        let directive = if let Some(call) = calls.first() {
             if call.name != "eval" {
                 return Err(CodecError::InvalidDirective {
                     message: format!("the model requested unsupported function `{}`", call.name),
                 });
             }
-            return parse_eval_arguments(&call.arguments).map(ModelDirective::Eval);
-        }
-        output_value(output_kind, message_text(&message)?).map(ModelDirective::Output)
+            parse_eval_arguments(&call.arguments).map(ModelDirective::Eval)?
+        } else {
+            output_value(output_kind, message_text(&message)?).map(ModelDirective::Output)?
+        };
+        Ok(ModelResponseProjection { display, directive })
     }
 
     fn response_metadata(&self, response: &EncodedPayload) -> ModelResponseMetadata {
@@ -467,7 +733,7 @@ fn encode_context(context: &[ProjectedContextEntry]) -> Result<Vec<Value>, Codec
                 native.push(json!({ "role": role, "content": message.text }));
             }
         } else if is_codec(payload, CHAT_RESPONSE_CODEC_ID, CODEC_VERSION) {
-            let (_, message, _) = response_message(payload)?;
+            let (_, mut message, _) = response_message(payload)?;
             let calls = tool_calls(&message)?;
             if calls.len() > 1 {
                 return Err(CodecError::InvalidPayload {
@@ -477,6 +743,7 @@ fn encode_context(context: &[ProjectedContextEntry]) -> Result<Vec<Value>, Codec
             if let Some(call) = calls.first() {
                 pending_eval = Some(call.id.clone());
             }
+            omit_null_request_fields(&mut message);
             native.push(message);
         } else if is_codec(payload, LAM_EVAL_CODEC_ID, LAM_CODEC_VERSION) {
             let tool_call_id = pending_eval
@@ -496,6 +763,17 @@ fn encode_context(context: &[ProjectedContextEntry]) -> Result<Vec<Value>, Codec
         });
     }
     Ok(native)
+}
+
+fn omit_null_request_fields(message: &mut Value) {
+    let Some(message) = message.as_object_mut() else {
+        return;
+    };
+    for field in ["tool_calls", "reasoning_content", "reasoning", "thinking"] {
+        if message.get(field).is_some_and(Value::is_null) {
+            message.remove(field);
+        }
+    }
 }
 
 fn compaction_replacement_codec() -> CodecRef {
@@ -613,6 +891,41 @@ fn response_message(
     }
 }
 
+fn response_display_deltas(
+    response: &EncodedPayload,
+    message: &Value,
+    calls: &[ToolCall],
+) -> Vec<ModelDelta> {
+    if let Some(chunks) = response.value.get("chunks").and_then(Value::as_array) {
+        return chunks.iter().flat_map(chunk_deltas).collect();
+    }
+
+    let mut deltas = Vec::new();
+    for field in ["reasoning_content", "reasoning", "thinking"] {
+        if let Some(reasoning) = message
+            .get(field)
+            .and_then(Value::as_str)
+            .filter(|reasoning| !reasoning.is_empty())
+        {
+            deltas.push(ModelDelta::Reasoning(reasoning.to_owned()));
+        }
+    }
+    if let Ok(text) = message_text(message)
+        && !text.is_empty()
+    {
+        deltas.push(ModelDelta::Text(text));
+    }
+    deltas.extend(calls.iter().enumerate().map(|(index, call)| {
+        ModelDelta::ToolCall(ToolCallDelta {
+            index,
+            call_id: Some(call.id.clone()),
+            name: Some(call.name.clone()),
+            arguments: call.arguments.clone(),
+        })
+    }));
+    deltas
+}
+
 fn streamed_finish_reason(chunks: &[Value]) -> Option<String> {
     chunks
         .iter()
@@ -664,10 +977,15 @@ fn merge_message_delta(target: &mut Value, delta: &Value) -> Result<(), CodecErr
     let target = target
         .as_object_mut()
         .expect("message accumulator is an object");
+    match streamed_tool_calls(delta)? {
+        StreamedToolCalls::Missing => {}
+        StreamedToolCalls::Null => {
+            target.entry("tool_calls".to_owned()).or_insert(Value::Null);
+        }
+        StreamedToolCalls::Array(calls) => merge_tool_call_deltas(target, calls)?,
+    }
     for (key, incoming) in delta {
-        if key == "tool_calls" {
-            merge_tool_call_deltas(target, incoming)?;
-        } else {
+        if key != "tool_calls" {
             merge_value(
                 target.entry(key.clone()).or_insert(Value::Null),
                 incoming,
@@ -678,18 +996,34 @@ fn merge_message_delta(target: &mut Value, delta: &Value) -> Result<(), CodecErr
     Ok(())
 }
 
+enum StreamedToolCalls<'a> {
+    Missing,
+    Null,
+    Array(&'a [Value]),
+}
+
+fn streamed_tool_calls(delta: &Map<String, Value>) -> Result<StreamedToolCalls<'_>, CodecError> {
+    match delta.get("tool_calls") {
+        None => Ok(StreamedToolCalls::Missing),
+        Some(Value::Null) => Ok(StreamedToolCalls::Null),
+        Some(Value::Array(calls)) => Ok(StreamedToolCalls::Array(calls)),
+        Some(_) => Err(CodecError::InvalidPayload {
+            message: "streamed tool_calls is not an array or null".to_owned(),
+        }),
+    }
+}
+
 fn merge_tool_call_deltas(
     message: &mut Map<String, Value>,
-    incoming: &Value,
+    incoming: &[Value],
 ) -> Result<(), CodecError> {
-    let incoming = incoming
-        .as_array()
-        .ok_or_else(|| CodecError::InvalidPayload {
-            message: "streamed tool_calls is not an array".to_owned(),
-        })?;
     let target = message
         .entry("tool_calls".to_owned())
-        .or_insert_with(|| Value::Array(Vec::new()))
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if target.is_null() {
+        *target = Value::Array(Vec::new());
+    }
+    let target = target
         .as_array_mut()
         .ok_or_else(|| CodecError::InvalidPayload {
             message: "accumulated tool_calls is not an array".to_owned(),
@@ -801,6 +1135,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn empty_streamed_text_is_a_noop_but_whitespace_is_preserved() {
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let output = std::sync::Arc::clone(&captured);
+        let events = ModelEventSink::new(move |delta| output.lock().unwrap().push(delta));
+
+        emit_chunk_deltas(
+            &events,
+            &json!({
+                "choices": [{
+                    "delta": {
+                        "content": "",
+                        "reasoning_content": "",
+                        "role": "assistant"
+                    }
+                }]
+            }),
+        );
+        emit_chunk_deltas(
+            &events,
+            &json!({
+                "choices": [{
+                    "delta": {
+                        "content": " ",
+                        "reasoning_content": "\n"
+                    }
+                }]
+            }),
+        );
+
+        assert_eq!(
+            *captured.lock().unwrap(),
+            [
+                ModelDelta::Text(" ".to_owned()),
+                ModelDelta::Reasoning("\n".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
     fn assembles_reasoning_and_tool_arguments_without_losing_extensions() {
         let chunks = vec![
             json!({
@@ -842,5 +1215,105 @@ mod tests {
             "{\"source\":\"1+1\"}"
         );
         assert!(message["tool_calls"][0].get("index").is_none());
+    }
+
+    #[test]
+    fn distinguishes_missing_null_and_array_tool_call_deltas() {
+        let missing = Map::new();
+        assert!(matches!(
+            streamed_tool_calls(&missing).expect("missing is valid"),
+            StreamedToolCalls::Missing
+        ));
+
+        let null = json!({ "tool_calls": null });
+        assert!(matches!(
+            streamed_tool_calls(null.as_object().expect("object")).expect("null is valid"),
+            StreamedToolCalls::Null
+        ));
+
+        let array = json!({ "tool_calls": [] });
+        assert!(matches!(
+            streamed_tool_calls(array.as_object().expect("object")).expect("array is valid"),
+            StreamedToolCalls::Array([])
+        ));
+    }
+
+    #[test]
+    fn assembles_text_when_streamed_tool_calls_is_null() {
+        let chunks = vec![
+            json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "role": "assistant",
+                        "content": "complete response",
+                        "reasoning_content": null,
+                        "tool_calls": null
+                    }
+                }]
+            }),
+            json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop"
+                }]
+            }),
+        ];
+
+        let message = assemble_message(&chunks).expect("null tool_calls is valid");
+        assert_eq!(message["content"], "complete response");
+        assert!(message["reasoning_content"].is_null());
+        assert!(message["tool_calls"].is_null());
+    }
+
+    #[test]
+    fn tool_call_array_supersedes_an_explicit_null_without_losing_the_distinction() {
+        let chunks = vec![
+            json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": { "tool_calls": null }
+                }]
+            }),
+            json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "call_1",
+                            "type": "function",
+                            "function": { "name": "eval", "arguments": "{}" }
+                        }]
+                    }
+                }]
+            }),
+            json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": { "tool_calls": null }
+                }]
+            }),
+        ];
+
+        let message = assemble_message(&chunks).expect("array supersedes null");
+        assert_eq!(message["tool_calls"][0]["id"], "call_1");
+    }
+
+    #[test]
+    fn rejects_non_array_non_null_streamed_tool_calls() {
+        let chunks = vec![json!({
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "content": "response",
+                    "tool_calls": {}
+                }
+            }]
+        })];
+
+        let error = assemble_message(&chunks).expect_err("object tool_calls must be rejected");
+        assert!(error.to_string().contains("not an array or null"));
     }
 }

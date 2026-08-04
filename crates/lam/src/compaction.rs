@@ -121,8 +121,9 @@ where
             let metadata = self.codec.response_metadata(&response);
             let directive = self
                 .codec
-                .interpret_response(&response)
-                .map_err(|error| CompactionError::new(error.to_string()))?;
+                .project_response(&response)
+                .map_err(|error| CompactionError::new(error.to_string()))?
+                .directive;
             let ModelDirective::Output(Value::String(summary)) = directive else {
                 return Err(CompactionError::new(
                     "summary model did not return one text completion",
@@ -294,12 +295,6 @@ pub(crate) fn estimated_context_tokens(
         .filter(|entry| matches!(entry.entry.transition, ContextTransition::Compaction { .. }))
         .map(|entry| entry.sequence)
         .max();
-    let full_estimate = context
-        .iter()
-        .map(estimated_visible_entry_tokens)
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .fold(0_u64, u64::saturating_add);
     let Some((anchor_index, usage)) =
         context.iter().enumerate().rev().find_map(|(index, entry)| {
             (matches!(entry.entry.transition, ContextTransition::Model { .. })
@@ -309,15 +304,20 @@ pub(crate) fn estimated_context_tokens(
             .map(|usage| (index, usage))
         })
     else {
-        return Ok(full_estimate);
+        return context
+            .iter()
+            .map(estimated_visible_entry_tokens)
+            .try_fold(0_u64, |total, estimate| {
+                estimate.map(|estimate| total.saturating_add(estimate))
+            });
     };
     let suffix = context[anchor_index + 1..]
         .iter()
         .map(estimated_visible_entry_tokens)
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .fold(0_u64, u64::saturating_add);
-    Ok(full_estimate.max(usage.total_tokens.saturating_add(suffix)))
+        .try_fold(0_u64, |total, estimate| {
+            estimate.map(|estimate| total.saturating_add(estimate))
+        })?;
+    Ok(usage.total_tokens.saturating_add(suffix))
 }
 
 fn selected_compaction(

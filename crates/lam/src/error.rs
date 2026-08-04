@@ -99,6 +99,9 @@ pub enum ActorError {
     /// Forceful actor cancellation stopped the current operation.
     #[error("the actor operation was aborted")]
     Aborted,
+    /// A recoverable host interruption durably closed the active run.
+    #[error("the actor run was interrupted")]
+    Interrupted,
     /// The dedicated actor thread could not be joined cleanly.
     #[error("failed to join the actor runner: {message}")]
     RunnerJoin {

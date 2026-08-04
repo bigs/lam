@@ -476,11 +476,11 @@ let structured: Review = actor.call(input).output::<Review>().await?;
 `call` starts a new correlated run and waits for its tool-calling loop to
 finish. It supports text and schema-constrained structured output.
 
-**Settled for Slice 3.** `Actor` is a non-cloneable linear owner, while
-`ActorRef` is a cloneable mailbox address exposing `send`. `Actor::call`
-requires `&mut self` and returns a `Run<'_, T>` which holds that mutable borrow,
-preventing overlapping calls through safe Rust while cloned references remain
-available for steering.
+**Updated after Slice 6.** `Actor` is the non-cloneable lifecycle and event
+owner. `ActorHandle` is cloneable correlated-operation authority, while
+`ActorRef` remains a cloneable send-only mailbox address. Calls return owned
+`Run<T>` values; a shared operation lease rejects overlapping calls,
+compactions, and model switches with `ActorError::Busy`.
 
 `Run<T>` is both a `Future<Output = Result<T, _>>` and a stream of ephemeral
 runtime events. Ignoring the stream never blocks the actor. Text is the default
@@ -1339,8 +1339,9 @@ outcomes use the `lam/eval@1` context codec.
 
 The slice has one actor and one dedicated runner thread. It does not include
 subagents, actor-to-actor routing, child lifecycle, or the eventual scheduler.
-`Actor` is linear for calls; cloneable `ActorRef` values remain available for
-mailbox delivery. Dropping a started run only detaches its consumer.
+The later `ActorHandle` API provides cloneable correlated operations;
+`ActorRef` remains available for send-only mailbox delivery. Dropping a started
+run only detaches its consumer.
 
 The essential end-to-end test is:
 
@@ -1408,6 +1409,32 @@ outcome unknown after restart. Process-local `call` waiters are not recoverable
 after process death, so autonomously recovered work uses the ordinary text
 output contract. Durable attachable jobs with persisted output contracts remain
 a possible future API.
+
+#### Slice 4C: recoverable single-actor interruption
+
+**Implemented.**
+
+`ActorHandle::interrupt` is out-of-band control over the process-local active
+run. It is distinct from shutdown and abort: provider and compactor futures are
+dropped, active JavaScript is terminated, and the actor remains available for
+later calls. V8 interruption covers the race where an immediately completed
+Rust builtin hands control back to synchronous JavaScript; an interrupted
+isolate generation is discarded and replaced before the operation returns.
+
+The durable boundary is one compare-and-append batch. It admits a structured
+`runInterrupted` notice from `lam/runtime`, records an explicit failed
+`lam/eval` result when a native eval request was durable but unfinished, and
+appends `ContextTransition::Interrupted` to consume pending steering plus the
+notice and permanently close the run. Partial provider text, reasoning, and
+tool-call JSON remain ephemeral and are discarded. If a terminal model output
+was already committed, ordinary completion wins and no interruption boundary
+is appended.
+
+The same actor can begin a new run after interruption. Both OpenAI Responses
+and Chat Completions replay the explicit eval failure and runtime notice using
+their native tool-result and system/developer message forms. Tree-wide fan-out
+and descendant retirement are implemented by the higher-level scheduler; the
+TUI exposes the boundary through a deliberate double-Escape interaction.
 
 ### Slice 5: real provider codec
 
@@ -1612,6 +1639,14 @@ the owned subtree. Background outcomes enter the parent's ordinary durable
 mailbox and wake or steer it. Direct-child `stop`, host-side `wait`, actor-wide
 run streams, and one addressed system event stream complete the lifecycle
 surface needed by an embedding TUI.
+
+**Slice 7C implemented.** Recoverable tree interruption marks an exclusive
+subtree boundary, prevents new descendant launches, and signals all resident
+actors deepest-first before awaiting their durable results. Active runs each
+commit the Slice 4C terminal boundary. Descendants then retire gracefully and
+release residency while the addressed root remains available. Dropped call
+guards cannot escalate recoverable child interruption into abort, and outcomes
+from interrupted detached work are not delivered back into the root mailbox.
 
 There is intentionally no model-visible `wait`: synchronous work uses `call`,
 while `spawn` is detached and pushes completion without polling or duplicate

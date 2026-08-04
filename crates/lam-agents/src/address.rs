@@ -69,6 +69,10 @@ impl ActorAddress {
             .strip_prefix(ancestor.as_str())
             .is_some_and(|suffix| suffix.starts_with('/'))
     }
+
+    pub(crate) fn depth(&self) -> usize {
+        self.0.bytes().filter(|byte| *byte == b'/').count()
+    }
 }
 
 impl fmt::Display for ActorAddress {

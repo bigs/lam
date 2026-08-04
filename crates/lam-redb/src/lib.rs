@@ -27,7 +27,11 @@ impl RedbStore {
     /// Opens an existing database.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, RedbStoreError> {
         let database = Database::open(path).map_err(database_error)?;
-        Self::initialize(database)
+        let read = database.begin_read().map_err(database_error)?;
+        read.open_table(HEADS).map_err(database_error)?;
+        read.open_table(EVENTS).map_err(database_error)?;
+        drop(read);
+        Ok(Self { database })
     }
 
     fn initialize(database: Database) -> Result<Self, RedbStoreError> {
@@ -38,6 +42,22 @@ impl RedbStore {
         }
         write.commit().map_err(database_error)?;
         Ok(Self { database })
+    }
+
+    /// Lists actor journals in canonical actor-ID order.
+    pub fn actor_ids(&self) -> Result<Vec<ActorId>, RedbStoreError> {
+        let read = self.database.begin_read().map_err(database_error)?;
+        let heads = read.open_table(HEADS).map_err(database_error)?;
+        heads
+            .iter()
+            .map_err(database_error)?
+            .map(|item| {
+                let (actor, _) = item.map_err(database_error)?;
+                ActorId::new(actor.value()).map_err(|error| RedbStoreError::ActorId {
+                    message: error.to_string(),
+                })
+            })
+            .collect()
     }
 
     fn read_page(
@@ -152,7 +172,7 @@ impl JournalStore for RedbStore {
     }
 }
 
-/// A redb operation or actor-event serialization failed.
+/// A redb operation, actor-event serialization, or stored-key validation failed.
 #[derive(Debug, thiserror::Error)]
 pub enum RedbStoreError {
     /// The embedded database rejected an operation.
@@ -161,6 +181,12 @@ pub enum RedbStoreError {
     /// An actor event could not cross the JSON storage boundary.
     #[error("actor event serialization failed: {0}")]
     Serialization(#[from] serde_json::Error),
+    /// A stored actor key violated Lam's actor-ID contract.
+    #[error("stored actor id is invalid: {message}")]
+    ActorId {
+        /// Identifier validation failure.
+        message: String,
+    },
 }
 
 fn database_error(error: impl Into<redb::Error>) -> RedbStoreError {

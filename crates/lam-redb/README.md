@@ -49,7 +49,7 @@ model-specific schemas; those remain pure logic in `lam-core`.
 A head mismatch returns `AppendOutcome::Conflict` rather than partially writing
 the batch. Revision exhaustion and backend failures use the generic
 `JournalError` boundary. `RedbStoreError` distinguishes database failures from
-actor-event serialization failures.
+actor-event serialization failures and invalid stored actor IDs.
 
 The `JournalStore` methods are async for backend interchangeability, while the
 current redb operations complete synchronously inside each call.

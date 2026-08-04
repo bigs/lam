@@ -2,10 +2,10 @@
 
 mod support;
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier, mpsc};
 use std::task::Poll;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use lam::{
     Actor, ActorError, CompactionArtifact, CompactionConfig, CompactionOutput, CompactionPlan,
@@ -38,6 +38,41 @@ impl Compactor for InvalidCutCompactor {
                 strategy: "invalid-cut".to_owned(),
                 covers_through: ContextSequence::new(2),
                 output: CompactionOutput::Artifact(CompactionArtifact::summary("invalid")),
+                source: None,
+                metadata: ModelResponseMetadata::default(),
+            })
+        })
+    }
+}
+
+struct InterruptibleCompactor {
+    started: mpsc::Sender<()>,
+    dropped: Arc<AtomicBool>,
+    calls: AtomicUsize,
+}
+
+struct DropFlag(Arc<AtomicBool>);
+
+impl Drop for DropFlag {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+impl Compactor for InterruptibleCompactor {
+    fn compact<'a>(&'a self, request: &'a CompactionRequest) -> lam::CompactionFuture<'a> {
+        let first = self.calls.fetch_add(1, Ordering::AcqRel) == 0;
+        let covers_through = request.units.last().unwrap().covers_through();
+        Box::pin(async move {
+            if first {
+                let _drop_flag = DropFlag(Arc::clone(&self.dropped));
+                let _ = self.started.send(());
+                return std::future::pending().await;
+            }
+            Ok(CompactionPlan {
+                strategy: "interruption-retry".to_owned(),
+                covers_through,
+                output: CompactionOutput::Artifact(CompactionArtifact::summary("resumed")),
                 source: None,
                 metadata: ModelResponseMetadata::default(),
             })
@@ -147,7 +182,7 @@ async fn new_actor_starts_with_one_durable_model_selection() {
     assert_eq!(state.selected_model().unwrap().model_id.as_str(), "primary");
 }
 
-async fn wait_for_model_start(run: &mut Run<'_, String>) {
+async fn wait_for_model_start(run: &mut Run<String>) {
     loop {
         match run.next().await {
             Some(RunEvent::ModelStarted { .. }) => return,
@@ -528,6 +563,131 @@ async fn post_compaction_estimate_ignores_usage_from_before_the_marker() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn provider_usage_is_authoritative_over_large_durable_payloads() {
+    let provider =
+        ScriptedProvider::new([output_with_usage("x".repeat(20_000), 100), output("done")]);
+    let config = CompactionConfig::default()
+        .context_window_tokens(1_000)
+        .trigger_at(ContextAmount::Tokens(500))
+        .retain(ContextAmount::Tokens(0))
+        .summary_reserve_tokens(100);
+    let mut actor = Lam::builder(Model::new(provider.clone(), ScriptedCodec))
+        .compaction_config(config)
+        .build()
+        .actor("usage-anchor")
+        .build()
+        .await
+        .unwrap();
+    let actor_ref = actor.actor_ref();
+
+    assert_eq!(actor.call("one").await.unwrap(), "x".repeat(20_000));
+    assert_eq!(actor.call("two").await.unwrap(), "done");
+
+    assert_eq!(provider.requests().len(), 2);
+    assert!(
+        actor_ref
+            .state()
+            .await
+            .unwrap()
+            .context()
+            .iter()
+            .all(|entry| {
+                !matches!(entry.entry.transition, ContextTransition::Compaction { .. })
+            })
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn unmetered_suffix_is_added_to_provider_usage() {
+    let provider = ScriptedProvider::new([
+        output_with_usage("first", 450),
+        output("summary"),
+        output("done"),
+    ]);
+    let config = CompactionConfig::default()
+        .context_window_tokens(1_000)
+        .trigger_at(ContextAmount::Tokens(500))
+        .retain(ContextAmount::Tokens(0))
+        .summary_reserve_tokens(100);
+    let mut actor = Lam::builder(Model::new(provider.clone(), ScriptedCodec))
+        .compaction_config(config)
+        .build()
+        .actor("usage-suffix")
+        .build()
+        .await
+        .unwrap();
+    let actor_ref = actor.actor_ref();
+
+    assert_eq!(actor.call("one").await.unwrap(), "first");
+    assert_eq!(actor.call("x".repeat(600)).await.unwrap(), "done");
+
+    assert_eq!(provider.requests().len(), 3);
+    assert!(
+        actor_ref
+            .state()
+            .await
+            .unwrap()
+            .context()
+            .iter()
+            .any(|entry| {
+                matches!(entry.entry.transition, ContextTransition::Compaction { .. })
+            })
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn automatic_compaction_uses_the_selected_models_context_window() {
+    let wide = ScriptedProvider::new([output_with_usage("wide first", 500), output("wide second")]);
+    let narrow = ScriptedProvider::new([
+        output("narrow summary"),
+        output_with_usage("narrow answer", 500),
+    ]);
+    let config = CompactionConfig::default()
+        .retain(ContextAmount::Tokens(0))
+        .summary_reserve_tokens(50);
+    let mut actor =
+        Lam::builder(Model::new(wide.clone(), ScriptedCodec).with_context_window_tokens(1_000))
+            .initial_model_id("wide")
+            .model(
+                "narrow",
+                Model::new(narrow.clone(), ScriptedCodec).with_context_window_tokens(400),
+            )
+            .compaction_config(config)
+            .build()
+            .actor("model-windows")
+            .build()
+            .await
+            .unwrap();
+    let actor_ref = actor.actor_ref();
+
+    assert_eq!(actor.call("first").await.unwrap(), "wide first");
+    actor
+        .switch_model_with_policy("narrow", ModelSwitchPolicy::ReuseContext)
+        .await
+        .unwrap();
+    assert_eq!(actor.call("second").await.unwrap(), "narrow answer");
+    actor
+        .switch_model_with_policy("wide", ModelSwitchPolicy::ReuseContext)
+        .await
+        .unwrap();
+    assert_eq!(actor.call("third").await.unwrap(), "wide second");
+
+    assert_eq!(narrow.requests().len(), 2);
+    assert_eq!(wide.requests().len(), 2);
+    assert_eq!(
+        actor_ref
+            .state()
+            .await
+            .unwrap()
+            .context()
+            .iter()
+            .filter(|entry| matches!(entry.entry.transition, ContextTransition::Compaction { .. }))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn rejected_materialized_replacement_is_never_persisted() {
     let provider = ScriptedProvider::new([output("first"), output("summary")]);
     let mut actor = Lam::builder(Model::new(provider, RejectingCompactionCodec))
@@ -667,6 +827,57 @@ async fn threshold_compaction_is_transparent_and_emits_run_events() {
         state.context()[1].entry.transition,
         ContextTransition::Compaction { .. }
     ));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn interruption_drops_automatic_compaction_and_keeps_the_actor_resumable() {
+    let (started_sender, started_receiver) = mpsc::channel();
+    let dropped = Arc::new(AtomicBool::new(false));
+    let provider = ScriptedProvider::new([output("resumed")]);
+    let config = CompactionConfig::default()
+        .context_window_tokens(400)
+        .trigger_at(ContextAmount::Tokens(100))
+        .retain(ContextAmount::Tokens(0))
+        .summary_reserve_tokens(50);
+    let mut actor = Lam::builder(Model::new(provider, ScriptedCodec))
+        .compactor(InterruptibleCompactor {
+            started: started_sender,
+            dropped: Arc::clone(&dropped),
+            calls: AtomicUsize::new(0),
+        })
+        .compaction_config(config)
+        .build()
+        .actor("compaction-interruption")
+        .build()
+        .await
+        .expect("fixture actor should build");
+    let handle = actor.handle();
+    let interrupt_thread = std::thread::spawn(move || {
+        started_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("automatic compaction should start");
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(handle.interrupt())
+            .expect("interruption should become durable")
+            .expect("one run should be active")
+    });
+
+    let started_at = Instant::now();
+    assert_eq!(
+        actor.call("x".repeat(600)).await.unwrap_err(),
+        ActorError::Interrupted
+    );
+    let receipt = interrupt_thread
+        .join()
+        .expect("interrupt thread should finish");
+    assert!(started_at.elapsed() < Duration::from_secs(3));
+    assert_eq!(receipt.isolate_state, lam::IsolateState::Retained);
+    assert!(dropped.load(Ordering::Acquire));
+
+    assert_eq!(actor.call("continue").await.unwrap(), "resumed");
+    actor.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -845,6 +1056,8 @@ async fn default_system_prompt_describes_the_installed_manifest() {
         .as_str()
         .expect("scripted codec records the system prompt");
     assert!(prompt.starts_with("You are a coding agent with one tool, `eval`"));
+    assert!(prompt.contains("not a general Node.js or Deno runtime"));
+    assert!(prompt.contains("Do not import modules or call unlisted platform globals."));
     assert!(prompt.contains("`lam.dir(query?: { path?: string })"));
     assert!(prompt.contains("`lam.result<T extends JsonValue>(value: T): T`"));
     assert!(
@@ -1151,6 +1364,30 @@ async fn dropping_a_run_detaches_without_permitting_an_overlapping_call() {
             ..
         }
     ));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cloned_actor_handles_share_exclusive_operation_admission() {
+    let gate = Arc::new(Barrier::new(2));
+    let provider = ScriptedProvider::new([
+        gated_output(json!("first"), Arc::clone(&gate)),
+        output(json!("second")),
+    ]);
+    let actor = build_actor(provider, []).await;
+    let handle = actor.handle();
+    let other = handle.clone();
+    let mut first = handle.call("first");
+    wait_for_model_start(&mut first).await;
+
+    assert_eq!(
+        other.call("overlapping").await.unwrap_err(),
+        ActorError::Busy
+    );
+    assert_eq!(other.compact().await.unwrap_err(), ActorError::Busy);
+
+    gate.wait();
+    assert_eq!(first.await.unwrap(), "first");
+    assert_eq!(other.call("second").await.unwrap(), "second");
 }
 
 async fn wait_for_context(actor: &lam::ActorRef<MemStore>, count: usize) -> lam::ActorState {

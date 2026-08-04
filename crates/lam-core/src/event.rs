@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::{ContextEntry, MessageEnvelope, ModelSelection};
 
 /// Current serialized schema version for actor events.
-pub const ACTOR_EVENT_SCHEMA_VERSION: u32 = 2;
+pub const ACTOR_EVENT_SCHEMA_VERSION: u32 = 3;
 
 /// One versioned fact in an actor journal.
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]

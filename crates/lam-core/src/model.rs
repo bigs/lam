@@ -58,8 +58,11 @@ impl<'a> ModelRequestConfig<'a> {
 }
 
 /// One eval request computed from a provider-native response.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct EvalRequest {
+    /// Brief one-line explanation of what the program is intended to accomplish.
+    pub intent: String,
     /// TypeScript program to evaluate in the actor's persistent isolate.
     pub source: String,
     /// Optional model-requested timeout, still bounded by the host maximum.
@@ -75,7 +78,20 @@ pub enum ModelDirective {
     Output(Value),
 }
 
-/// Ephemeral model output suitable for interactive display.
+/// Provider-neutral projection of one completed native model response.
+///
+/// Display deltas preserve the response's visible text, reasoning, and tool
+/// call stream for interactive or historical presentation. The directive is
+/// the single semantic action consumed by the actor runtime.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModelResponseProjection {
+    /// Ordered visible output recovered from the completed response.
+    pub display: Vec<ModelDelta>,
+    /// The single runtime action represented by the completed response.
+    pub directive: ModelDirective,
+}
+
+/// Provider-neutral model output suitable for live or historical display.
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "kind", content = "delta", rename_all = "camelCase")]
 pub enum ModelDelta {
@@ -83,6 +99,27 @@ pub enum ModelDelta {
     Text(String),
     /// Visible reasoning or thinking text when a provider exposes it.
     Reasoning(String),
+    /// One streamed fragment of a native tool call.
+    ToolCall(ToolCallDelta),
+}
+
+/// Provider-neutral display view of an incrementally constructed tool call.
+///
+/// The index is stable only within one model response. Names and arguments are
+/// fragments and must be appended in arrival order.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolCallDelta {
+    /// Provider-native position of this call within the model response.
+    pub index: usize,
+    /// Provider-native call identity when the current fragment carries it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
+    /// Function-name fragment when the current fragment carries it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// JSON argument fragment, possibly empty while the call is introduced.
+    pub arguments: String,
 }
 
 /// Best-effort metadata computed from one completed provider response.
@@ -195,8 +232,12 @@ pub trait ModelCodec: Send + Sync + 'static {
         config: &ModelRequestConfig<'_>,
     ) -> Result<EncodedPayload, Self::Error>;
 
-    /// Interprets one untouched completed provider response.
-    fn interpret_response(&self, response: &EncodedPayload) -> Result<ModelDirective, Self::Error>;
+    /// Projects one untouched completed provider response into its ordered
+    /// display output and single semantic runtime action.
+    fn project_response(
+        &self,
+        response: &EncodedPayload,
+    ) -> Result<ModelResponseProjection, Self::Error>;
 
     /// Computes optional observability metadata from a native response.
     ///
