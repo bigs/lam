@@ -479,13 +479,6 @@ fn chunk_deltas(chunk: &Value) -> Vec<ModelDelta> {
         .iter()
         .filter_map(|choice| choice.get("delta").and_then(Value::as_object))
     {
-        if let Some(text) = delta
-            .get("content")
-            .and_then(Value::as_str)
-            .filter(|text| !text.is_empty())
-        {
-            output.push(ModelDelta::Text(text.to_owned()));
-        }
         for field in ["reasoning_content", "reasoning", "thinking"] {
             if let Some(text) = delta
                 .get(field)
@@ -494,6 +487,13 @@ fn chunk_deltas(chunk: &Value) -> Vec<ModelDelta> {
             {
                 output.push(ModelDelta::Reasoning(text.to_owned()));
             }
+        }
+        if let Some(text) = delta
+            .get("content")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+        {
+            output.push(ModelDelta::Text(text.to_owned()));
         }
         if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
             for (position, call) in calls.iter().enumerate() {
@@ -1167,8 +1167,26 @@ mod tests {
         assert_eq!(
             *captured.lock().unwrap(),
             [
-                ModelDelta::Text(" ".to_owned()),
                 ModelDelta::Reasoning("\n".to_owned()),
+                ModelDelta::Text(" ".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn reasoning_precedes_text_from_the_same_chunk() {
+        assert_eq!(
+            chunk_deltas(&json!({
+                "choices": [{
+                    "delta": {
+                        "content": "That's a great milestone",
+                        "reasoning_content": "."
+                    }
+                }]
+            })),
+            [
+                ModelDelta::Reasoning(".".to_owned()),
+                ModelDelta::Text("That's a great milestone".to_owned()),
             ]
         );
     }
