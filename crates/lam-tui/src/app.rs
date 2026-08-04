@@ -164,6 +164,9 @@ pub(crate) struct App {
     pub(crate) suggestion_index: usize,
     pub(crate) busy: bool,
     pub(crate) status: String,
+    /// Provider-reported context consumption (total_tokens) of the newest
+    /// completed model response for the current agent, when one exists.
+    pub(crate) context_tokens: Option<u64>,
     pub(crate) should_exit: bool,
     /// Visible click targets for the conversation, one per entry with at
     /// least one row in the viewport.
@@ -201,6 +204,7 @@ struct AgentConversation {
     follow_conversation_tail: bool,
     selection_drives_viewport: bool,
     status: String,
+    context_tokens: Option<u64>,
     parent: Option<String>,
     model: Option<String>,
     committed_len: usize,
@@ -284,6 +288,7 @@ impl App {
             suggestion_index: 0,
             busy: root_run_active,
             status: root.status,
+            context_tokens: root.context_tokens,
             should_exit: false,
             hitboxes: Vec::new(),
             current_agent: root.address,
@@ -327,6 +332,15 @@ impl App {
             .efforts
             .get(self.selected_efforts[model_index])
             .map(String::as_str)
+    }
+
+    /// Context window of the model driving the current agent, when known.
+    pub(crate) fn context_window_tokens(&self) -> Option<u64> {
+        let model = self
+            .current_agent_model()
+            .and_then(|id| self.models.iter().find(|model| model.registry_id == id))
+            .unwrap_or_else(|| self.selected_model());
+        (model.context_window > 0).then_some(model.context_window)
     }
 
     pub(crate) fn runtime_preferences(&self) -> RuntimePreferences {
@@ -1012,7 +1026,9 @@ impl App {
                     self.status = format!("{address} is preparing a tool call…");
                 }
             },
-            RunEvent::ModelCompleted { .. } => {}
+            RunEvent::ModelCompleted { metadata, .. } => {
+                self.context_tokens = metadata.usage.map(|usage| usage.total_tokens);
+            }
             RunEvent::EvalStarted { .. } => {
                 // The model turn that requested this eval committed before
                 // the event was emitted, so the fold that preceded this event
@@ -1122,7 +1138,14 @@ impl App {
         }
         self.ensure_agent(address, parent_address(address), "Working…");
         let owner = address.to_owned();
+        let context_tokens = outcome.context_tokens;
         self.with_agent(address, move |app| {
+            // A fold with no new model response reports `None`; keep the
+            // last known provider usage (e.g. the value seeded from the
+            // journal at startup) rather than clearing it.
+            if let Some(context_tokens) = context_tokens {
+                app.context_tokens = Some(context_tokens);
+            }
             let committed_runs = outcome
                 .rows
                 .iter()
@@ -1637,6 +1660,7 @@ impl App {
             follow_conversation_tail: self.follow_conversation_tail,
             selection_drives_viewport: self.selection_drives_viewport,
             status: std::mem::take(&mut self.status),
+            context_tokens: self.context_tokens,
             parent: self.current_parent.take(),
             model: self.current_model.take(),
             committed_len: self.committed_len,
@@ -1651,6 +1675,7 @@ impl App {
         self.follow_conversation_tail = next.follow_conversation_tail;
         self.selection_drives_viewport = next.selection_drives_viewport;
         self.status = next.status;
+        self.context_tokens = next.context_tokens;
         self.current_parent = next.parent;
         self.current_model = next.model;
         self.committed_len = next.committed_len;
@@ -1689,6 +1714,7 @@ impl AgentConversation {
             follow_conversation_tail: true,
             selection_drives_viewport: true,
             status: status.to_owned(),
+            context_tokens: None,
             parent,
             model: None,
             committed_len: 0,
@@ -1707,6 +1733,7 @@ impl AgentConversation {
             follow_conversation_tail: true,
             selection_drives_viewport: true,
             status: history.status,
+            context_tokens: history.context_tokens,
             parent: history.parent,
             model: history.model,
             overlay_turn: 0,
@@ -2118,7 +2145,10 @@ mod tests {
     use crossterm::event::{
         KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
-    use lam::{EvalOutcome, EvalOutput, EvalValue, ModelDelta, RunEvent, RunId, ToolCallDelta};
+    use lam::{
+        EvalOutcome, EvalOutput, EvalValue, ModelDelta, ModelResponseMetadata, RunEvent, RunId,
+        TokenUsage, ToolCallDelta,
+    };
     use lam_agents::{ActorAddress, AgentOutcome, AgentSystemEvent};
 
     use super::{
@@ -3945,6 +3975,67 @@ mod tests {
 
         assert_eq!(app.selected_entry, Some(entry));
         assert!(app.entries[entry].expanded);
+    }
+
+    #[test]
+    fn model_completed_records_provider_usage() {
+        let mut app = app();
+        app.apply_agent_event(AgentSystemEvent::Run {
+            address: ActorAddress::new("/root").unwrap(),
+            event: RunEvent::ModelCompleted {
+                run_id: RunId::new("run-1").unwrap(),
+                metadata: ModelResponseMetadata {
+                    usage: Some(TokenUsage {
+                        input_tokens: 10_000,
+                        cached_input_tokens: None,
+                        output_tokens: 2_345,
+                        reasoning_tokens: None,
+                        total_tokens: 12_345,
+                        native: serde_json::Value::Null,
+                    }),
+                    ..ModelResponseMetadata::default()
+                },
+            },
+        });
+        assert_eq!(app.context_tokens, Some(12_345));
+    }
+
+    #[test]
+    fn apply_fold_seeds_context_tokens() {
+        let mut app = app();
+        app.apply_fold(
+            "/root",
+            FoldOutcome {
+                context_tokens: Some(42),
+                ..FoldOutcome::default()
+            },
+        );
+        assert_eq!(app.context_tokens, Some(42));
+    }
+
+    #[test]
+    fn empty_fold_preserves_existing_context_tokens() {
+        let mut app = app();
+        app.context_tokens = Some(42);
+        // The projector already caught up at startup, so live folds report
+        // no new usage; the seeded value must survive them.
+        app.apply_fold("/root", FoldOutcome::default());
+        assert_eq!(app.context_tokens, Some(42));
+    }
+
+    #[test]
+    fn context_tokens_travel_with_the_agent() {
+        let mut app = app();
+        app.context_tokens = Some(7);
+        app.ensure_agent("/root/worker", Some("/root".to_owned()), "Ready");
+        app.with_agent("/root/worker", |app| {
+            assert_eq!(app.context_tokens, None);
+            app.context_tokens = Some(9);
+        });
+        assert_eq!(app.context_tokens, Some(7));
+        app.with_agent("/root/worker", |app| {
+            assert_eq!(app.context_tokens, Some(9))
+        });
     }
 
     #[test]

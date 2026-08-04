@@ -99,10 +99,7 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let cwd = elide_middle(&app.cwd, cwd_space);
     frame.render_widget(Block::default().style(Style::default().bg(PANEL)), area);
     let left = Line::from(vec![
-        Span::styled(
-            " λ lam ",
-            Style::default().fg(Color::Black).bg(ACCENT).bold(),
-        ),
+        Span::styled(" λ ", Style::default().fg(Color::Black).bg(ACCENT).bold()),
         Span::styled(cwd, Style::default().fg(DIM)),
     ]);
     frame.render_widget(Paragraph::new(left).style(Style::default().bg(PANEL)), area);
@@ -688,13 +685,29 @@ fn render_shelf(frame: &mut Frame<'_>, area: Rect, app: &mut App, suggestions: &
     } else {
         Style::default().fg(DIM)
     };
+    // ` message ` and ` working ` are the same width, so the context
+    // parenthetical stays in the same column across both states.
+    let mut title = if app.busy {
+        " working ".to_owned()
+    } else {
+        " message ".to_owned()
+    };
+    if let Some(consumed) = app.context_tokens
+        && let Some(window) = app.context_window_tokens()
+        && window > 0
+    {
+        let consumed = consumed.min(window);
+        let percent = consumed.saturating_mul(100) / window.max(1);
+        title.push_str(&format!(
+            "({percent}% · {}k/{}k) ",
+            consumed.saturating_add(500) / 1000,
+            window.saturating_add(500) / 1000,
+        ));
+    }
     let block = Block::default()
         .borders(Borders::TOP)
         .border_style(border_style)
-        .title(Span::styled(
-            if app.busy { " working " } else { " message " },
-            border_style,
-        ));
+        .title(Span::styled(title, border_style));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -1206,6 +1219,104 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("/root/worker"));
+    }
+
+    #[test]
+    fn header_shows_lambda_and_cwd_without_the_wordmark() {
+        let mut app = test_app(Vec::new());
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("λ /tmp/project"));
+        assert!(!rendered.contains("λ lam"));
+    }
+
+    #[test]
+    fn message_bar_reports_context_consumption() {
+        let mut app = test_app(Vec::new());
+        app.context_tokens = Some(123_456);
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains(" message (30% · 123k/400k) "));
+    }
+
+    #[test]
+    fn message_bar_omits_context_before_the_first_model_turn() {
+        let mut app = test_app(Vec::new());
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains(" message "));
+        assert!(!rendered.contains("tokens)"));
+    }
+
+    #[test]
+    fn message_bar_keeps_context_while_working() {
+        let mut app = test_app(Vec::new());
+        app.context_tokens = Some(123_456);
+        app.busy = true;
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains(" working (30% · 123k/400k) "));
+    }
+
+    #[test]
+    fn context_parenthetical_stays_aligned_between_states() {
+        let mut app = test_app(Vec::new());
+        app.context_tokens = Some(123_456);
+        let paren_column = |app: &mut App, label: &str| {
+            let backend = TestBackend::new(100, 24);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|frame| render(frame, app)).unwrap();
+            let content = terminal.backend().buffer().content();
+            let row = content
+                .chunks(100)
+                .position(|row| {
+                    row.iter()
+                        .map(|cell| cell.symbol())
+                        .collect::<String>()
+                        .contains(label)
+                })
+                .expect("the shelf title row should render");
+            content[row * 100..(row + 1) * 100]
+                .iter()
+                .position(|cell| cell.symbol() == "(")
+                .expect("the context parenthetical should render")
+        };
+        let message_column = paren_column(&mut app, " message (");
+        app.busy = true;
+        let working_column = paren_column(&mut app, " working (");
+        assert_eq!(message_column, working_column);
     }
 
     #[test]

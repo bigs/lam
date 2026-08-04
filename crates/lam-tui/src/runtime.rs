@@ -55,6 +55,9 @@ pub(crate) struct AgentHistory {
     pub(crate) model: Option<String>,
     pub(crate) status: String,
     pub(crate) run_completed: bool,
+    /// Provider-reported context consumption (total_tokens) of the newest
+    /// completed model response folded from the journal, when one exists.
+    pub(crate) context_tokens: Option<u64>,
     pub(crate) history: Vec<CommittedRow>,
 }
 
@@ -66,6 +69,7 @@ impl AgentHistory {
             model: None,
             status: "Ready".to_owned(),
             run_completed: true,
+            context_tokens: None,
             history,
         }
     }
@@ -150,6 +154,9 @@ pub(crate) struct CommittedRow {
 #[derive(Debug, Default)]
 pub(crate) struct FoldOutcome {
     pub(crate) rows: Vec<CommittedRow>,
+    /// Provider-reported context consumption (total_tokens) of the newest
+    /// completed model response folded by this pass, when one was present.
+    pub(crate) context_tokens: Option<u64>,
     /// Run id of every model turn committed by this fold, in order. Each one
     /// supersedes the oldest streaming overlay segment for that run.
     pub(crate) model_turns: Vec<String>,
@@ -271,6 +278,7 @@ impl Runtime {
                 &address,
                 state,
                 outcome.rows,
+                outcome.context_tokens,
                 address != "/root",
             ));
             projectors.insert(address, projector);
@@ -610,6 +618,23 @@ impl AnyModel {
             Self::ChatCompletions(model) => model.shared_parts().1.project_response(payload).ok(),
         }
     }
+
+    fn response_metadata(&self, payload: &lam::EncodedPayload) -> Option<ModelResponseMetadata> {
+        match self {
+            Self::Responses(model) => {
+                let codec = model.shared_parts().1;
+                (payload.codec.id.as_str() == lam_openai::responses::RESPONSE_CODEC_ID
+                    && payload.codec.version == lam_openai::responses::PAYLOAD_VERSION)
+                    .then(|| codec.response_metadata(payload))
+            }
+            Self::ChatCompletions(model) => {
+                let codec = model.shared_parts().1;
+                (payload.codec.id.as_str() == lam_openai::chat_completions::RESPONSE_CODEC_ID
+                    && payload.codec.version == lam_openai::chat_completions::PAYLOAD_VERSION)
+                    .then(|| codec.response_metadata(payload))
+            }
+        }
+    }
 }
 
 fn append_model_delta(history: &mut Vec<HistoryEntry>, address: &str, delta: ModelDelta) {
@@ -862,6 +887,13 @@ fn accumulate_entry(
             if *progress == RunProgress::Complete {
                 outcome.dead_runs.push(run_id.to_string());
             }
+            if let Some(usage) = models
+                .iter()
+                .find_map(|configured| configured.model.response_metadata(&entry.payload))
+                .and_then(|metadata| metadata.usage)
+            {
+                outcome.context_tokens = Some(usage.total_tokens);
+            }
         }
         ContextTransition::Interrupted { run_id, .. } => {
             outcome.dead_runs.push(run_id.to_string());
@@ -893,6 +925,7 @@ fn agent_history(
     address: &str,
     state: &ActorState,
     history: Vec<CommittedRow>,
+    context_tokens: Option<u64>,
     restored_child: bool,
 ) -> AgentHistory {
     let active = state.active_run().is_some();
@@ -923,6 +956,7 @@ fn agent_history(
             "Ready".to_owned()
         },
         run_completed: !active,
+        context_tokens,
         history,
     }
 }
@@ -1135,16 +1169,22 @@ mod tests {
     use lam::{
         ActorEvent, ActorId, ActorState, AppendOutcome, CodecId, CodecRef, ContextEntry,
         ContextTransition, DeliveryMode, EncodedPayload, EventBatch, InterruptionReason,
-        IsolateState, JournalStore, MessageEnvelope, MessageId, MessageSource, ModelDelta,
-        ModelDirective, ModelResponseProjection, Revision, RunId, RunProgress,
+        IsolateState, JournalStore, MessageEnvelope, MessageId, MessageSource, Model, ModelDelta,
+        ModelDescriptor, ModelDirective, ModelResponseProjection, Revision, RunId, RunProgress,
         SYSTEM_NOTICE_CODEC_ID, SYSTEM_NOTICE_CODEC_VERSION, SystemNotice, Timestamp,
     };
+    use lam_openai::chat_completions::{
+        ChatCompletions, PAYLOAD_VERSION as CHAT_PAYLOAD_VERSION,
+        RESPONSE_CODEC_ID as CHAT_RESPONSE_CODEC_ID,
+    };
+    use lam_openai::responses::{PAYLOAD_VERSION, RESPONSE_CODEC_ID, Responses};
     use lam_redb::RedbStore;
     use serde_json::json;
 
     use super::{
-        EffortControl, HistoryKind, Projector, append_model_projection, coding_instruction,
-        first_user_message, fold_projector, insert_json_path, runtime_notice,
+        AnyModel, ConfiguredModel, EffortCodec, EffortControl, HistoryKind, Projector,
+        append_model_projection, coding_instruction, first_user_message, fold_projector,
+        insert_json_path, runtime_notice,
     };
     use crate::config::ModelChoice;
     use crate::session::Session;
@@ -1273,6 +1313,240 @@ mod tests {
             .unwrap();
         assert!(outcome.rows.is_empty());
         assert!(outcome.consumed_message_ids.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fold_records_provider_usage_from_model_entries() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = RedbStore::create(directory.path().join("session.redb")).unwrap();
+        let actor = ActorId::new("/root").unwrap();
+        let run = RunId::new("run-1").unwrap();
+
+        let (transport, codec) = Responses::builder("gpt-test")
+            .api_key("test-key")
+            .build_parts()
+            .unwrap();
+        let effort = EffortControl::new(vec!["effort".to_owned()], &["high".to_owned()]);
+        let model = Model::new(
+            transport,
+            EffortCodec {
+                inner: codec,
+                control: effort.clone(),
+            },
+        )
+        .with_descriptor(ModelDescriptor::new("openai", "gpt-test", "openai/responses").unwrap())
+        .with_context_window_tokens(400_000);
+        let configured = ConfiguredModel {
+            choice: ModelChoice {
+                registry_id: "openai/gpt-test".to_owned(),
+                provider: "openai".to_owned(),
+                model: "gpt-test".to_owned(),
+                display_name: "GPT Test".to_owned(),
+                context_window: 400_000,
+                efforts: vec!["high".to_owned()],
+            },
+            model: AnyModel::Responses(model),
+            effort,
+        };
+
+        let response = |total: u64| {
+            EncodedPayload::new(
+                CodecRef::new(CodecId::new(RESPONSE_CODEC_ID).unwrap(), PAYLOAD_VERSION),
+                json!({
+                    "outputKind": "text",
+                    "model": "gpt-test",
+                    "response": {
+                        "id": "resp-1",
+                        "model": "gpt-test",
+                        "output": [{
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{ "type": "output_text", "text": "hello" }]
+                        }],
+                        "usage": {
+                            "input_tokens": 10_000,
+                            "output_tokens": total - 10_000,
+                            "total_tokens": total,
+                        }
+                    }
+                }),
+            )
+        };
+
+        let appended = store
+            .append(
+                &actor,
+                Revision::ZERO,
+                EventBatch::new(
+                    user_message("m-1", "start the task"),
+                    vec![
+                        context_entry(ContextTransition::Messages {
+                            run_id: run.clone(),
+                            consumed_message_ids: vec![MessageId::new("m-1").unwrap()],
+                        }),
+                        ActorEvent::context_appended(ContextEntry {
+                            transition: ContextTransition::Model {
+                                run_id: run.clone(),
+                                progress: RunProgress::Continue,
+                            },
+                            payload: response(12_345),
+                            recorded_at: Timestamp::from_unix_millis(1),
+                        }),
+                        ActorEvent::context_appended(ContextEntry {
+                            transition: ContextTransition::Model {
+                                run_id: run.clone(),
+                                progress: RunProgress::Complete,
+                            },
+                            payload: response(20_000),
+                            recorded_at: Timestamp::from_unix_millis(2),
+                        }),
+                    ],
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(appended, AppendOutcome::Appended { .. }));
+
+        let mut projector = Projector {
+            actor_id: actor.clone(),
+            state: Some(ActorState::new()),
+        };
+        let outcome = fold_projector(&store, &[configured], "/root", &mut projector)
+            .await
+            .unwrap();
+
+        // The newest completed model response wins: 20_000, not 12_345.
+        assert_eq!(outcome.context_tokens, Some(20_000));
+        assert!(!outcome.rows.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fold_matches_payload_codec_across_model_variants() {
+        // openai/responses is configured first, but the journal payload is a
+        // chat-completions stream; the fold must pick the codec that owns the
+        // payload instead of always using the first configured model.
+        let directory = tempfile::tempdir().unwrap();
+        let store = RedbStore::create(directory.path().join("session.redb")).unwrap();
+        let actor = ActorId::new("/root").unwrap();
+        let run = RunId::new("run-1").unwrap();
+
+        let (transport, codec) = Responses::builder("gpt-test")
+            .api_key("test-key")
+            .build_parts()
+            .unwrap();
+        let effort = EffortControl::new(vec!["effort".to_owned()], &["high".to_owned()]);
+        let responses = ConfiguredModel {
+            choice: ModelChoice {
+                registry_id: "openai/gpt-test".to_owned(),
+                provider: "openai".to_owned(),
+                model: "gpt-test".to_owned(),
+                display_name: "GPT Test".to_owned(),
+                context_window: 1_050_000,
+                efforts: vec!["high".to_owned()],
+            },
+            model: AnyModel::Responses(
+                Model::new(
+                    transport,
+                    EffortCodec {
+                        inner: codec,
+                        control: effort.clone(),
+                    },
+                )
+                .with_descriptor(
+                    ModelDescriptor::new("openai", "gpt-test", "openai/responses").unwrap(),
+                )
+                .with_context_window_tokens(1_050_000),
+            ),
+            effort: effort.clone(),
+        };
+        let (transport, codec) = ChatCompletions::builder("gpt-test")
+            .api_key("test-key")
+            .build_parts()
+            .unwrap();
+        let chat = ConfiguredModel {
+            choice: ModelChoice {
+                registry_id: "fireworks/gpt-test".to_owned(),
+                provider: "fireworks".to_owned(),
+                model: "gpt-test".to_owned(),
+                display_name: "GPT Test".to_owned(),
+                context_window: 1_040_000,
+                efforts: vec!["high".to_owned()],
+            },
+            model: AnyModel::ChatCompletions(
+                Model::new(
+                    transport,
+                    EffortCodec {
+                        inner: codec,
+                        control: effort.clone(),
+                    },
+                )
+                .with_descriptor(
+                    ModelDescriptor::new("fireworks", "gpt-test", "openai/chat-completions")
+                        .unwrap(),
+                )
+                .with_context_window_tokens(1_040_000),
+            ),
+            effort,
+        };
+
+        let payload = EncodedPayload::new(
+            CodecRef::new(
+                CodecId::new(CHAT_RESPONSE_CODEC_ID).unwrap(),
+                CHAT_PAYLOAD_VERSION,
+            ),
+            json!({
+                "outputKind": "text",
+                "model": "gpt-test",
+                "chunks": [{
+                    "id": "chatcmpl-1",
+                    "object": "chat.completion.chunk",
+                    "model": "gpt-test",
+                    "choices": [],
+                    "usage": {
+                        "prompt_tokens": 10_000,
+                        "completion_tokens": 2_345,
+                        "total_tokens": 12_345
+                    }
+                }]
+            }),
+        );
+
+        let appended = store
+            .append(
+                &actor,
+                Revision::ZERO,
+                EventBatch::new(
+                    user_message("m-1", "start the task"),
+                    vec![
+                        context_entry(ContextTransition::Messages {
+                            run_id: run.clone(),
+                            consumed_message_ids: vec![MessageId::new("m-1").unwrap()],
+                        }),
+                        ActorEvent::context_appended(ContextEntry {
+                            transition: ContextTransition::Model {
+                                run_id: run.clone(),
+                                progress: RunProgress::Complete,
+                            },
+                            payload,
+                            recorded_at: Timestamp::from_unix_millis(1),
+                        }),
+                    ],
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(appended, AppendOutcome::Appended { .. }));
+
+        let mut projector = Projector {
+            actor_id: actor.clone(),
+            state: Some(ActorState::new()),
+        };
+        // The responses model is listed first, but the payload belongs to
+        // the chat-completions codec.
+        let outcome = fold_projector(&store, &[responses, chat], "/root", &mut projector)
+            .await
+            .unwrap();
+        assert_eq!(outcome.context_tokens, Some(12_345));
     }
 
     #[tokio::test(flavor = "current_thread")]
