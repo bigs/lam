@@ -1,6 +1,6 @@
 # lam-tui
 
-`lam-tui` is the interactive `lam` executable. It combines the embeddable
+`lam-tui` is the interactive `lam-agent` executable. It combines the embeddable
 runtime with the coding capability pack, hierarchical subagents, and a compact
 Ratatui conversation interface.
 
@@ -150,7 +150,7 @@ next message.
 Run it from the project directory the agent should operate within:
 
 ```bash
-cargo run -p lam-tui --bin lam
+cargo run -p lam-tui --bin lam-agent
 ```
 
 The root and every subagent receive read/write filesystem, editing, and local

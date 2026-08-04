@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [[bin]]
-name = "lam"
+name = "lam-agent"
 path = "src/main.rs"
 doc = false
 

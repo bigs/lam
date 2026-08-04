@@ -253,7 +253,7 @@ requests; they must be enabled explicitly.
 
 ## Interactive TUI
 
-The separate `lam-tui` package produces the `lam` executable while depending
+The separate `lam-tui` package produces the `lam-agent` executable while depending
 on the library crate of the same name. It loads `~/.lam/providers.toml`, starts
 the coding and multi-agent capability packs in the current directory, and
 renders a responsive conversation with expandable eval and lifecycle rows.

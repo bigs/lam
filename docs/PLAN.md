@@ -1182,7 +1182,9 @@ empty crates for speculative boundaries.
 
 ### TUI package and executable naming
 
-**Settled.** The user-facing TUI executable will be named `lam`.
+**Superseded.** The user-facing TUI executable is named `lam-agent`. The
+earlier decision to name it `lam` collided with the BSD `lam(1)`
+"laminate files" utility shipped on macOS (`/usr/bin/lam`).
 
 The Rust library remains the `lam` package and library crate. The future TUI
 will live in a separately named Cargo package—provisionally `lam-tui`—with an
@@ -1193,7 +1195,7 @@ explicit binary target:
 name = "lam-tui"
 
 [[bin]]
-name = "lam"
+name = "lam-agent"
 path = "src/main.rs"
 
 [dependencies]
@@ -1206,7 +1208,7 @@ binary can import the library as `lam`. This does not require renaming
 `lam-core`, `lam-deno`, or the public library.
 
 If the packages are later published, users would install a package such as
-`lam-tui` or `lam-cli` and receive an executable named `lam`. Whether to optimize
+`lam-tui` or `lam-cli` and receive an executable named `lam-agent`. Whether to optimize
 the crates.io command, a release installer, or package-manager distribution is
 a packaging decision for the TUI slice; it should not couple TUI dependencies
 into the core library now.
@@ -1693,7 +1695,7 @@ optional pack.
 
 ### Follow-up: TUI
 
-Build the TUI as a consumer of the `lam` library and emit the `lam` executable.
+Build the TUI as a consumer of the `lam` library and emit the `lam-agent` executable.
 It uses the same `send`, `call`, history, and run-event streams as any other
 embedding application. Token deltas remain ephemeral but are displayed
 immediately for a responsive experience.
