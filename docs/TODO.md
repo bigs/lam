@@ -27,4 +27,9 @@
   - Added `Pass structured values directly to lam.result without JSON.stringify; the runtime handles encoding` to `EVAL_TOOL_DESCRIPTION`.
 - [ ] Offer interleaved (merged, temporal-order) shell output as an option alongside the current separate stdout/stderr captures.
   - Observed from the model side: separate streams are usually right, but when a command fails the merged ordering is what explains how stdout and stderr relate.
-  - Keep the structured per-stream fields; add merging without losing stream attribution.
+  - Constraint: Unix pipes record no per-write timestamps and no cross-stream ordering. Once stdout and stderr are separate pipes, true interleave cannot be reconstructed post-hoc; any merge is a best-effort guess.
+  - Design fork, unresolved:
+    - One pipe (`stderr(Stdio::stdout())`): kernel-guaranteed write-order, but output is not labeled by stream. Honest trade; best fit for the failure-diagnosis case.
+    - Two pipes + read-lock or chunk timestamps: keeps stream labels, but ordering is heuristic (timestamps would measure read/arrival time, not the child's write time) and a read-lock risks blocking the child on a full pipe buffer. Worst of both.
+    - Status quo (two pipes, separate fields): exact labels, no claimed cross-stream order.
+  - Deferred pending a decision on whether guaranteed ordering (one pipe, unlabeled) is worth giving up attribution.
