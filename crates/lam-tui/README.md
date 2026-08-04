@@ -118,8 +118,8 @@ or raw SSE payloads.
   below without moving the selection or scroll position. Move back to the
   newest row, or press End, to resume following live output.
 - User messages start expanded. Agent text is expanded while it streams and
-  stays that way when the run completes; if the same run continues into a tool
-  call, the intermediate text collapses. Both remain manually collapsible.
+  stays that way when the run completes, including intermediate text that
+  leads into a tool call. Both remain manually collapsible.
 - Expanded user, agent, and reasoning rows render Markdown as it streams;
   collapsed previews remain compact plain text.
 - Mouse wheel navigation and click-to-expand are supported.

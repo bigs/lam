@@ -942,7 +942,6 @@ impl App {
                     }
                 }
                 ModelDelta::ToolCall(delta) => {
-                    self.collapse_streamed_text(address, &run_id);
                     self.append_tool_delta(address, &run_id, delta);
                     if !self.is_completed_run(&run_id) {
                         self.status = format!("{address} is preparing a tool call…");
@@ -953,7 +952,6 @@ impl App {
             RunEvent::EvalStarted {
                 run_id, request, ..
             } => {
-                self.collapse_streamed_text(address, &run_id);
                 let body = eval_request_body(&request);
                 let title = format!("{address} · {}", request.intent);
                 if let Some(entry) = self.pending_tool_mut(address, &run_id) {
@@ -1274,16 +1272,6 @@ impl App {
 
     fn is_completed_run(&self, run_id: &RunId) -> bool {
         self.root_run_completed && self.completed_run_id.as_deref() == Some(run_id.as_str())
-    }
-
-    fn collapse_streamed_text(&mut self, address: &str, run_id: &RunId) {
-        if let Some(entry) = self.entries.iter_mut().rev().find(|entry| {
-            entry.kind == EntryKind::Assistant
-                && entry.model_owner.as_deref() == Some(address)
-                && entry.model_run.as_deref() == Some(run_id.as_str())
-        }) {
-            entry.expanded = false;
-        }
     }
 
     fn reconcile_root_output(&mut self, output: String) -> Option<String> {
@@ -2913,7 +2901,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_collapses_only_text_from_the_same_run() {
+    fn tool_call_keeps_intermediate_text_expanded() {
         let mut app = app();
         let address = ActorAddress::new("/root").unwrap();
         let first_run = RunId::new("run-1").unwrap();
@@ -2939,9 +2927,7 @@ mod tests {
                 }),
             },
         });
-        assert!(!app.entries[first_text].expanded);
-
-        app.entries[first_text].expanded = true;
+        assert!(app.entries[first_text].expanded);
         app.apply_agent_event(AgentSystemEvent::Run {
             address,
             event: RunEvent::ModelDelta {
