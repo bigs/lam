@@ -34,6 +34,10 @@ pub(crate) struct Runtime {
     effort_controls: Vec<EffortControl>,
     history_models: Arc<[ConfiguredModel]>,
     store: Arc<RedbStore>,
+    /// Executor for TUI commands. Command futures do journal I/O, including
+    /// durable fsyncs, and must never run on the UI's single-thread runtime,
+    /// where they would freeze rendering and input for their duration.
+    command_runtime: tokio::runtime::Runtime,
     /// One transcript projector per journaled actor. The projector is the
     /// TUI's only source of committed transcript content: it folds journal
     /// pages incrementally and renders each committed context entry through
@@ -215,6 +219,12 @@ impl Runtime {
             .max_agents(64)
             .build()
             .map_err(|error| RuntimeError::AgentSystem(error.to_string()))?;
+        let command_runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("lam-tui-command")
+            .enable_all()
+            .build()
+            .map_err(|error| RuntimeError::AgentSystem(format!("command runtime: {error}")))?;
         let events = system
             .take_events()
             .expect("a new agent system owns its event receiver");
@@ -309,6 +319,7 @@ impl Runtime {
             effort_controls,
             history_models,
             store,
+            command_runtime,
             projectors,
         })
     }
@@ -367,7 +378,7 @@ impl Runtime {
     pub(crate) fn execute(&self, command: Command, output: mpsc::UnboundedSender<CommandResult>) {
         let root = self.root.clone();
         let effort_controls = self.effort_controls.clone();
-        tokio::spawn(async move {
+        self.command_runtime.spawn(async move {
             let result = match command {
                 Command::Message(input) => {
                     let result = match root.send(input.clone(), DeliveryMode::Steer).await {

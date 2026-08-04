@@ -107,7 +107,9 @@ pub(crate) struct Suggestion {
 #[derive(Clone, Debug)]
 pub(crate) struct PendingSteer {
     /// Durable identity used to match the message against delivery events.
-    pub(crate) message_id: String,
+    /// None while the message awaits its admission receipt: the optimistic
+    /// row shown the moment the user submits.
+    pub(crate) message_id: Option<String>,
     /// The user's message text.
     pub(crate) text: String,
 }
@@ -733,6 +735,13 @@ impl App {
             self.with_agent("/root", |app| {
                 app.status = "Sending…".to_owned();
             });
+            // Optimistically show the steer the moment it is submitted; the
+            // receipt attaches the durable identity (or the row is removed on
+            // failure) so the steering area never waits on the journal write.
+            self.pending_steers.push(PendingSteer {
+                message_id: None,
+                text: input.clone(),
+            });
             return Some(Command::Message(input));
         }
         if self.busy {
@@ -1159,10 +1168,12 @@ impl App {
         if address == "/root" {
             if !outcome.consumed_message_ids.is_empty() {
                 self.pending_steers.retain(|steer| {
-                    !outcome
-                        .consumed_message_ids
-                        .iter()
-                        .any(|consumed| consumed == &steer.message_id)
+                    !outcome.consumed_message_ids.iter().any(|consumed| {
+                        steer
+                            .message_id
+                            .as_ref()
+                            .is_some_and(|message_id| message_id == consumed)
+                    })
                 });
             }
             self.root_run_active = outcome.active_run.is_some();
@@ -1224,13 +1235,26 @@ impl App {
     /// whether the projector has already folded the message into context —
     /// in that case its row is already rendered and nothing is pending.
     pub(crate) fn apply_message_receipt(&mut self, sent: SentMessage, consumed: bool) {
-        if consumed {
-            return;
+        // Attach the durable identity to the optimistic row submitted above,
+        // or drop the row when the delivery already committed into context.
+        if let Some(index) = self
+            .pending_steers
+            .iter()
+            .position(|steer| steer.message_id.is_none() && steer.text == sent.text)
+        {
+            if consumed {
+                self.pending_steers.remove(index);
+            } else {
+                self.pending_steers[index].message_id = Some(sent.message_id);
+            }
+        } else if !consumed {
+            // No optimistic row (e.g. a receipt without a prior submit);
+            // register the pending steer directly.
+            self.pending_steers.push(PendingSteer {
+                message_id: Some(sent.message_id),
+                text: sent.text,
+            });
         }
-        self.pending_steers.push(PendingSteer {
-            message_id: sent.message_id,
-            text: sent.text,
-        });
         self.with_agent("/root", |app| {
             if !app.root_run_active {
                 return;
@@ -1240,6 +1264,18 @@ impl App {
     }
 
     pub(crate) fn apply_message_error(&mut self, error: String) {
+        // A rejected send removes the optimistic row and restores the draft
+        // so the user's text is never lost.
+        if let Some(index) = self
+            .pending_steers
+            .iter()
+            .position(|steer| steer.message_id.is_none())
+        {
+            let steer = self.pending_steers.remove(index);
+            self.input = InputBuffer::at_end(steer.text);
+            self.input_history = None;
+            self.suggestion_index = 0;
+        }
         self.push_error("Could not send message", error);
     }
 
@@ -2251,7 +2287,8 @@ mod tests {
     use ratatui::layout::Rect;
 
     use super::{
-        App, EntryKind, Focus, Hitbox, InputBuffer, SessionChoice, SessionView, partial_eval_intent,
+        App, EntryKind, Focus, Hitbox, InputBuffer, PendingSteer, SessionChoice, SessionView,
+        partial_eval_intent,
     };
     use crate::config::ModelChoice;
     use crate::runtime::{
@@ -2303,6 +2340,80 @@ mod tests {
             0,
             "high",
         )
+    }
+
+    #[test]
+    fn submit_registers_an_optimistic_pending_steer() {
+        let mut app = app();
+        app.input = InputBuffer::at_end("hello".to_owned());
+        let command = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(command, Some(Command::Message(_))));
+        assert_eq!(app.pending_steers.len(), 1);
+        assert!(app.pending_steers[0].message_id.is_none());
+        assert_eq!(app.pending_steers[0].text, "hello");
+        assert!(app.input.text.is_empty());
+    }
+
+    #[test]
+    fn receipt_attaches_the_durable_id_to_the_optimistic_steer() {
+        let mut app = app();
+        app.pending_steers.push(PendingSteer {
+            message_id: None,
+            text: "hello".to_owned(),
+        });
+        app.apply_message_receipt(
+            SentMessage {
+                message_id: "m1".to_owned(),
+                text: "hello".to_owned(),
+            },
+            false,
+        );
+        assert_eq!(app.pending_steers.len(), 1);
+        assert_eq!(app.pending_steers[0].message_id.as_deref(), Some("m1"));
+    }
+
+    #[test]
+    fn consumed_receipt_removes_the_optimistic_steer() {
+        let mut app = app();
+        app.pending_steers.push(PendingSteer {
+            message_id: None,
+            text: "hello".to_owned(),
+        });
+        app.apply_message_receipt(
+            SentMessage {
+                message_id: "m1".to_owned(),
+                text: "hello".to_owned(),
+            },
+            true,
+        );
+        assert!(app.pending_steers.is_empty());
+    }
+
+    #[test]
+    fn failed_send_removes_the_optimistic_steer_and_restores_the_draft() {
+        let mut app = app();
+        app.input = InputBuffer::at_end("hello".to_owned());
+        let _ = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.pending_steers.len(), 1);
+        assert!(app.input.text.is_empty());
+        app.apply_message_error("the journal rejected the message".to_owned());
+        assert!(app.pending_steers.is_empty());
+        assert_eq!(app.input.text, "hello");
+    }
+
+    #[test]
+    fn delivered_steer_is_cleared_by_the_consume_fold() {
+        let mut app = app();
+        app.pending_steers.push(PendingSteer {
+            message_id: Some("m1".to_owned()),
+            text: "hello".to_owned(),
+        });
+        let outcome = FoldOutcome {
+            consumed_message_ids: vec!["m1".to_owned()],
+            ..FoldOutcome::default()
+        };
+        app.apply_fold("/root", outcome);
+        assert!(app.pending_steers.is_empty());
     }
 
     #[test]
@@ -2763,7 +2874,7 @@ mod tests {
             false,
         );
         assert_eq!(app.pending_steers.len(), 1);
-        assert_eq!(app.pending_steers[0].message_id, "steer-1");
+        assert_eq!(app.pending_steers[0].message_id.as_deref(), Some("steer-1"));
         assert!(
             app.entries
                 .iter()
@@ -2938,7 +3049,10 @@ mod tests {
         app.apply_interrupt_result(Ok(true));
 
         assert_eq!(app.pending_steers.len(), 1);
-        assert_eq!(app.pending_steers[0].message_id, "steer-kept");
+        assert_eq!(
+            app.pending_steers[0].message_id.as_deref(),
+            Some("steer-kept")
+        );
         assert!(app.entries.iter().any(|entry| {
             entry.kind == EntryKind::User && entry.body == "consumed by boundary"
         }));
