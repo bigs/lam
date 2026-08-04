@@ -22,6 +22,9 @@
 - [x] Ctrl+C clears nonempty draft input first; when the input is empty, it quits through the existing system-abort cleanup.
 - [x] Streaming Markdown rendering for expanded user, assistant, and reasoning messages; collapsed previews remain plain.
 - [ ] Bound console capture and spill oversized serialized eval results through embedding-provided storage.
+- [ ] Consider a substring/regex replace capability in `lam.edit` for edits that line-oriented patching handles poorly.
+  - `lam.edit.apply` matches whole lines only (now documented); a single-line blob such as a long embedded help string cannot be patched by targeting an inner substring and forced a shell-out to `perl`.
+  - Documented the whole-line rule in the `apply` description; a targeted string replace remains a possible additive capability.
 - [x] Clarify the eval tool description so the model passes structured values to `lam.result` directly instead of pre-stringifying.
   - Root cause: the double JSON encoding was model behavior, not a harness defect. The provider APIs force exactly one stringification at the wire (`function_call_output.output` is a string); the second appeared only when the model called `JSON.stringify` before `lam.result`.
   - Added `Pass structured values directly to lam.result without JSON.stringify; the runtime handles encoding` to `EVAL_TOOL_DESCRIPTION`.

@@ -80,7 +80,7 @@ pub(crate) fn edit_namespace(workspace: CodingWorkspace) -> Namespace {
     )
     .function(
         "apply",
-        "Apply a file-oriented patch enclosed by `*** Begin Patch` and `*** End Patch`. Use explicit Add File, Delete File, or Update File sections; updates may include `*** Move to`, and hunks begin with `@@` and space, `-`, or `+` prefixes. Paths must be relative. Every path and hunk is validated before the first mutation.",
+        "Apply a file-oriented patch enclosed by `*** Begin Patch` and `*** End Patch`. Use explicit Add File, Delete File, or Update File sections; updates may include `*** Move to`, and hunks begin with `@@` and space, `-`, or `+` prefixes. Context and removal lines match whole lines exactly: a substring within a line does not match. Paths must be relative. Every path and hunk is validated before the first mutation.",
         move |_context, request: ApplyPatchRequest| {
             let workspace = apply_workspace.clone();
             async move {
