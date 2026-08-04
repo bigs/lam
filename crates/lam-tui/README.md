@@ -139,8 +139,9 @@ selection or viewport. Each eval row uses the model's brief intent as its stable
 title while collapsed or expanded; the generated TypeScript is shown only in
 its expanded body. The intent title streams as partial eval-argument JSON
 arrives. The eventual eval outcome appears in its own result row. Reasoning,
-eval call, and result rows render faint while unselected to keep the
-transcript calm; selecting a row restores its full intensity.
+eval call, and result rows render at full intensity while their run is
+writing them, then turn faint once the stream moves on, keeping the
+transcript calm; selecting a row also restores its full intensity.
 
 After interruption, Lam reloads every affected view from its durable journal.
 Incomplete text, reasoning, and tool-call JSON disappear; a committed eval call

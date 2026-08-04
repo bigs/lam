@@ -42,6 +42,7 @@ pub(crate) struct ConversationEntry {
     pub(crate) body: String,
     pub(crate) expanded: bool,
     pub(crate) pending_tool: bool,
+    pub(crate) streaming: bool,
     model_owner: Option<String>,
     model_run: Option<String>,
     tool_owner: Option<String>,
@@ -187,6 +188,7 @@ impl App {
             body: ready_message,
             expanded: false,
             pending_tool: false,
+            streaming: false,
             model_owner: None,
             model_run: None,
             tool_owner: None,
@@ -954,7 +956,10 @@ impl App {
             } => {
                 let body = eval_request_body(&request);
                 let title = format!("{address} · {}", request.intent);
-                if let Some(entry) = self.pending_tool_mut(address, &run_id) {
+                if let Some(index) = self.pending_tool_index(address, &run_id) {
+                    self.clear_streaming(&run_id);
+                    let entry = &mut self.entries[index];
+                    entry.streaming = true;
                     entry.tool_name = "eval".to_owned();
                     entry.title = title;
                     entry.body = body;
@@ -966,6 +971,7 @@ impl App {
                         entry.tool_run = Some(run_id.to_string());
                         entry.tool_name = "eval".to_owned();
                     }
+                    self.mark_last_streaming(&run_id);
                 }
                 if !self.is_completed_run(&run_id) {
                     self.status = format!("{address} is evaluating TypeScript…");
@@ -987,6 +993,11 @@ impl App {
                     format!("{address} · {tool_name} result"),
                     result,
                 );
+                if let Some(entry) = self.entries.last_mut() {
+                    entry.tool_owner = Some(address.to_owned());
+                    entry.tool_run = Some(run_id.to_string());
+                }
+                self.mark_last_streaming(&run_id);
                 if !self.is_completed_run(&run_id) {
                     self.status = format!("{address} finished eval");
                 }
@@ -1020,6 +1031,7 @@ impl App {
             RunEvent::Completed { run_id } => {
                 self.root_run_completed = true;
                 self.completed_run_id = Some(run_id.to_string());
+                self.clear_streaming(&run_id);
                 if let Some(entry) = self
                     .entries
                     .iter_mut()
@@ -1261,17 +1273,41 @@ impl App {
             if kind == EntryKind::Assistant {
                 entry.expanded = true;
             }
+            entry.streaming = true;
         } else {
             self.push_entry_with_expansion(kind, title, delta, kind == EntryKind::Assistant);
             if let Some(entry) = self.entries.last_mut() {
                 entry.model_owner = Some(address.to_owned());
                 entry.model_run = Some(run_id.to_string());
             }
+            self.mark_last_streaming(run_id);
         }
     }
 
     fn is_completed_run(&self, run_id: &RunId) -> bool {
         self.root_run_completed && self.completed_run_id.as_deref() == Some(run_id.as_str())
+    }
+
+    /// Clears the streaming marker from every row owned by the run. Each
+    /// run keeps at most one streaming row: the row it is actively writing.
+    fn clear_streaming(&mut self, run_id: &RunId) {
+        let run_id = run_id.as_str();
+        for entry in &mut self.entries {
+            if entry.model_run.as_deref() == Some(run_id)
+                || entry.tool_run.as_deref() == Some(run_id)
+            {
+                entry.streaming = false;
+            }
+        }
+    }
+
+    /// Moves the run's streaming marker to its newest row, dimming the row
+    /// the cursor just left.
+    fn mark_last_streaming(&mut self, run_id: &RunId) {
+        self.clear_streaming(run_id);
+        if let Some(entry) = self.entries.last_mut() {
+            entry.streaming = true;
+        }
     }
 
     fn reconcile_root_output(&mut self, output: String) -> Option<String> {
@@ -1326,15 +1362,23 @@ impl App {
     }
 
     fn append_tool_delta(&mut self, address: &str, run_id: &RunId, delta: ToolCallDelta) {
-        let run_id = run_id.as_str();
-        let entry = self.entries.iter_mut().rev().find(|entry| {
-            entry.kind == EntryKind::ToolCall
-                && entry.pending_tool
-                && entry.tool_owner.as_deref() == Some(address)
-                && entry.tool_run.as_deref() == Some(run_id)
-                && entry.tool_index == Some(delta.index)
-        });
-        if let Some(entry) = entry {
+        let existing = self
+            .entries
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, entry)| {
+                entry.kind == EntryKind::ToolCall
+                    && entry.pending_tool
+                    && entry.tool_owner.as_deref() == Some(address)
+                    && entry.tool_run.as_deref() == Some(run_id.as_str())
+                    && entry.tool_index == Some(delta.index)
+            })
+            .map(|(index, _)| index);
+        if let Some(index) = existing {
+            self.clear_streaming(run_id);
+            let entry = &mut self.entries[index];
+            entry.streaming = true;
             if let Some(name) = delta.name {
                 entry.tool_name.push_str(&name);
                 entry.title = format!("{address} · {}", entry.tool_name);
@@ -1354,11 +1398,12 @@ impl App {
         if let Some(entry) = self.entries.last_mut() {
             entry.pending_tool = true;
             entry.tool_owner = Some(address.to_owned());
-            entry.tool_run = Some(run_id.to_owned());
+            entry.tool_run = Some(run_id.to_string());
             entry.tool_index = Some(delta.index);
             entry.tool_name = name;
             update_streamed_eval_title(entry, address);
         }
+        self.mark_last_streaming(run_id);
     }
 
     fn pending_tool_mut(
@@ -1366,15 +1411,22 @@ impl App {
         address: &str,
         run_id: &RunId,
     ) -> Option<&mut ConversationEntry> {
+        let index = self.pending_tool_index(address, run_id)?;
+        self.entries.get_mut(index)
+    }
+
+    fn pending_tool_index(&self, address: &str, run_id: &RunId) -> Option<usize> {
         self.entries
-            .iter_mut()
-            .filter(|entry| {
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| {
                 entry.kind == EntryKind::ToolCall
                     && entry.pending_tool
                     && entry.tool_owner.as_deref() == Some(address)
                     && entry.tool_run.as_deref() == Some(run_id.as_str())
             })
-            .min_by_key(|entry| entry.tool_index.unwrap_or(usize::MAX))
+            .min_by_key(|(_, entry)| entry.tool_index.unwrap_or(usize::MAX))
+            .map(|(index, _)| index)
     }
 
     fn push_error(&mut self, title: impl Into<String>, body: impl Into<String>) {
@@ -1408,6 +1460,7 @@ impl App {
             body: body.into(),
             expanded,
             pending_tool: false,
+            streaming: false,
             model_owner: None,
             model_run: None,
             tool_owner: None,
@@ -1688,6 +1741,7 @@ fn historical_entry(entry: HistoryEntry) -> ConversationEntry {
         body: entry.body,
         expanded: matches!(kind, EntryKind::User | EntryKind::Assistant),
         pending_tool: false,
+        streaming: false,
         model_owner: None,
         model_run: None,
         tool_owner: None,
@@ -2941,6 +2995,72 @@ mod tests {
             },
         });
         assert!(app.entries[first_text].expanded);
+    }
+
+    #[test]
+    fn streaming_marker_follows_the_active_row_and_clears_on_completion() {
+        let mut app = app();
+        let address = ActorAddress::new("/root").unwrap();
+        let run_id = RunId::new("run-1").unwrap();
+
+        app.apply_agent_event(AgentSystemEvent::Run {
+            address: address.clone(),
+            event: RunEvent::ModelDelta {
+                run_id: run_id.clone(),
+                delta: ModelDelta::Reasoning("thinking".to_owned()),
+            },
+        });
+        let reasoning = app.entries.len() - 1;
+        assert!(app.entries[reasoning].streaming);
+
+        app.apply_agent_event(AgentSystemEvent::Run {
+            address: address.clone(),
+            event: RunEvent::ModelDelta {
+                run_id: run_id.clone(),
+                delta: ModelDelta::ToolCall(ToolCallDelta {
+                    index: 0,
+                    call_id: Some("call-1".to_owned()),
+                    name: Some("eval".to_owned()),
+                    arguments: r#"{"source":"1 + 1"}"#.to_owned(),
+                }),
+            },
+        });
+        let call = app.entries.len() - 1;
+        assert!(!app.entries[reasoning].streaming);
+        assert!(app.entries[call].streaming);
+
+        app.apply_agent_event(AgentSystemEvent::Run {
+            address: address.clone(),
+            event: RunEvent::EvalCompleted {
+                run_id: run_id.clone(),
+                outcome: EvalOutcome::Success {
+                    output: EvalOutput {
+                        result: EvalValue::Json(serde_json::json!(2)),
+                        logs: Vec::new(),
+                    },
+                },
+            },
+        });
+        let result = app.entries.len() - 1;
+        assert!(!app.entries[call].streaming);
+        assert!(app.entries[result].streaming);
+
+        app.apply_agent_event(AgentSystemEvent::Run {
+            address: address.clone(),
+            event: RunEvent::ModelDelta {
+                run_id: run_id.clone(),
+                delta: ModelDelta::Text("The answer is 2.".to_owned()),
+            },
+        });
+        let text = app.entries.len() - 1;
+        assert!(!app.entries[result].streaming);
+        assert!(app.entries[text].streaming);
+
+        app.apply_agent_event(AgentSystemEvent::Run {
+            address,
+            event: RunEvent::Completed { run_id },
+        });
+        assert!(app.entries.iter().all(|entry| !entry.streaming));
     }
 
     #[test]

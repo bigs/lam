@@ -215,12 +215,14 @@ fn entry_lines(
     let (marker, color) = entry_style(entry.kind);
     let selection = if selected { "│" } else { " " };
     let disclosure = if entry.expanded { "▾" } else { "▸" };
-    // Tool and reasoning rows are ambient detail: render them faint until
-    // selected, when they return to full intensity for focused reading.
+    // Tool and reasoning rows are ambient detail: render them faint once the
+    // stream moves past them. The row a run is actively writing and the
+    // selected row stay at full intensity for reading.
     let dimmed = matches!(
         entry.kind,
         EntryKind::ToolCall | EntryKind::ToolResult | EntryKind::Reasoning
-    ) && !selected;
+    ) && !selected
+        && !entry.streaming;
     let style = if selected {
         Style::default().bg(PANEL)
     } else {
@@ -1135,6 +1137,23 @@ mod tests {
 
         app.focus = Focus::Conversation;
         app.selected_entry = Some(0);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        assert!(!text_modifier(buffer, "weighing").contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn streaming_rows_render_at_full_intensity() {
+        let mut app = test_app(vec![HistoryEntry {
+            kind: HistoryKind::Reasoning,
+            title: "agent".to_owned(),
+            body: "weighing the options".to_owned(),
+        }]);
+        app.entries[0].expanded = true;
+        app.entries[0].streaming = true;
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let buffer = terminal.backend().buffer();
         assert!(!text_modifier(buffer, "weighing").contains(Modifier::DIM));
