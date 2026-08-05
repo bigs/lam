@@ -121,6 +121,30 @@ pub trait JournalStore: Send + Sync {
         expected: Revision,
         events: EventBatch,
     ) -> impl Future<Output = Result<AppendOutcome, JournalError<Self::Error>>> + Send;
+
+    /// Persists one opaque projection checkpoint for an actor, replacing any
+    /// earlier checkpoint. The revision is the journal head the checkpoint
+    /// was folded through. Backends may ignore this (the default); the
+    /// loader falls back to a full replay when no checkpoint is available.
+    fn write_checkpoint(
+        &self,
+        _actor: &ActorId,
+        _revision: Revision,
+        _blob: &[u8],
+    ) -> impl Future<Output = Result<(), JournalError<Self::Error>>> + Send {
+        async { Ok(()) }
+    }
+
+    /// Returns the newest checkpoint for an actor, when the backend keeps
+    /// them.
+    #[allow(clippy::type_complexity)]
+    fn read_checkpoint(
+        &self,
+        _actor: &ActorId,
+    ) -> impl Future<Output = Result<Option<(Revision, Vec<u8>)>, JournalError<Self::Error>>> + Send
+    {
+        async { Ok(None) }
+    }
 }
 
 impl<S> JournalStore for Arc<S>
@@ -145,5 +169,22 @@ where
         events: EventBatch,
     ) -> impl Future<Output = Result<AppendOutcome, JournalError<Self::Error>>> + Send {
         (**self).append(actor, expected, events)
+    }
+
+    fn write_checkpoint(
+        &self,
+        actor: &ActorId,
+        revision: Revision,
+        blob: &[u8],
+    ) -> impl Future<Output = Result<(), JournalError<Self::Error>>> + Send {
+        (**self).write_checkpoint(actor, revision, blob)
+    }
+
+    fn read_checkpoint(
+        &self,
+        actor: &ActorId,
+    ) -> impl Future<Output = Result<Option<(Revision, Vec<u8>)>, JournalError<Self::Error>>> + Send
+    {
+        (**self).read_checkpoint(actor)
     }
 }

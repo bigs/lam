@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use lam_core::{
     ActorEvent, ActorEventData, ActorId, ActorState, AdmissionDecision, AdmittedMessage,
-    AppendOutcome, ContextEntry, EventBatch, JournalPage, JournalStore, MessageEnvelope,
-    ModelSelection, Revision, StateError, StoredEvent,
+    AppendOutcome, Checkpoint, ContextEntry, EventBatch, JournalPage, JournalStore,
+    MessageEnvelope, ModelSelection, Revision, StateError, StoredEvent,
 };
 use tokio::sync::Mutex;
 
@@ -24,7 +24,41 @@ pub(crate) async fn load_state<S>(store: &S, actor_id: &ActorId) -> Result<Actor
 where
     S: JournalStore,
 {
+    // Bootstrap from the newest checkpoint when one exists: fold forward from
+    // its revision instead of replaying the whole journal. A missing, corrupt,
+    // or ahead-of-head checkpoint falls back to a full replay.
+    if let Some((_revision, blob)) = store
+        .read_checkpoint(actor_id)
+        .await
+        .map_err(journal_error)?
+        && let Ok(checkpoint) = serde_json::from_slice::<Checkpoint>(&blob)
+        && let Ok(state) = refresh_state(store, actor_id, checkpoint.into_state()).await
+    {
+        return Ok(state);
+    }
     refresh_state(store, actor_id, ActorState::new()).await
+}
+
+/// Persists a projection checkpoint at the state's folded revision so a
+/// later cold load bootstraps from this point instead of replaying the
+/// journal from zero. Best-effort: backends without checkpoint storage
+/// ignore the write.
+pub(crate) async fn write_checkpoint<S>(
+    store: &S,
+    actor_id: &ActorId,
+    state: &ActorState,
+) -> Result<(), ActorError>
+where
+    S: JournalStore,
+{
+    let checkpoint = Checkpoint::from_state(state);
+    let blob = serde_json::to_vec(&checkpoint).map_err(|error| ActorError::State {
+        message: format!("checkpoint for {actor_id} could not be encoded: {error}"),
+    })?;
+    store
+        .write_checkpoint(actor_id, state.revision(), &blob)
+        .await
+        .map_err(journal_error)
 }
 
 /// Folds any journal events past the state's revision. Unlike [`load_state`],
@@ -555,5 +589,40 @@ mod tests {
             }
             AppendAttempt::Conflict(_) => panic!("a refreshed retry must append"),
         }
+    }
+
+    #[tokio::test]
+    async fn load_state_bootstraps_from_a_checkpoint() {
+        let store = Arc::new(MemStore::new());
+        let actor = root();
+        let _ = store
+            .append(
+                &actor,
+                Revision::ZERO,
+                EventBatch::one(ActorEvent::message_admitted(envelope("m1", "one"))),
+            )
+            .await
+            .expect("append");
+        let state = load_state(store.as_ref(), &actor).await.expect("load");
+        write_checkpoint(store.as_ref(), &actor, &state)
+            .await
+            .expect("checkpoint");
+
+        // Advance the journal past the checkpoint, then confirm a cold load
+        // bootstraps to the same state a full replay would produce.
+        let _ = store
+            .append(
+                &actor,
+                state.revision(),
+                EventBatch::one(ActorEvent::message_admitted(envelope("m2", "two"))),
+            )
+            .await
+            .expect("append");
+        let bootstrapped = load_state(store.as_ref(), &actor).await.expect("load");
+        let full = refresh_state(store.as_ref(), &actor, ActorState::new())
+            .await
+            .expect("full replay");
+        assert_eq!(bootstrapped, full);
+        assert_eq!(bootstrapped.messages().len(), 2);
     }
 }

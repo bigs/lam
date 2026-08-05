@@ -16,6 +16,7 @@ use crate::model::RegisteredModel;
 use crate::runner::{ActorRunner, emit, wait_for_abort};
 use crate::runtime_journal::{
     AppendAttempt, append_batch, append_context, append_event, load_state, refresh_state,
+    write_checkpoint,
 };
 use crate::{ActorError, ModelSwitchPolicy, ModelSwitchReceipt, RunEvent, RuntimeEvent};
 
@@ -134,6 +135,16 @@ where
             let receipt = prepared.receipt(marker_revision);
             let next =
                 append_context(self.store.as_ref(), &self.actor_id, state, prepared.entry).await?;
+            // Best-effort: a checkpoint lets a later cold load bootstrap from
+            // this compaction boundary instead of replaying the journal.
+            if let Err(error) = write_checkpoint(self.store.as_ref(), &self.actor_id, &next).await {
+                tracing::warn!(
+                    target: "lam::compaction",
+                    actor_id = %self.actor_id,
+                    %error,
+                    "checkpoint write failed; cold loads will replay the journal"
+                );
+            }
             Ok((next, receipt))
         }
         .await;
@@ -253,6 +264,16 @@ where
                     };
                     match append {
                         AppendAttempt::Appended(next) => {
+                            if let Err(error) =
+                                write_checkpoint(self.store.as_ref(), &self.actor_id, &next).await
+                            {
+                                tracing::warn!(
+                                    target: "lam::compaction",
+                                    actor_id = %self.actor_id,
+                                    %error,
+                                    "checkpoint write failed; cold loads will replay the journal"
+                                );
+                            }
                             trace_compaction_completed(&self.actor_id, None, &compaction);
                             self.emit_compaction_completed(None, None, &compaction);
                             return Ok(ModelSwitchReceipt {

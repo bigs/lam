@@ -22,6 +22,10 @@
 - [x] Ctrl+C clears nonempty draft input first; when the input is empty, it quits through the existing system-abort cleanup.
 - [x] Streaming Markdown rendering for expanded user, assistant, and reasoning messages; collapsed previews remain plain.
 - [ ] Bound console capture and spill oversized serialized eval results through embedding-provided storage.
+- [ ] Fix panic on Ctrl+C quit (and likely session switch): dropping the TUI command runtime panics in async context.
+  - Symptom: panics at tokio runtime/blocking/shutdown.rs with "Cannot drop a runtime in a context where blocking is not allowed" whenever quitting with Ctrl+C.
+  - Root cause: the TUI Runtime owns a multi-thread tokio Runtime (command_runtime, added for non-blocking commands); dropping a tokio Runtime performs a blocking shutdown, which is illegal inside the current-thread async context of tokio_main.
+  - Fix direction: call shutdown_background() on the command runtime before it is dropped (a Drop impl on the TUI Runtime, or explicit calls on the quit and session-switch paths). Verify session switch does not panic too.
 - [ ] Consider a substring/regex replace capability in `lam.edit` for edits that line-oriented patching handles poorly.
   - `lam.edit.apply` matches whole lines only (now documented); a single-line blob such as a long embedded help string cannot be patched by targeting an inner substring and forced a shell-out to `perl`.
   - Documented the whole-line rule in the `apply` description; a targeted string replace remains a possible additive capability.

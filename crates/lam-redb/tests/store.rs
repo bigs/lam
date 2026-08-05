@@ -213,3 +213,71 @@ async fn rebuild(store: &RedbStore, actor: &ActorId) -> ActorState {
         }
     }
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn checkpoint_round_trips_and_survives_reopen() {
+    let directory = tempfile::tempdir().expect("temporary directory should exist");
+    let path = directory.path().join("checkpoint.redb");
+    let actor = ActorId::new("/root").expect("fixture actor id is valid");
+    let blob = b"checkpoint-bytes".to_vec();
+
+    {
+        let store = RedbStore::create(&path).expect("redb store should create");
+        store
+            .write_checkpoint(&actor, Revision::new(42), &blob)
+            .await
+            .expect("checkpoint write should succeed");
+        let read = store
+            .read_checkpoint(&actor)
+            .await
+            .expect("checkpoint read should succeed");
+        assert_eq!(read, Some((Revision::new(42), blob.clone())));
+    }
+
+    let reopened = RedbStore::open(&path).expect("redb store should reopen");
+    let read = reopened
+        .read_checkpoint(&actor)
+        .await
+        .expect("checkpoint read should succeed after reopen");
+    assert_eq!(read, Some((Revision::new(42), blob)));
+}
+
+#[test]
+fn legacy_database_gains_the_checkpoint_table_on_open() {
+    let directory = tempfile::tempdir().expect("temporary directory should exist");
+    let path = directory.path().join("legacy.redb");
+    // Simulate a database written before checkpoints existed: only the
+    // original two tables.
+    {
+        let db = Database::create(&path).expect("empty database should create");
+        let write = db.begin_write().expect("write transaction should begin");
+        write
+            .open_table(redb::TableDefinition::<&str, u64>::new(
+                "lam_actor_heads_v1",
+            ))
+            .expect("heads table should open");
+        write
+            .open_table(redb::TableDefinition::<(&str, u64), &[u8]>::new(
+                "lam_actor_events_v1",
+            ))
+            .expect("events table should open");
+        write.commit().expect("commit should succeed");
+    }
+
+    let store = RedbStore::open(&path).expect("legacy journal should open");
+    let actor = ActorId::new("/root").expect("fixture actor id is valid");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("test runtime should build");
+    runtime.block_on(async {
+        store
+            .write_checkpoint(&actor, Revision::new(7), b"bytes")
+            .await
+            .expect("checkpoint write should succeed on a legacy journal");
+        let read = store
+            .read_checkpoint(&actor)
+            .await
+            .expect("checkpoint read should succeed on a legacy journal");
+        assert_eq!(read, Some((Revision::new(7), b"bytes".to_vec())));
+    });
+}

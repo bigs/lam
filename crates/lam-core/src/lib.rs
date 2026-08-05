@@ -36,7 +36,8 @@ pub use model::{
     ModelResponseProjection, OutputContract, TokenUsage, ToolCallDelta,
 };
 pub use projection::{
-    ActorState, AdmissionDecision, AdmittedMessage, ProjectedContextEntry, StateError,
+    ActorState, AdmissionDecision, AdmittedMessage, Checkpoint, CheckpointEntry,
+    ProjectedContextEntry, StateError,
 };
 pub use types::{
     ActorId, CodecId, CodecRef, ComponentId, ContextSequence, EncodedPayload, InvalidIdentifier,

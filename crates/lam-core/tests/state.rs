@@ -816,3 +816,38 @@ async fn single_event_batches_validate_without_the_full_preview_clone() {
         .expect_err("an empty Messages transition is rejected");
     assert!(matches!(error, StateError::MessageBatchMismatch { .. }));
 }
+
+#[tokio::test]
+async fn checkpoint_round_trips_the_full_projection() {
+    let store = MemStore::new();
+    let actor = actor_id();
+    let first = message("m1", DeliveryMode::Steer, "hello", 1);
+    append_successfully(
+        &store,
+        &actor,
+        Revision::ZERO,
+        ActorEvent::message_admitted(first),
+    )
+    .await;
+    let state = catch_up(&store, &actor, ActorState::default()).await;
+    let run = RunId::new("r1").expect("fixture run id is valid");
+    let messages = context(
+        ContextTransition::Messages {
+            run_id: run.clone(),
+            consumed_message_ids: vec![MessageId::new("m1").expect("fixture id is valid")],
+        },
+        json!({ "messages": [1] }),
+        2,
+    );
+    append_successfully(
+        &store,
+        &actor,
+        state.revision(),
+        ActorEvent::context_appended(messages),
+    )
+    .await;
+    let state = catch_up(&store, &actor, state).await;
+
+    let restored = lam_core::Checkpoint::from_state(&state).into_state();
+    assert_eq!(state, restored);
+}

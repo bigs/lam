@@ -11,6 +11,8 @@ use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 
 const HEADS: TableDefinition<&str, u64> = TableDefinition::new("lam_actor_heads_v1");
 const EVENTS: TableDefinition<(&str, u64), &[u8]> = TableDefinition::new("lam_actor_events_v1");
+const CHECKPOINTS: TableDefinition<&str, (u64, &[u8])> =
+    TableDefinition::new("lam_actor_checkpoints_v1");
 
 /// Durable actor-journal storage in one redb database.
 pub struct RedbStore {
@@ -31,6 +33,13 @@ impl RedbStore {
         read.open_table(HEADS).map_err(database_error)?;
         read.open_table(EVENTS).map_err(database_error)?;
         drop(read);
+        // Databases written before the checkpoint table existed need it
+        // created on open so every session can bootstrap from a checkpoint.
+        let write = database.begin_write().map_err(database_error)?;
+        {
+            write.open_table(CHECKPOINTS).map_err(database_error)?;
+        }
+        write.commit().map_err(database_error)?;
         Ok(Self { database })
     }
 
@@ -39,6 +48,7 @@ impl RedbStore {
         {
             write.open_table(HEADS).map_err(database_error)?;
             write.open_table(EVENTS).map_err(database_error)?;
+            write.open_table(CHECKPOINTS).map_err(database_error)?;
         }
         write.commit().map_err(database_error)?;
         Ok(Self { database })
@@ -169,6 +179,46 @@ impl JournalStore for RedbStore {
         events: EventBatch,
     ) -> Result<AppendOutcome, JournalError<Self::Error>> {
         self.append_batch(actor, expected, events)
+    }
+
+    async fn write_checkpoint(
+        &self,
+        actor: &ActorId,
+        revision: Revision,
+        blob: &[u8],
+    ) -> Result<(), JournalError<Self::Error>> {
+        let write = self
+            .database
+            .begin_write()
+            .map_err(journal_database_error)?;
+        {
+            let mut checkpoints = write
+                .open_table(CHECKPOINTS)
+                .map_err(journal_database_error)?;
+            checkpoints
+                .insert(actor.as_str(), (revision.get(), blob))
+                .map_err(journal_database_error)?;
+        }
+        write.commit().map_err(journal_database_error)?;
+        Ok(())
+    }
+
+    async fn read_checkpoint(
+        &self,
+        actor: &ActorId,
+    ) -> Result<Option<(Revision, Vec<u8>)>, JournalError<Self::Error>> {
+        let read = self.database.begin_read().map_err(journal_database_error)?;
+        let checkpoints = read
+            .open_table(CHECKPOINTS)
+            .map_err(journal_database_error)?;
+        let Some(value) = checkpoints
+            .get(actor.as_str())
+            .map_err(journal_database_error)?
+        else {
+            return Ok(None);
+        };
+        let (revision, blob) = value.value();
+        Ok(Some((Revision::new(revision), blob.to_vec())))
     }
 }
 

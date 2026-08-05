@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
 use crate::{
     ACTOR_EVENT_SCHEMA_VERSION, ActorEvent, ActorEventData, ContextEntry, ContextSequence,
     ContextTransition, DeliveryMode, EventBatch, JournalPage, MessageEnvelope, MessageError,
@@ -8,7 +10,7 @@ use crate::{
 };
 
 /// One admitted message as viewed through the actor projection.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub struct AdmittedMessage {
     /// Journal revision which admitted the message.
     pub revision: Revision,
@@ -30,6 +32,90 @@ pub struct ProjectedContextEntry {
     /// instead of the (potentially large) payload. A future mutator would
     /// need Arc::make_mut or an explicit lock.
     pub entry: Arc<ContextEntry>,
+}
+
+/// A durable snapshot of an actor projection, used to bootstrap cold loads
+/// from the most recent compaction boundary instead of replaying the journal
+/// from revision zero.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct Checkpoint {
+    /// Journal revision the snapshot was folded through.
+    pub revision: Revision,
+    /// All admitted messages in admission order.
+    pub messages: Vec<AdmittedMessage>,
+    /// Projected context entries in sequence order.
+    pub context: Vec<CheckpointEntry>,
+    /// Durable model selection.
+    pub selected_model: Option<ModelSelection>,
+    /// Registered model descriptors.
+    pub model_descriptors: BTreeMap<ModelId, ModelDescriptor>,
+    /// Run open at the snapshot, if any.
+    pub active_run: Option<RunId>,
+    /// Runs completed by the snapshot.
+    pub completed_runs: BTreeSet<RunId>,
+    /// Runs interrupted by the snapshot.
+    pub interrupted_runs: BTreeSet<RunId>,
+}
+
+/// One projected context entry in checkpoint wire form. The entry is owned
+/// rather than Arc-shared because serde cannot deserialize Arc; loaders
+/// Arc-wrap entries when rebuilding a projection.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct CheckpointEntry {
+    /// Position in the logical context stream.
+    pub sequence: ContextSequence,
+    /// Actor-journal revision which stored the entry.
+    pub revision: Revision,
+    /// Model-visible item.
+    pub entry: ContextEntry,
+}
+
+impl Checkpoint {
+    /// Snapshots a folded projection.
+    #[must_use]
+    pub fn from_state(state: &ActorState) -> Self {
+        Self {
+            revision: state.revision,
+            messages: state.messages.clone(),
+            context: state
+                .context
+                .iter()
+                .map(|projected| CheckpointEntry {
+                    sequence: projected.sequence,
+                    revision: projected.revision,
+                    entry: (*projected.entry).clone(),
+                })
+                .collect(),
+            selected_model: state.selected_model.as_deref().cloned(),
+            model_descriptors: state.model_descriptors.clone(),
+            active_run: state.active_run.clone(),
+            completed_runs: state.completed_runs.clone(),
+            interrupted_runs: state.interrupted_runs.clone(),
+        }
+    }
+
+    /// Rebuilds the projected state this snapshot captured.
+    #[must_use]
+    pub fn into_state(self) -> ActorState {
+        ActorState {
+            revision: self.revision,
+            messages: self.messages,
+            context: self
+                .context
+                .into_iter()
+                .map(|entry| ProjectedContextEntry {
+                    sequence: entry.sequence,
+                    revision: entry.revision,
+                    entry: Arc::new(entry.entry),
+                })
+                .collect(),
+            selected_model: self.selected_model.map(Box::new),
+            model_descriptors: self.model_descriptors,
+            active_run: self.active_run,
+            completed_runs: self.completed_runs,
+            interrupted_runs: self.interrupted_runs,
+        }
+    }
 }
 
 /// Pure current-state projection of one actor journal.

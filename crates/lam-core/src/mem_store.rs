@@ -11,6 +11,7 @@ use crate::{
 /// Pure-Rust in-memory reference implementation of [`JournalStore`].
 pub struct MemStore {
     journals: RwLock<HashMap<ActorId, Vec<ActorEvent>>>,
+    checkpoints: RwLock<HashMap<ActorId, (Revision, Vec<u8>)>>,
 }
 
 impl MemStore {
@@ -19,6 +20,7 @@ impl MemStore {
     pub fn new() -> Self {
         Self {
             journals: RwLock::new(HashMap::new()),
+            checkpoints: RwLock::new(HashMap::new()),
         }
     }
 
@@ -107,5 +109,30 @@ impl JournalStore for MemStore {
             .or_default()
             .extend(events.into_vec());
         Ok(AppendOutcome::Appended { head })
+    }
+
+    async fn write_checkpoint(
+        &self,
+        actor: &ActorId,
+        revision: Revision,
+        blob: &[u8],
+    ) -> Result<(), JournalError<Self::Error>> {
+        self.checkpoints
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(actor.clone(), (revision, blob.to_vec()));
+        Ok(())
+    }
+
+    async fn read_checkpoint(
+        &self,
+        actor: &ActorId,
+    ) -> Result<Option<(Revision, Vec<u8>)>, JournalError<Self::Error>> {
+        Ok(self
+            .checkpoints
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(actor)
+            .cloned())
     }
 }

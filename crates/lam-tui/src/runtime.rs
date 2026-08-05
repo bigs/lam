@@ -273,13 +273,42 @@ impl Runtime {
         let mut agents = Vec::new();
         for actor in actor_ids {
             let address = actor.as_str().to_owned();
+            // Bootstrap the projector from the newest checkpoint so a cold
+            // start folds only post-compaction events. The checkpoint's
+            // context is rendered into rows through the same path as live
+            // folds, so the bootstrapped and fully-replayed views agree.
+            let (initial, mut initial_rows) = match store
+                .read_checkpoint(&actor)
+                .await
+                .map_err(|error| RuntimeError::AgentSystem(error.to_string()))?
+            {
+                Some((_, blob)) => match serde_json::from_slice::<lam::Checkpoint>(&blob) {
+                    Ok(checkpoint) => {
+                        let state = checkpoint.into_state();
+                        let mut rows = FoldOutcome::default();
+                        for projected in state.context() {
+                            accumulate_entry(
+                                &mut rows,
+                                &address,
+                                &projected.entry,
+                                &state,
+                                &history_models,
+                            );
+                        }
+                        (state, rows.rows)
+                    }
+                    Err(_) => (ActorState::new(), Vec::new()),
+                },
+                None => (ActorState::new(), Vec::new()),
+            };
             let mut projector = Projector {
                 actor_id: actor,
-                state: Some(ActorState::new()),
+                state: Some(initial),
             };
             let outcome = fold_projector(store.as_ref(), &history_models, &address, &mut projector)
                 .await
                 .map_err(RuntimeError::AgentSystem)?;
+            initial_rows.extend(outcome.rows);
             let state = projector
                 .state
                 .as_ref()
@@ -287,7 +316,7 @@ impl Runtime {
             agents.push(agent_history(
                 &address,
                 state,
-                outcome.rows,
+                initial_rows,
                 outcome.context_tokens,
                 address != "/root",
             ));
