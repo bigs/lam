@@ -40,9 +40,22 @@
     - Two pipes + read-lock or chunk timestamps: keeps stream labels, but ordering is heuristic (timestamps would measure read/arrival time, not the child's write time) and a read-lock risks blocking the child on a full pipe buffer. Worst of both.
     - Status quo (two pipes, separate fields): exact labels, no claimed cross-stream order.
   - Deferred pending a decision on whether guaranteed ordering (one pipe, unlabeled) is worth giving up attribution.
+- [ ] Lazy full-history transcript loading after cold boot (planned, not started).
+  - Context: projections and checkpoints now truncate context covered by a compaction marker, so a cold boot renders the transcript from the newest compaction window. Earlier rows exist only in the journal (which retains every event durably).
+  - UX: an affordance at the top of the transcript (e.g. a "── earlier history compacted; press <key> to load ──" divider row, or triggered by scrolling past the top) loads pre-compaction rows on demand.
+  - Mechanism: replay journal events for the actor from Revision::ZERO up to the checkpoint bootstrap revision through the existing fold/accumulate rendering path, then prepend the rendered rows. Build a detached ActorState fold purely for row rendering — never mutate the live projector state, and stop the fold exactly at the bootstrap revision so loaded and live rows meet without overlap.
+  - The loaded history is display-only: the compaction summary remains the model-context truth, and the marker row should still render so the boundary is visible.
+  - Memory bound: pre-compaction journals can be hundreds of MiB. v1 may load-all-on-request with a row-count/size guard; the better shape is paged loading (bounded event pages per request) since journal reads are forward-only by revision.
+  - Run the replay off the UI thread; reads can go through the existing store handle (reads are cheap and concurrent with the UI's folds).
+- [ ] Backfill the active session's catalog preview when its first user message is admitted (planned, not started).
+  - Context: session previews are cached in the catalog index (SessionRecord.preview) and backfilled at boot via a read-only journal scan. A session created with /new in the current process gets no cached preview until the next boot, because this process holds the journal read-write and the read-only scan cannot open it.
+  - Mechanism: on the first admitted user message of a session (the TUI sees the admission receipt and its projector knows the message count), write the preview to the catalog via SessionCatalog::store_preview, applying the same 300-char cap as first_user_message.
+  - Only write when the record has no preview yet; failure is best-effort (warn; the boot-time backfill remains the catch-all).
+  - Derive "first" from the projector state (first user-sourced message) rather than a separate journal scan.
 
 ## Tooling / eval harness
 
 - [ ] The eval harness rejects source whose template-literal patch strings contain backtick characters (e.g. Markdown code spans in doc comments): the transpiler parses the closing backtick as the end of the string and chokes on the remainder.
+  - Fresh failure mode (hit repeatedly while adding bincode checkpoints): any backtick inside a lam.edit.apply patch source, even in a plain doc comment, aborts the whole eval with SyntaxError: Expected ',', got '<token after the backtick>' pointing into the generated lam/cell-<n>.ts. Doc comments using code spans are the usual culprit; reword without backticks.
   - Workaround in use: keep patch and heredoc content backtick-free (plain doc wording, escaped backticks, or single-line strings with \n escapes).
   - Consider a follow-up where the harness accepts backticks inside template literals, or a helper that writes patch text to a file instead of embedding it in source.
