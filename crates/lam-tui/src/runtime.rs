@@ -18,10 +18,11 @@ use lam_openai::chat_completions::{
     ChatCompletions, ChatCompletionsCodec, ChatCompletionsProvider,
 };
 use lam_openai::responses::{Responses, ResponsesCodec, ResponsesProvider};
-use lam_redb::RedbStore;
+use lam_redb::{ReadOnlyStore, RedbStore};
 use thiserror::Error;
 use tokio::sync::mpsc;
 
+use crate::boot::{phase, phase_sync};
 use crate::config::{LoadedConfig, ModelChoice, ModelConfig, ProviderConfig, ProviderProtocol};
 use crate::session::Session;
 
@@ -199,7 +200,7 @@ impl Runtime {
         session: &Session,
         preferences: Option<&RuntimePreferences>,
     ) -> Result<Self, RuntimeError> {
-        let models = configured_models(config)?;
+        let models = phase_sync("configured_models", || configured_models(config))?;
         let effort_controls = models
             .iter()
             .map(|configured| configured.effort.clone())
@@ -219,17 +220,22 @@ impl Runtime {
         let initial = models
             .get(initial_index)
             .expect("the selected model index comes from the validated model list");
-        let coding = CodingPack::builder(&cwd)
-            .filesystem_access(FilesystemAccess::ReadWrite)
-            .shell(LocalCommandRunner::default())
-            .build()
-            .map_err(|error| RuntimeError::CodingPack(error.to_string()))?;
-        let store = RedbStore::open(&session.database_path).map_err(RuntimeError::Journal)?;
-        let system = AgentSystem::builder(store)
-            .worker_threads(default_worker_threads())
-            .max_agents(64)
-            .build()
-            .map_err(|error| RuntimeError::AgentSystem(error.to_string()))?;
+        let coding = phase_sync("coding_pack_build", || {
+            CodingPack::builder(&cwd)
+                .filesystem_access(FilesystemAccess::ReadWrite)
+                .shell(LocalCommandRunner::default())
+                .build()
+                .map_err(|error| RuntimeError::CodingPack(error.to_string()))
+        })?;
+        let store = phase_sync("redb_open", || RedbStore::open(&session.database_path))
+            .map_err(RuntimeError::Journal)?;
+        let system = phase_sync("agent_system_build", || {
+            AgentSystem::builder(store)
+                .worker_threads(default_worker_threads())
+                .max_agents(64)
+                .build()
+                .map_err(|error| RuntimeError::AgentSystem(error.to_string()))
+        })?;
         let events = system
             .take_events()
             .expect("a new agent system owns its event receiver");
@@ -261,10 +267,13 @@ impl Runtime {
             .required_instructions(instruction)
             .build()
             .map_err(|error| RuntimeError::AgentSystem(error.to_string()))?;
-        let root = system
-            .host_with_subagents(root_builder.build().actor("/root"), children)
-            .await
-            .map_err(|error| RuntimeError::AgentSystem(error.to_string()))?;
+        let root = phase("host_root_actor", async {
+            system
+                .host_with_subagents(root_builder.build().actor("/root"), children)
+                .await
+                .map_err(|error| RuntimeError::AgentSystem(error.to_string()))
+        })
+        .await?;
 
         let history_models: Arc<[ConfiguredModel]> = models.into();
         let store = system.state_store();
@@ -282,49 +291,57 @@ impl Runtime {
             // start folds only post-compaction events. The checkpoint's
             // context is rendered into rows through the same path as live
             // folds, so the bootstrapped and fully-replayed views agree.
-            let (initial, mut initial_rows) = match store
-                .read_checkpoint(&actor)
-                .await
-                .map_err(|error| RuntimeError::AgentSystem(error.to_string()))?
-            {
-                Some((_, blob)) => match serde_json::from_slice::<lam::Checkpoint>(&blob) {
-                    Ok(checkpoint) => {
-                        let state = checkpoint.into_state();
-                        let mut rows = FoldOutcome::default();
-                        for projected in state.context() {
-                            accumulate_entry(
-                                &mut rows,
-                                &address,
-                                &projected.entry,
-                                &state,
-                                &history_models,
-                            );
+            let phase_name = format!("projector_bootstrap_{address}");
+            let result = phase(&phase_name, async {
+                let (initial, mut initial_rows) = match store
+                    .read_checkpoint(&actor)
+                    .await
+                    .map_err(|error| RuntimeError::AgentSystem(error.to_string()))?
+                {
+                    Some((_, blob)) => match lam::Checkpoint::decode(&blob) {
+                        Ok(checkpoint) => {
+                            let state = checkpoint.into_state();
+                            let mut rows = FoldOutcome::default();
+                            for projected in state.context() {
+                                accumulate_entry(
+                                    &mut rows,
+                                    &address,
+                                    &projected.entry,
+                                    &state,
+                                    &history_models,
+                                );
+                            }
+                            (state, rows.rows)
                         }
-                        (state, rows.rows)
-                    }
-                    Err(_) => (ActorState::new(), Vec::new()),
-                },
-                None => (ActorState::new(), Vec::new()),
-            };
-            let mut projector = Projector {
-                actor_id: actor,
-                state: Some(initial),
-            };
-            let outcome = fold_projector(store.as_ref(), &history_models, &address, &mut projector)
-                .await
-                .map_err(RuntimeError::AgentSystem)?;
-            initial_rows.extend(outcome.rows);
-            let state = projector
-                .state
-                .as_ref()
-                .expect("a successful fold always restores the projector state");
-            agents.push(agent_history(
-                &address,
-                state,
-                initial_rows,
-                outcome.context_tokens,
-                address != "/root",
-            ));
+                        Err(_) => (ActorState::new(), Vec::new()),
+                    },
+                    None => (ActorState::new(), Vec::new()),
+                };
+                let mut projector = Projector {
+                    actor_id: actor,
+                    state: Some(initial),
+                };
+                let outcome =
+                    fold_projector(store.as_ref(), &history_models, &address, &mut projector)
+                        .await
+                        .map_err(RuntimeError::AgentSystem)?;
+                initial_rows.extend(outcome.rows);
+                let state = projector
+                    .state
+                    .as_ref()
+                    .expect("a successful fold always restores the projector state");
+                let history = agent_history(
+                    &address,
+                    state,
+                    initial_rows,
+                    outcome.context_tokens,
+                    address != "/root",
+                );
+                Ok::<_, RuntimeError>((history, projector))
+            })
+            .await?;
+            let (history, projector) = result;
+            agents.push(history);
             projectors.insert(address, projector);
         }
         agents.sort_by(|left, right| left.address.cmp(&right.address));
@@ -345,12 +362,14 @@ impl Runtime {
         // Built last so no error path in this function ever owns a multi-thread
         // tokio runtime: an unbuilt runtime needs no teardown, and a built one
         // is only dropped from quiesce on a blocking thread.
-        let command_runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .thread_name("lam-tui-command")
-            .enable_all()
-            .build()
-            .map_err(|error| RuntimeError::AgentSystem(format!("command runtime: {error}")))?;
+        let command_runtime = phase_sync("command_runtime_build", || {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_name("lam-tui-command")
+                .enable_all()
+                .build()
+                .map_err(|error| RuntimeError::AgentSystem(format!("command runtime: {error}")))
+        })?;
 
         Ok(Self {
             system,
@@ -413,6 +432,16 @@ impl Runtime {
             .and_then(|projector| projector.state.as_ref())
             .and_then(|state| state.message(&message_id))
             .is_some_and(|message| message.consumed_at.is_some())
+    }
+
+    /// Consumes the runtime and returns the actor journal store, releasing
+    /// the agent system, root actor, and projectors. Teardown paths use this
+    /// to run best-effort maintenance (journal compaction) once nothing else
+    /// holds the store.
+    pub(crate) fn into_store(self) -> Arc<RedbStore> {
+        let store = self.store.clone();
+        drop(self);
+        store
     }
 
     pub(crate) fn selected_effort(&self) -> String {
@@ -500,6 +529,36 @@ impl Runtime {
     pub(crate) async fn quiesce(&mut self) {
         quiesce_command_runtime(&mut self.command_runtime, &self.command_handles).await;
     }
+
+    /// Snapshots every projector at the journal head so the next cold boot
+    /// bootstraps from the head and folds approximately nothing. Compaction is
+    /// the only other checkpoint writer, so without this a long stretch of work
+    /// without a compaction costs a long fold at the next boot. Call after the
+    /// agent system is stopped and the command runtime is quiesced, so the
+    /// journal cannot advance past the snapshot, and before journal compaction,
+    /// so the orphaned old blobs are reclaimed in the same teardown.
+    ///
+    /// Best-effort throughout: teardown never fails because maintenance did.
+    pub(crate) async fn write_teardown_checkpoints(&mut self) {
+        for (address, projector) in &mut self.projectors {
+            if let Err(error) = checkpoint_projector(
+                self.store.as_ref(),
+                &self.history_models,
+                address,
+                projector,
+            )
+            .await
+            {
+                tracing::warn!(
+                    target: "lam_tui::runtime",
+                    event = "session.checkpoint_skipped",
+                    actor_id = %address,
+                    %error,
+                    "teardown checkpoint skipped; the next boot folds from the older checkpoint"
+                );
+            }
+        }
+    }
 }
 
 /// Drains in-flight command tasks and then drops the command runtime. Kept as
@@ -536,14 +595,16 @@ fn drop_runtime_outside_async(runtime: tokio::runtime::Runtime) {
 
 pub(crate) async fn first_user_message(session: &Session) -> Result<Option<String>, RuntimeError> {
     const PAGE_SIZE: NonZeroUsize = NonZeroUsize::new(256).expect("256 is nonzero");
-    let store = RedbStore::open(&session.database_path).map_err(RuntimeError::Journal)?;
+    // Previews are one picker row plus its search text; a bound keeps the
+    // cached copy in the session catalog small even for pasted novels.
+    const PREVIEW_MAX_CHARS: usize = 300;
+    let store = ReadOnlyStore::open(&session.database_path).map_err(RuntimeError::Journal)?;
     let actor = ActorId::new("/root").expect("the root actor ID is valid");
     let mut after = Revision::ZERO;
     loop {
         let page = store
-            .read(&actor, after, PAGE_SIZE)
-            .await
-            .map_err(|error| RuntimeError::AgentSystem(error.to_string()))?;
+            .read_page(&actor, after, PAGE_SIZE)
+            .map_err(RuntimeError::Journal)?;
         let head = page.head;
         for stored in page.events {
             after = stored.revision;
@@ -551,7 +612,12 @@ pub(crate) async fn first_user_message(session: &Session) -> Result<Option<Strin
                 continue;
             };
             if matches!(message.source(), MessageSource::User { .. }) {
-                return Ok(Some(display_json(&message.payload().value)));
+                let text = display_json(&message.payload().value);
+                let text = match text.char_indices().nth(PREVIEW_MAX_CHARS) {
+                    Some((cut, _)) => text[..cut].to_owned(),
+                    None => text,
+                };
+                return Ok(Some(text));
             }
         }
         if after >= head {
@@ -974,6 +1040,53 @@ async fn fold_projector(
     Ok(outcome)
 }
 
+/// Snapshots one projector at the journal head and reports whether a
+/// checkpoint was written. The projector is folded forward first: interruption
+/// records and other events may have landed after the last UI fold, and only a
+/// head-fresh snapshot spares the next boot a fold.
+///
+/// The write is gated on strict revision progress. Replacing a checkpoint at a
+/// revision already stored orphans the previous blob's pages, so an ungated
+/// rewrite on every quit would manufacture compaction waste for no benefit.
+async fn checkpoint_projector(
+    store: &RedbStore,
+    models: &[ConfiguredModel],
+    address: &str,
+    projector: &mut Projector,
+) -> Result<bool, String> {
+    let started = std::time::Instant::now();
+    fold_projector(store, models, address, projector).await?;
+    let state = projector.state.as_ref().ok_or_else(|| {
+        format!("the transcript projector for {address} has no folded state to snapshot")
+    })?;
+    let revision = state.revision();
+    if revision == Revision::ZERO {
+        return Ok(false);
+    }
+    let stored = store
+        .read_checkpoint(&projector.actor_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    if stored.is_some_and(|(stored, _)| stored >= revision) {
+        return Ok(false);
+    }
+    let blob = lam::Checkpoint::from_state(state).encode();
+    store
+        .write_checkpoint(&projector.actor_id, revision, &blob)
+        .await
+        .map_err(|error| error.to_string())?;
+    tracing::info!(
+        target: "lam_tui::runtime",
+        event = "session.checkpoint",
+        actor_id = %address,
+        revision = revision.get(),
+        blob_bytes = blob.len(),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "teardown checkpoint written at the journal head"
+    );
+    Ok(true)
+}
+
 fn accumulate_entry(
     outcome: &mut FoldOutcome,
     address: &str,
@@ -1283,9 +1396,9 @@ mod tests {
 
     use super::{
         AnyModel, ConfiguredModel, EffortCodec, EffortControl, HistoryKind, Projector,
-        append_model_projection, coding_instruction, drop_runtime_outside_async,
-        first_user_message, fold_projector, insert_json_path, quiesce_command_runtime,
-        runtime_notice,
+        append_model_projection, checkpoint_projector, coding_instruction,
+        drop_runtime_outside_async, first_user_message, fold_projector, insert_json_path,
+        quiesce_command_runtime, runtime_notice,
     };
     use crate::config::ModelChoice;
     use crate::session::Session;
@@ -1648,6 +1761,138 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(outcome.context_tokens, Some(12_345));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn teardown_checkpoint_snapshots_the_head_then_skips_an_unchanged_projector() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = RedbStore::create(directory.path().join("session.redb")).unwrap();
+        let actor = ActorId::new("/root").unwrap();
+        let run = RunId::new("run-1").unwrap();
+
+        let appended = store
+            .append(
+                &actor,
+                Revision::ZERO,
+                EventBatch::new(
+                    user_message("m-1", "start the task"),
+                    vec![
+                        context_entry(ContextTransition::Messages {
+                            run_id: run.clone(),
+                            consumed_message_ids: vec![MessageId::new("m-1").unwrap()],
+                        }),
+                        context_entry(ContextTransition::Model {
+                            run_id: run.clone(),
+                            progress: RunProgress::Complete,
+                        }),
+                    ],
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(appended, AppendOutcome::Appended { .. }));
+
+        let mut projector = Projector {
+            actor_id: actor.clone(),
+            state: Some(ActorState::new()),
+        };
+        fold_projector(&store, &[], "/root", &mut projector)
+            .await
+            .unwrap();
+        let head = projector.state.as_ref().unwrap().revision();
+        assert_eq!(head, Revision::new(3));
+
+        assert!(
+            checkpoint_projector(&store, &[], "/root", &mut projector)
+                .await
+                .unwrap()
+        );
+        let (revision, blob) = store.read_checkpoint(&actor).await.unwrap().unwrap();
+        assert_eq!(revision, head);
+        assert_eq!(
+            &lam::Checkpoint::decode(&blob).unwrap().into_state(),
+            projector.state.as_ref().unwrap()
+        );
+
+        // Nothing new committed: a rewrite at the stored revision would only
+        // orphan the stored blob's pages.
+        assert!(
+            !checkpoint_projector(&store, &[], "/root", &mut projector)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store.read_checkpoint(&actor).await.unwrap().unwrap().0,
+            head
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn teardown_checkpoint_folds_a_stale_projector_to_the_head() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = RedbStore::create(directory.path().join("session.redb")).unwrap();
+        let actor = ActorId::new("/root").unwrap();
+        let run = RunId::new("run-1").unwrap();
+
+        let appended = store
+            .append(
+                &actor,
+                Revision::ZERO,
+                EventBatch::new(
+                    user_message("m-1", "start the task"),
+                    vec![context_entry(ContextTransition::Messages {
+                        run_id: run.clone(),
+                        consumed_message_ids: vec![MessageId::new("m-1").unwrap()],
+                    })],
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(appended, AppendOutcome::Appended { .. }));
+        let mut projector = Projector {
+            actor_id: actor.clone(),
+            state: Some(ActorState::new()),
+        };
+        fold_projector(&store, &[], "/root", &mut projector)
+            .await
+            .unwrap();
+        assert!(
+            checkpoint_projector(&store, &[], "/root", &mut projector)
+                .await
+                .unwrap()
+        );
+
+        // Events committed after the last fold, as an interruption record
+        // appended during teardown would be.
+        let appended = store
+            .append(
+                &actor,
+                Revision::new(2),
+                EventBatch::new(
+                    context_entry(ContextTransition::Model {
+                        run_id: run.clone(),
+                        progress: RunProgress::Continue,
+                    }),
+                    vec![context_entry(ContextTransition::Eval {
+                        run_id: run.clone(),
+                    })],
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(appended, AppendOutcome::Appended { .. }));
+
+        // No intervening fold: the checkpoint pass folds forward itself.
+        assert!(
+            checkpoint_projector(&store, &[], "/root", &mut projector)
+                .await
+                .unwrap()
+        );
+        let (revision, blob) = store.read_checkpoint(&actor).await.unwrap().unwrap();
+        assert_eq!(revision, Revision::new(4));
+        let snapshot = lam::Checkpoint::decode(&blob).unwrap().into_state();
+        assert_eq!(snapshot.revision(), Revision::new(4));
+        assert_eq!(snapshot.context().len(), 3);
     }
 
     #[tokio::test(flavor = "current_thread")]

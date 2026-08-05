@@ -3,7 +3,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::JoinHandle;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use lam_core::{
     ActorId, ActorState, CompactionConfig, Compactor, DeliveryMode, EncodedPayload, JournalStore,
@@ -601,10 +601,18 @@ where
             isolate_builder = isolate_builder.max_timeout(timeout);
         }
         isolate_builder = isolate_builder.capture_console(self.capture_console);
+        let isolate_started = Instant::now();
         let isolate = isolate_builder
             .build()
             .await
             .map_err(initialization_error)?;
+        tracing::info!(
+            target: "lam::actor",
+            event = "boot.isolate_build",
+            actor_id = %self.actor_id,
+            elapsed_ms = isolate_started.elapsed().as_millis() as u64,
+            "actor isolate built"
+        );
         let system_prompt = self.system_prompt.render(&isolate.api_inventory());
         let interrupt = isolate.interrupt_handle();
         let control = Arc::new(RunControl::new(interrupt.clone()));
@@ -615,10 +623,18 @@ where
             .descriptor()
             .clone();
         let initial_selection = ModelSelection::new(self.initial_model_id, initial_descriptor);
+        let state_load_started = Instant::now();
         let (state, created) =
             ensure_model_selection(store.as_ref(), &self.actor_id, initial_selection)
                 .await
                 .map_err(initialization_error)?;
+        tracing::info!(
+            target: "lam::actor",
+            event = "boot.state_load",
+            actor_id = %self.actor_id,
+            elapsed_ms = state_load_started.elapsed().as_millis() as u64,
+            "actor state restored from the journal"
+        );
         if create_only && !created {
             return Err(ActorBuildError::ActorAlreadyExists {
                 actor_id: self.actor_id,
@@ -643,6 +659,7 @@ where
                 ),
             });
         }
+        let recovery_started = Instant::now();
         let (recovery, state) = recover_actor(
             &self.actor_id,
             store.as_ref(),
@@ -654,6 +671,13 @@ where
         )
         .await
         .map_err(initialization_error)?;
+        tracing::info!(
+            target: "lam::actor",
+            event = "boot.recovery",
+            actor_id = %self.actor_id,
+            elapsed_ms = recovery_started.elapsed().as_millis() as u64,
+            "actor startup recovery admitted"
+        );
         if let Some(event) = recovery.event {
             let _ = runtime_event_sender.try_send(event);
         }

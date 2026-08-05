@@ -1,6 +1,7 @@
 //! Interactive terminal application for the Lam coding-agent runtime.
 
 mod app;
+mod boot;
 mod config;
 mod diagnostics;
 mod runtime;
@@ -12,6 +13,7 @@ use std::env;
 use std::io::{self, stdout};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
@@ -22,12 +24,14 @@ use crossterm::terminal::{
 };
 use lam::RunEvent;
 use lam_agents::{AgentOutcome, AgentSystemEvent};
+use lam_redb::StoreFootprint;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
 use crate::app::{App, SessionChoice, SessionView};
+use crate::boot::{phase, phase_sync};
 use crate::config::LoadedConfig;
 use crate::diagnostics::DiagnosticLog;
 use crate::runtime::{Command, CommandResult, Runtime, RuntimePreferences};
@@ -63,14 +67,18 @@ async fn tokio_main() -> Result<(), AppError> {
         return Ok(());
     }
 
+    let boot_started = std::time::Instant::now();
     let cwd = env::current_dir().map_err(AppError::CurrentDirectory)?;
     let cwd = cwd
         .canonicalize()
         .map_err(AppError::CanonicalCurrentDirectory)?;
-    let config = LoadedConfig::load(args.config.as_deref()).map_err(AppError::Config)?;
+    let config = phase_sync("config_load", || LoadedConfig::load(args.config.as_deref()))
+        .map_err(AppError::Config)?;
     let config_path = config.path.display().to_string();
-    let sessions = SessionCatalog::open_default().map_err(AppError::Session)?;
-    let selection = sessions.resume_or_create(&cwd).map_err(AppError::Session)?;
+    let sessions = phase_sync("session_catalog_open", SessionCatalog::open_default)
+        .map_err(AppError::Session)?;
+    let selection = phase_sync("resume_or_create", || sessions.resume_or_create(&cwd))
+        .map_err(AppError::Session)?;
     let diagnostics = args
         .debug_log
         .then(DiagnosticLog::install)
@@ -81,20 +89,29 @@ async fn tokio_main() -> Result<(), AppError> {
             .activate(&selection.session)
             .map_err(AppError::Diagnostics)?;
     }
-    let choices = session_choices(&sessions, &cwd).await?;
+    let choices = phase("session_choices", session_choices(&sessions, &cwd)).await?;
     let mut session_lease = selection.lease;
-    let (mut runtime, mut app) = open_session(
-        &config,
-        &cwd,
-        selection.session,
-        selection.resumed,
-        &config_path,
-        choices,
-        None,
+    let (mut runtime, mut app) = phase(
+        "open_session",
+        open_session(
+            &config,
+            &cwd,
+            selection.session,
+            selection.resumed,
+            &config_path,
+            choices,
+            None,
+        ),
     )
     .await?;
 
-    let mut terminal = TerminalSession::start()?;
+    let mut terminal = phase_sync("terminal_start", TerminalSession::start)?;
+    tracing::info!(
+        target: "lam_tui::boot",
+        event = "boot.complete",
+        total_ms = boot_started.elapsed().as_millis() as u64,
+        "boot sequence complete"
+    );
     let (terminal_events, mut terminal_receiver) = mpsc::unbounded_channel();
     std::thread::Builder::new()
         .name("lam-terminal-events".to_owned())
@@ -110,6 +127,7 @@ async fn tokio_main() -> Result<(), AppError> {
 
     let mut redraw = true;
     let mut next_frame = tokio::time::Instant::now();
+    let mut background_compactions: Vec<std::thread::JoinHandle<()>> = Vec::new();
     'main: while !app.should_exit {
         if redraw && tokio::time::Instant::now() >= next_frame {
             terminal
@@ -192,7 +210,18 @@ async fn tokio_main() -> Result<(), AppError> {
                                         shutdown.map_err(|error| {
                                             AppError::Shutdown(error.to_string())
                                         })?;
-                                        drop(runtime);
+                                        // Before compaction, so the blobs these
+                                        // writes orphan are reclaimed by the
+                                        // background pass this switch spawns.
+                                        phase(
+                                            "session_switch_checkpoints",
+                                            runtime.write_teardown_checkpoints(),
+                                        )
+                                        .await;
+                                        spawn_old_session_compaction(
+                                            runtime,
+                                            &mut background_compactions,
+                                        );
                                         drop(session_lease);
                                         session_lease = next_lease;
                                         if let Some(diagnostics) = &diagnostics {
@@ -292,10 +321,19 @@ async fn tokio_main() -> Result<(), AppError> {
         }
     }
 
-    let shutdown = runtime.system.abort().await;
-    runtime.quiesce().await;
+    let shutdown = phase("shutdown_abort", runtime.system.abort()).await;
+    phase("shutdown_quiesce", runtime.quiesce()).await;
     shutdown.map_err(|error| AppError::Shutdown(error.to_string()))?;
+    // Before compaction, so the blobs these writes orphan are reclaimed by the
+    // same teardown rather than lingering as waste.
+    phase("shutdown_checkpoints", runtime.write_teardown_checkpoints()).await;
+    phase_sync("shutdown_background_compactions", || {
+        for handle in background_compactions.drain(..) {
+            let _ = handle.join();
+        }
+    });
     terminal.restore()?;
+    phase_sync("shutdown_compact_store", || compact_store(runtime));
     Ok(())
 }
 
@@ -349,6 +387,89 @@ async fn fold_and_apply(runtime: &mut Runtime, app: &mut App, address: &str) -> 
     }
 }
 
+/// Compaction of a large journal costs seconds, so teardown runs it only
+/// when it can reclaim both a meaningful absolute amount and a meaningful
+/// share of the file. Below the thresholds quit stays instant; the waste is
+/// reclaimed on a later quit once enough accumulates.
+const COMPACTION_MIN_RECLAIMABLE_BYTES: u64 = 64 * 1024 * 1024;
+
+fn worth_compacting(footprint: &StoreFootprint) -> bool {
+    footprint.reclaimable_bytes >= COMPACTION_MIN_RECLAIMABLE_BYTES
+        && footprint.reclaimable_bytes.saturating_mul(4) >= footprint.file_bytes
+}
+
+/// Best-effort journal compaction at quit, gated on measured waste. The
+/// terminal is restored first so the user sees the status line and the shell
+/// prompt is not delayed behind a frozen alternate screen. Whatever happens,
+/// the store must drop before the process exits: a clean close is what lets
+/// the next boot open the journal without a full repair.
+fn compact_store(runtime: Runtime) {
+    let store = runtime.into_store();
+    let Ok(mut store) = Arc::try_unwrap(store) else {
+        // Another owner still holds the journal; it will close when that
+        // reference drops, but no maintenance can run without exclusivity.
+        eprintln!("lam: session journal is still referenced at quit; skipping maintenance");
+        return;
+    };
+    let footprint = match store.footprint() {
+        Ok(footprint) => footprint,
+        Err(error) => {
+            eprintln!("lam: could not measure the session journal: {error}");
+            return;
+        }
+    };
+    if !worth_compacting(&footprint) {
+        return;
+    }
+    println!(
+        "lam: compacting session journal ({} MiB reclaimable)",
+        footprint.reclaimable_bytes >> 20
+    );
+    let started = std::time::Instant::now();
+    match store.compact() {
+        Ok(_) => println!(
+            "lam: session journal compacted in {:.1}s",
+            started.elapsed().as_secs_f64()
+        ),
+        Err(error) => eprintln!("lam: session journal compaction failed: {error}"),
+    }
+}
+
+/// Compacts a torn-down session journal on a background thread so a session
+/// switch is not delayed, with the same waste gate as quit. Quit joins every
+/// such thread before exiting.
+fn spawn_old_session_compaction(
+    runtime: Runtime,
+    background: &mut Vec<std::thread::JoinHandle<()>>,
+) {
+    let store = runtime.into_store();
+    let Ok(mut store) = Arc::try_unwrap(store) else {
+        return;
+    };
+    if let Ok(handle) = std::thread::Builder::new()
+        .name("lam-session-compaction".to_owned())
+        .spawn(move || {
+            if !store
+                .footprint()
+                .is_ok_and(|footprint| worth_compacting(&footprint))
+            {
+                return;
+            }
+            let started = std::time::Instant::now();
+            let relocated = store.compact();
+            tracing::info!(
+                target: "lam_tui::runtime",
+                event = "session.compaction",
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                relocated = ?relocated.ok(),
+                "old session journal compacted in the background"
+            );
+        })
+    {
+        background.push(handle);
+    }
+}
+
 async fn open_session(
     config: &LoadedConfig,
     cwd: &Path,
@@ -392,18 +513,28 @@ async fn reconcile_session_choices(
     cached: &[SessionChoice],
     fresh_session: Option<u64>,
 ) -> Result<Vec<SessionChoice>, AppError> {
-    let sessions = catalog.list(cwd).map_err(AppError::Session)?;
+    let listings = catalog.list(cwd).map_err(AppError::Session)?;
     let mut cached = cached
         .iter()
         .cloned()
         .map(|choice| (choice.id, choice))
         .collect::<BTreeMap<_, _>>();
-    let mut choices = Vec::with_capacity(sessions.len());
-    for session in sessions {
+    let mut choices = Vec::with_capacity(listings.len());
+    for listing in listings {
+        let session = listing.session;
         if fresh_session == Some(session.id) {
             choices.push(SessionChoice {
                 id: session.id,
                 preview: None,
+            });
+            continue;
+        }
+        // The catalog caches each session's first user message, so listing
+        // sessions normally never opens their journals.
+        if let Some(preview) = listing.preview {
+            choices.push(SessionChoice {
+                id: session.id,
+                preview: Some(preview),
             });
             continue;
         }
@@ -416,8 +547,28 @@ async fn reconcile_session_choices(
             choices.push(choice);
             continue;
         }
-        let preview = match runtime::first_user_message(&session).await {
-            Ok(preview) => preview,
+        let preview = match phase(
+            &format!("session_preview_{}", session.id),
+            runtime::first_user_message(&session),
+        )
+        .await
+        {
+            Ok(preview) => {
+                // Backfill the catalog so this journal scan happens once per
+                // session, ever. Best-effort: a failed write only costs a
+                // rescan on the next boot.
+                if let Some(text) = &preview
+                    && let Err(error) = catalog.store_preview(session.id, text)
+                {
+                    tracing::warn!(
+                        target: "lam_tui::session",
+                        session_id = session.id,
+                        %error,
+                        "session preview could not be cached in the catalog"
+                    );
+                }
+                preview
+            }
             Err(error) => Some(format!("Preview unavailable: {error}")),
         };
         choices.push(SessionChoice {

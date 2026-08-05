@@ -47,6 +47,14 @@ pub(crate) struct SessionCatalog {
     sessions_dir: PathBuf,
 }
 
+/// One catalog row for the session picker: identity plus the cached
+/// first-user-message preview, so listing sessions never opens their
+/// journals.
+pub(crate) struct SessionListing {
+    pub(crate) session: Session,
+    pub(crate) preview: Option<String>,
+}
+
 /// An exclusive, process-scoped claim on a session journal.
 pub(crate) struct SessionLease {
     _file: File,
@@ -59,6 +67,12 @@ struct SessionRecord {
     cwd: String,
     created_at_unix_ms: u64,
     last_opened_at_unix_ms: u64,
+    /// First user message, cached once discovered. A session's first message
+    /// never changes, so the cache never invalidates. Absent on records
+    /// written before this field existed and on sessions with no user
+    /// message yet.
+    #[serde(default)]
+    preview: Option<String>,
 }
 
 impl SessionCatalog {
@@ -133,7 +147,7 @@ impl SessionCatalog {
         self.with_write_database(|database| self.create_for_key(database, cwd))
     }
 
-    pub(crate) fn list(&self, cwd: &Path) -> Result<Vec<Session>, SessionError> {
+    pub(crate) fn list(&self, cwd: &Path) -> Result<Vec<SessionListing>, SessionError> {
         let cwd = cwd_key(cwd)?;
         self.with_read_database(|database| {
             let read = database.begin_read().map_err(database_error)?;
@@ -146,11 +160,46 @@ impl SessionCatalog {
                     .map_err(SessionError::Serialize)?;
                 validate_record(&record, id)?;
                 if record.cwd == cwd {
-                    matches.push(self.session(id, &cwd));
+                    matches.push(SessionListing {
+                        session: self.session(id, &cwd),
+                        preview: record.preview,
+                    });
                 }
             }
-            matches.sort_unstable_by_key(|session| std::cmp::Reverse(session.id));
+            matches.sort_unstable_by_key(|listing| std::cmp::Reverse(listing.session.id));
             Ok(matches)
+        })
+    }
+
+    /// Caches a session's first-user-message preview in its catalog record so
+    /// later listings serve it from the index instead of scanning the
+    /// session journal.
+    pub(crate) fn store_preview(&self, id: u64, preview: &str) -> Result<(), SessionError> {
+        self.with_write_database(|database| {
+            let record = {
+                let read = database.begin_read().map_err(database_error)?;
+                let sessions = read.open_table(SESSIONS).map_err(database_error)?;
+                let encoded = sessions
+                    .get(id)
+                    .map_err(database_error)?
+                    .ok_or(SessionError::MissingRecord { id })?;
+                serde_json::from_slice::<SessionRecord>(encoded.value())
+                    .map_err(SessionError::Serialize)?
+            };
+            validate_record(&record, id)?;
+            let updated = SessionRecord {
+                preview: Some(preview.to_owned()),
+                ..record
+            };
+            let encoded = serde_json::to_vec(&updated).map_err(SessionError::Serialize)?;
+            let write = database.begin_write().map_err(database_error)?;
+            {
+                let mut sessions = write.open_table(SESSIONS).map_err(database_error)?;
+                sessions
+                    .insert(id, encoded.as_slice())
+                    .map_err(database_error)?;
+            }
+            write.commit().map_err(database_error)
         })
     }
 
@@ -199,6 +248,7 @@ impl SessionCatalog {
             cwd: cwd.clone(),
             created_at_unix_ms: now,
             last_opened_at_unix_ms: now,
+            preview: None,
         };
         let encoded = serde_json::to_vec(&record).map_err(SessionError::Serialize)?;
         {
@@ -507,7 +557,12 @@ mod tests {
         let (_, other_lease) = catalog.create(&second_cwd).unwrap();
 
         assert_eq!(
-            catalog.list(&first_cwd).unwrap(),
+            catalog
+                .list(&first_cwd)
+                .unwrap()
+                .into_iter()
+                .map(|listing| listing.session)
+                .collect::<Vec<_>>(),
             vec![newest, oldest.clone()]
         );
         drop((oldest_lease, newest_lease, other_lease));
@@ -533,8 +588,34 @@ mod tests {
 
         assert_ne!(first.session.id, second.session.id);
         assert_eq!(
-            first_catalog.list(&cwd).unwrap(),
+            first_catalog
+                .list(&cwd)
+                .unwrap()
+                .into_iter()
+                .map(|listing| listing.session)
+                .collect::<Vec<_>>(),
             vec![second.session.clone(), first.session.clone()]
+        );
+    }
+
+    #[test]
+    fn previews_are_cached_in_the_index_once_stored() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        let catalog = SessionCatalog::open(temp.path().join("lam-home")).unwrap();
+
+        let (session, _lease) = catalog.create(&cwd).unwrap();
+        let listed = catalog.list(&cwd).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].preview, None, "a fresh session has no preview");
+
+        catalog.store_preview(session.id, "first message").unwrap();
+        let listed = catalog.list(&cwd).unwrap();
+        assert_eq!(listed[0].preview.as_deref(), Some("first message"));
+
+        assert!(
+            catalog.store_preview(9_999, "orphan").is_err(),
+            "previews only attach to existing records"
         );
     }
 }

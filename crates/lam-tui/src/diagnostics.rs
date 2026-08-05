@@ -23,7 +23,12 @@ impl DiagnosticLog {
         let writer = SessionWriter::default();
         let filter = tracing_subscriber::filter::Targets::new()
             .with_target("lam", tracing::Level::TRACE)
+            .with_target("lam_agents", tracing::Level::TRACE)
+            .with_target("lam_code", tracing::Level::TRACE)
+            .with_target("lam_core", tracing::Level::TRACE)
+            .with_target("lam_deno", tracing::Level::TRACE)
             .with_target("lam_openai", tracing::Level::TRACE)
+            .with_target("lam_redb", tracing::Level::TRACE)
             .with_target("lam_tui", tracing::Level::TRACE);
         let formatter = tracing_subscriber::fmt::layer()
             .json()
