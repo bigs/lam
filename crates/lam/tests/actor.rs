@@ -446,7 +446,11 @@ async fn manual_compaction_materializes_one_durable_replay_record() {
     ));
 
     let state = actor_ref.state().await.expect("state should project");
-    assert_eq!(state.context().len(), 3);
+    assert_eq!(
+        state.context().len(),
+        1,
+        "the projection keeps only the marker; the journal keeps the history"
+    );
     let marker = state.context().last().unwrap();
     let record = CompactionRecord::decode(&marker.entry.payload)
         .unwrap()
@@ -476,8 +480,8 @@ async fn manual_compaction_materializes_one_durable_replay_record() {
     let state = actor_ref.state().await.expect("state should project");
     assert_eq!(
         state.context().len(),
-        5,
-        "raw pre-compaction entries remain"
+        3,
+        "only the post-compaction window is projected"
     );
 }
 
@@ -883,15 +887,15 @@ async fn repeated_compaction_updates_the_summary_and_selects_the_newest_marker()
         .iter()
         .filter(|entry| matches!(entry.entry.transition, ContextTransition::Compaction { .. }))
         .collect::<Vec<_>>();
-    assert_eq!(markers.len(), 2);
-    let newest = CompactionRecord::decode(&markers[1].entry.payload)
+    assert_eq!(markers.len(), 1, "the covered first marker is truncated");
+    let newest = CompactionRecord::decode(&markers[0].entry.payload)
         .unwrap()
         .unwrap();
     assert_eq!(newest.artifact.unwrap().summary, "summary two");
     assert_eq!(
         state.context().len(),
-        8,
-        "both covered prefixes remain durable"
+        3,
+        "only the newest marker and its tail are projected"
     );
 
     let requests = provider.requests();
@@ -958,9 +962,9 @@ async fn threshold_compaction_is_transparent_and_emits_run_events() {
     assert_eq!(requests[0].value["enableEval"], false);
     assert_eq!(requests[1].value["enableEval"], true);
     let state = actor_ref.state().await.unwrap();
-    assert_eq!(state.context().len(), 3);
+    assert_eq!(state.context().len(), 2, "the covered prefix is truncated");
     assert!(matches!(
-        state.context()[1].entry.transition,
+        state.context()[0].entry.transition,
         ContextTransition::Compaction { .. }
     ));
 }

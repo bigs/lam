@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::{Read, Write};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -70,6 +71,16 @@ pub struct CheckpointEntry {
     pub entry: ContextEntry,
 }
 
+/// Marker prefixing checkpoint blobs written in the current compressed
+/// format. Legacy JSON blobs predating the marker do not carry it.
+const CHECKPOINT_COMPRESSED_MAGIC: &[u8] = b"LAMC";
+
+/// A persisted checkpoint blob could not be decoded in either the current
+/// compressed format or the legacy JSON format.
+#[derive(Debug, thiserror::Error)]
+#[error("checkpoint blob could not be decoded: {0}")]
+pub struct CheckpointDecodeError(String);
+
 impl Checkpoint {
     /// Snapshots a folded projection.
     #[must_use]
@@ -94,15 +105,52 @@ impl Checkpoint {
         }
     }
 
-    /// Rebuilds the projected state this snapshot captured.
+    /// Reports whether this snapshot still carries context entries covered by
+    /// its own newest compaction marker. Projections truncate covered entries
+    /// when the marker folds, so this is true only for checkpoints written
+    /// before truncation existed; loaders use it to rewrite such checkpoints
+    /// once in the current compact form.
+    #[must_use]
+    pub fn has_covered_context(&self) -> bool {
+        let newest = self
+            .context
+            .iter()
+            .rev()
+            .find_map(|entry| match entry.entry.transition {
+                ContextTransition::Compaction { covers_through, .. } => Some(covers_through),
+                _ => None,
+            });
+        // Entries are in sequence order, so a covered entry exists exactly
+        // when the first entry is covered.
+        newest.is_some_and(|covers_through| {
+            self.context
+                .first()
+                .is_some_and(|entry| entry.sequence <= covers_through)
+        })
+    }
+
+    /// Rebuilds the projected state this snapshot captured. Entries covered
+    /// by the snapshot's newest compaction marker are dropped so legacy
+    /// checkpoints rebuild the same truncated projection a fresh fold of the
+    /// journal produces.
     #[must_use]
     pub fn into_state(self) -> ActorState {
+        let newest = self
+            .context
+            .iter()
+            .rev()
+            .find_map(|entry| match entry.entry.transition {
+                ContextTransition::Compaction { covers_through, .. } => Some(covers_through),
+                _ => None,
+            });
+        let covered = newest.unwrap_or(ContextSequence::ZERO);
         ActorState {
             revision: self.revision,
             messages: self.messages,
             context: self
                 .context
                 .into_iter()
+                .filter(|entry| entry.sequence > covered)
                 .map(|entry| ProjectedContextEntry {
                     sequence: entry.sequence,
                     revision: entry.revision,
@@ -114,6 +162,49 @@ impl Checkpoint {
             active_run: self.active_run,
             completed_runs: self.completed_runs,
             interrupted_runs: self.interrupted_runs,
+        }
+    }
+
+    /// Encodes this checkpoint into a self-describing blob: a zlib-compressed
+    /// JSON payload prefixed by a format marker so decode can distinguish it
+    /// from legacy JSON blobs without a rewrite.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut blob = CHECKPOINT_COMPRESSED_MAGIC.to_vec();
+        let json = serde_json::to_vec(self).expect("Checkpoint JSON serialization cannot fail");
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(&mut blob, flate2::Compression::default());
+        encoder
+            .write_all(&json)
+            .expect("compression into a Vec writer cannot fail");
+        encoder
+            .finish()
+            .expect("compression into a Vec writer cannot fail");
+        blob
+    }
+
+    /// Reports whether a persisted blob is already in the current compressed
+    /// format. Loaders rewrite legacy JSON blobs once so later loads skip
+    /// the large-blob decode.
+    #[must_use]
+    pub fn blob_is_current(blob: &[u8]) -> bool {
+        blob.starts_with(CHECKPOINT_COMPRESSED_MAGIC)
+    }
+
+    /// Decodes a checkpoint blob in the current compressed format or the
+    /// legacy JSON format. Returns an error for unrecognized or malformed
+    /// blobs so callers can fall back to a full journal replay.
+    pub fn decode(blob: &[u8]) -> Result<Self, CheckpointDecodeError> {
+        if blob.starts_with(CHECKPOINT_COMPRESSED_MAGIC) {
+            let mut decoder =
+                flate2::read::ZlibDecoder::new(&blob[CHECKPOINT_COMPRESSED_MAGIC.len()..]);
+            let mut json = Vec::new();
+            decoder
+                .read_to_end(&mut json)
+                .map_err(|error| CheckpointDecodeError(error.to_string()))?;
+            serde_json::from_slice(&json).map_err(|error| CheckpointDecodeError(error.to_string()))
+        } else {
+            serde_json::from_slice(blob).map_err(|error| CheckpointDecodeError(error.to_string()))
         }
     }
 }
@@ -504,8 +595,16 @@ impl ActorState {
                 progress: RunProgress::Continue,
                 ..
             }
-            | ContextTransition::Eval { .. }
-            | ContextTransition::Compaction { .. } => {}
+            | ContextTransition::Eval { .. } => {}
+            ContextTransition::Compaction { covers_through, .. } => {
+                // The journal keeps every covered entry durably; the
+                // projection retains only the effective window so state and
+                // checkpoint sizes stay proportional to post-compaction
+                // context instead of growing with session length.
+                let covers_through = *covers_through;
+                self.context
+                    .retain(|projected| projected.sequence > covers_through);
+            }
         }
 
         self.context.push(ProjectedContextEntry {

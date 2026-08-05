@@ -136,7 +136,11 @@ async fn actor_projection_survives_database_reopen() {
     assert_eq!(record.artifact.unwrap().summary, "complete");
     assert_eq!(record.source.unwrap().value["raw"], "provider response");
     assert_eq!(record.replacement.value["text"], "complete");
-    assert_eq!(state.context().len(), 3, "raw context remains available");
+    assert_eq!(
+        state.context().len(),
+        1,
+        "the projection keeps only the marker; the journal keeps the raw events"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]

@@ -230,8 +230,8 @@ where
             .is_empty()
     );
     assert!(
-        state.context().len() >= 3,
-        "raw covered context remains present"
+        state.context().len() >= 2,
+        "the marker and its post-compaction tail are projected"
     );
     assert!(
         observation.output.contains("COMPACTION_OK"),

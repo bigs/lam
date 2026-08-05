@@ -103,6 +103,41 @@ async fn catch_up(store: &MemStore, actor: &ActorId, mut state: ActorState) -> A
     }
 }
 
+/// Folds one event onto a projection at the next journal revision.
+fn fold_event(state: ActorState, event: ActorEvent) -> ActorState {
+    let revision = state
+        .revision()
+        .checked_advance(1)
+        .expect("fixture revision fits");
+    state
+        .fold_page(JournalPage {
+            head: revision,
+            events: vec![StoredEvent { revision, event }],
+        })
+        .expect("fixture event should project")
+}
+
+/// Builds a `bytes`-long payload string that resists zlib compression, so a
+/// checkpoint blob's size tracks the context it retains rather than how well a
+/// repeated pattern collapses. `label` varies the bytes between entries.
+fn noisy_payload(label: &str, bytes: usize) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+-";
+    let mut noise = label
+        .bytes()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |state, byte| {
+            state.wrapping_mul(0x0100_0000_01b3) ^ u64::from(byte)
+        });
+    let mut payload = String::with_capacity(bytes);
+    for _ in 0..bytes {
+        noise = noise
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        let index = usize::try_from(noise >> 58).expect("six bits index the alphabet");
+        payload.push(char::from(ALPHABET[index]));
+    }
+    payload
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn admission_is_idempotent_and_context_is_a_pure_projection() {
     let store = MemStore::new();
@@ -487,7 +522,7 @@ async fn queued_message_does_not_block_current_run_completion() {
 }
 
 #[test]
-fn newest_compatible_compaction_is_projected_without_discarding_history() {
+fn compaction_truncates_covered_entries_and_keeps_sequences_monotonic() {
     let mut state = ActorState::new();
     let codec_a = CodecRef::new(CodecId::new("provider/a").expect("fixture id is valid"), 1);
     let codec_b = CodecRef::new(CodecId::new("provider/b").expect("fixture id is valid"), 1);
@@ -505,7 +540,7 @@ fn newest_compatible_compaction_is_projected_without_discarding_history() {
                 covers_through: ContextSequence::new(1),
                 run_id: None,
             },
-            payload: EncodedPayload::new(codec_b, json!({ "summary": "other" })),
+            payload: EncodedPayload::new(codec_b.clone(), json!({ "summary": "other" })),
             recorded_at: Timestamp::from_unix_millis(2),
         },
         ContextEntry {
@@ -531,12 +566,201 @@ fn newest_compatible_compaction_is_projected_without_discarding_history() {
             .expect("compaction marker should project");
     }
 
+    // Each marker covers its predecessor, so only the newest survives; the
+    // journal, not the projection, retains the covered history.
+    assert_eq!(
+        state.context().len(),
+        1,
+        "covered entries leave the projection"
+    );
     let latest = state
         .latest_compaction_matching(|entry| entry.payload.codec == codec_a)
         .expect("compatible marker should exist");
     assert_eq!(latest.sequence.get(), 3);
     assert_eq!(latest.entry.payload.value, json!({ "summary": "new" }));
-    assert_eq!(state.context().len(), 3, "raw history remains intact");
+    assert!(
+        state
+            .latest_compaction_matching(|entry| entry.payload.codec == codec_b)
+            .is_none(),
+        "covered markers are no longer projected"
+    );
+    // Sequence numbering continues past the dropped entries.
+    assert_eq!(state.context_sequence(), ContextSequence::new(3));
+}
+
+#[test]
+fn legacy_checkpoints_with_covered_context_normalize_on_load() {
+    // Build the projection shape checkpoints had before truncation existed:
+    // raw entries followed by a compaction marker covering them.
+    let run = RunId::new("r1").expect("fixture run id is valid");
+    let mut state = ActorState::new();
+    let events = [
+        ActorEvent::message_admitted(message("m1", DeliveryMode::Steer, "hello", 1)),
+        ActorEvent::context_appended(context(
+            ContextTransition::Messages {
+                run_id: run.clone(),
+                consumed_message_ids: message_ids(&["m1"]),
+            },
+            json!({ "messages": [1] }),
+            2,
+        )),
+        ActorEvent::context_appended(context(
+            ContextTransition::Model {
+                run_id: run.clone(),
+                progress: RunProgress::Complete,
+            },
+            json!({ "text": "done" }),
+            3,
+        )),
+    ];
+    for (index, event) in events.into_iter().enumerate() {
+        let revision = Revision::new(u64::try_from(index + 1).expect("fixture revision fits"));
+        state = state
+            .fold_page(JournalPage {
+                head: revision,
+                events: vec![StoredEvent { revision, event }],
+            })
+            .expect("journal should project");
+    }
+    let mut checkpoint = lam_core::Checkpoint::from_state(&state);
+    assert!(!checkpoint.has_covered_context());
+
+    // Splice a covering marker in as if the checkpoint predated truncation.
+    let marker = state
+        .plan_context_append(context(
+            ContextTransition::Compaction {
+                covers_through: ContextSequence::new(2),
+                run_id: None,
+            },
+            json!({ "summary": "covered" }),
+            4,
+        ))
+        .expect("marker appends");
+    let head = state.revision();
+    let next = head.checked_advance(1).expect("fixture revision fits");
+    state = state
+        .fold_page(JournalPage {
+            head: next,
+            events: vec![StoredEvent {
+                revision: next,
+                event: marker,
+            }],
+        })
+        .expect("marker should project");
+    let truncated = lam_core::Checkpoint::from_state(&state);
+    checkpoint.revision = truncated.revision;
+    checkpoint.context.extend(
+        truncated
+            .context
+            .iter()
+            .filter(|entry| entry.sequence.get() == 3)
+            .cloned(),
+    );
+    assert!(checkpoint.has_covered_context());
+
+    // Loading the legacy shape rebuilds the same truncated projection a
+    // fresh fold of the journal produces.
+    assert_eq!(checkpoint.into_state(), state);
+}
+
+#[test]
+fn checkpoint_size_is_bounded_by_the_compaction_window() {
+    /// Compaction cycles to fold; a long-lived session runs far more.
+    const CYCLES: usize = 20;
+    /// Size of each large context payload, model input and output alike.
+    const PAYLOAD_BYTES: usize = 32 * 1024;
+    /// Per-cycle slack for what a checkpoint legitimately retains for the whole
+    /// session: the tiny admitted messages and the completed-run set.
+    const SLACK_PER_CYCLE: usize = 2048;
+
+    let mut state = ActorState::new();
+    let mut time = 0;
+    let mut baseline = None;
+
+    for cycle in 1..=CYCLES {
+        let run = RunId::new(format!("run-{cycle}")).expect("fixture run id is valid");
+        let message_id = format!("m{cycle}");
+
+        // Admitted messages are never truncated, so keep them tiny; only the
+        // context payloads should register in the size comparison below.
+        time += 1;
+        state = fold_event(
+            state,
+            ActorEvent::message_admitted(message(&message_id, DeliveryMode::Steer, "hi", time)),
+        );
+        time += 1;
+        state = fold_event(
+            state,
+            ActorEvent::context_appended(context(
+                ContextTransition::Messages {
+                    run_id: run.clone(),
+                    consumed_message_ids: message_ids(&[message_id.as_str()]),
+                },
+                json!({ "messages": [noisy_payload(&format!("input-{cycle}"), PAYLOAD_BYTES)] }),
+                time,
+            )),
+        );
+        time += 1;
+        state = fold_event(
+            state,
+            ActorEvent::context_appended(context(
+                ContextTransition::Model {
+                    run_id: run,
+                    progress: RunProgress::Complete,
+                },
+                json!({ "text": noisy_payload(&format!("output-{cycle}"), PAYLOAD_BYTES) }),
+                time,
+            )),
+        );
+
+        // The marker covers every entry folded so far, so the window it
+        // summarizes leaves the projection.
+        let covers_through = state.context_sequence();
+        time += 1;
+        state = fold_event(
+            state,
+            ActorEvent::context_appended(context(
+                ContextTransition::Compaction {
+                    covers_through,
+                    run_id: None,
+                },
+                json!({ "summary": format!("compacted through cycle {cycle}") }),
+                time,
+            )),
+        );
+
+        // One window's worth of history, for comparison against the full run.
+        if cycle == 2 {
+            baseline = Some(lam_core::Checkpoint::from_state(&state).encode().len());
+        }
+    }
+
+    let baseline = baseline.expect("the second cycle records the baseline");
+    let final_size = lam_core::Checkpoint::from_state(&state).encode().len();
+    assert_eq!(
+        state.context().len(),
+        1,
+        "only the newest compaction marker stays projected"
+    );
+
+    // A failure here means checkpoint size scales with total history instead of
+    // the post-compaction window -- the regression that grew a real session's
+    // snapshot to 284 MB and its cold boot to ~34 seconds.
+    let bound = baseline + CYCLES * SLACK_PER_CYCLE;
+    assert!(
+        final_size <= bound,
+        "checkpoint grew with history: {final_size} bytes after {CYCLES} cycles, \
+         against a {bound}-byte bound around the {baseline}-byte one-window baseline"
+    );
+
+    // The bound has teeth: were covered entries retained, the final blob would
+    // carry every cycle's two large payloads and overshoot it by far.
+    let history = CYCLES * 2 * PAYLOAD_BYTES;
+    assert!(
+        bound < history,
+        "the bound must sit well below the {history} bytes of context payload a \
+         history-scaled checkpoint would carry"
+    );
 }
 
 #[test]
@@ -850,4 +1074,55 @@ async fn checkpoint_round_trips_the_full_projection() {
 
     let restored = lam_core::Checkpoint::from_state(&state).into_state();
     assert_eq!(state, restored);
+}
+
+#[tokio::test]
+async fn checkpoint_encode_and_decode_accept_both_formats() {
+    let store = MemStore::new();
+    let actor = actor_id();
+    let first = message("m1", DeliveryMode::Steer, "hello", 1);
+    append_successfully(
+        &store,
+        &actor,
+        Revision::ZERO,
+        ActorEvent::message_admitted(first),
+    )
+    .await;
+    let state = catch_up(&store, &actor, ActorState::default()).await;
+    let run = RunId::new("r1").expect("fixture run id is valid");
+    let messages = context(
+        ContextTransition::Messages {
+            run_id: run.clone(),
+            consumed_message_ids: vec![MessageId::new("m1").expect("fixture id is valid")],
+        },
+        json!({ "messages": [1] }),
+        2,
+    );
+    append_successfully(
+        &store,
+        &actor,
+        state.revision(),
+        ActorEvent::context_appended(messages),
+    )
+    .await;
+    let state = catch_up(&store, &actor, state).await;
+    let checkpoint = lam_core::Checkpoint::from_state(&state);
+
+    let binary = checkpoint.encode();
+    assert!(
+        binary.starts_with(b"LAMC"),
+        "compressed blob carries the marker"
+    );
+    let decoded = lam_core::Checkpoint::decode(&binary).expect("compressed blob decodes");
+    assert_eq!(checkpoint, decoded);
+
+    let legacy = serde_json::to_vec(&checkpoint).expect("legacy JSON blob serializes");
+    let decoded = lam_core::Checkpoint::decode(&legacy).expect("legacy JSON blob decodes");
+    assert_eq!(checkpoint, decoded);
+
+    assert!(lam_core::Checkpoint::decode(b"not-a-checkpoint").is_err());
+    assert!(
+        lam_core::Checkpoint::decode(&binary[..binary.len() / 2]).is_err(),
+        "a mid-stream-truncated compressed blob must not decode"
+    );
 }
