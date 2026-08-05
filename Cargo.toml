@@ -43,3 +43,18 @@ unsafe_code = "deny"
 
 [workspace.lints.clippy]
 all = "warn"
+
+# The journal store and checkpoint compression run hot at boot and teardown;
+# unoptimized dev builds make a clean 400 MiB journal open take seconds
+# instead of tens of milliseconds. Optimize just those dependencies.
+[profile.dev.package.redb]
+opt-level = 3
+
+[profile.dev.package.flate2]
+opt-level = 3
+
+[profile.dev.package.miniz_oxide]
+opt-level = 3
+
+[profile.dev.package.simd-adler32]
+opt-level = 3
