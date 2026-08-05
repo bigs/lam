@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 
 use lam::{
     ActorEventData, ActorId, ActorState, CompactionArtifact, CompactionRecord, ContextEntry,
@@ -24,6 +25,12 @@ use tokio::sync::mpsc;
 use crate::config::{LoadedConfig, ModelChoice, ModelConfig, ProviderConfig, ProviderProtocol};
 use crate::session::Session;
 
+/// How long a quit or session switch waits for in-flight command tasks before
+/// abandoning them and dropping the command runtime. Commands are normally
+/// fast (steers, interrupts); the bound exists so a long compaction cannot
+/// stall teardown indefinitely.
+const COMMAND_DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
+
 pub(crate) struct Runtime {
     pub(crate) system: AgentSystem<RedbStore>,
     pub(crate) root: Agent<RedbStore>,
@@ -37,7 +44,11 @@ pub(crate) struct Runtime {
     /// Executor for TUI commands. Command futures do journal I/O, including
     /// durable fsyncs, and must never run on the UI's single-thread runtime,
     /// where they would freeze rendering and input for their duration.
-    command_runtime: tokio::runtime::Runtime,
+    command_runtime: Option<tokio::runtime::Runtime>,
+    /// Handles of in-flight command tasks. Quiescence drains these before the
+    /// command runtime is dropped so a quit or session switch never abandons
+    /// a durable operation mid-flight.
+    command_handles: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     /// One transcript projector per journaled actor. The projector is the
     /// TUI's only source of committed transcript content: it folds journal
     /// pages incrementally and renders each committed context entry through
@@ -219,12 +230,6 @@ impl Runtime {
             .max_agents(64)
             .build()
             .map_err(|error| RuntimeError::AgentSystem(error.to_string()))?;
-        let command_runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .thread_name("lam-tui-command")
-            .enable_all()
-            .build()
-            .map_err(|error| RuntimeError::AgentSystem(format!("command runtime: {error}")))?;
         let events = system
             .take_events()
             .expect("a new agent system owns its event receiver");
@@ -337,6 +342,15 @@ impl Runtime {
             .iter()
             .position(|model| model.registry_id == selected_model_id)
             .expect("runtime registration mirrors the validated model list");
+        // Built last so no error path in this function ever owns a multi-thread
+        // tokio runtime: an unbuilt runtime needs no teardown, and a built one
+        // is only dropped from quiesce on a blocking thread.
+        let command_runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("lam-tui-command")
+            .enable_all()
+            .build()
+            .map_err(|error| RuntimeError::AgentSystem(format!("command runtime: {error}")))?;
 
         Ok(Self {
             system,
@@ -348,7 +362,8 @@ impl Runtime {
             effort_controls,
             history_models,
             store,
-            command_runtime,
+            command_runtime: Some(command_runtime),
+            command_handles: Mutex::new(Vec::new()),
             projectors,
         })
     }
@@ -407,7 +422,11 @@ impl Runtime {
     pub(crate) fn execute(&self, command: Command, output: mpsc::UnboundedSender<CommandResult>) {
         let root = self.root.clone();
         let effort_controls = self.effort_controls.clone();
-        self.command_runtime.spawn(async move {
+        let runtime = self
+            .command_runtime
+            .as_ref()
+            .expect("the command runtime is present while the TUI is running");
+        let handle = runtime.spawn(async move {
             let result = match command {
                 Command::Message(input) => {
                     let result = match root.send(input.clone(), DeliveryMode::Steer).await {
@@ -471,6 +490,47 @@ impl Runtime {
             };
             let _ = output.send(result);
         });
+        self.command_handles.lock().unwrap().push(handle);
+    }
+
+    /// Winds the command executor down: waits up to COMMAND_DRAIN_TIMEOUT for
+    /// in-flight command tasks, then drops the multi-thread command runtime on
+    /// a thread where blocking is permitted. Call before dropping the Runtime
+    /// on the quit and session-switch paths.
+    pub(crate) async fn quiesce(&mut self) {
+        quiesce_command_runtime(&mut self.command_runtime, &self.command_handles).await;
+    }
+}
+
+/// Drains in-flight command tasks and then drops the command runtime. Kept as
+/// a free function so the teardown sequence is testable without a full
+/// Runtime.
+async fn quiesce_command_runtime(
+    command_runtime: &mut Option<tokio::runtime::Runtime>,
+    command_handles: &Mutex<Vec<tokio::task::JoinHandle<()>>>,
+) {
+    let handles = std::mem::take(&mut *command_handles.lock().unwrap());
+    let drain = async {
+        for handle in handles {
+            let _ = handle.await;
+        }
+    };
+    let _ = tokio::time::timeout(COMMAND_DRAIN_TIMEOUT, drain).await;
+    if let Some(runtime) = command_runtime.take() {
+        drop_runtime_outside_async(runtime);
+    }
+}
+
+/// Dropping a multi-thread tokio runtime joins its worker threads, which is
+/// only permitted where blocking is allowed. tokio_main tears down inside a
+/// current-thread async context, so the runtime is handed to a plain thread,
+/// the canonical context where runtime shutdown may block, and joined.
+fn drop_runtime_outside_async(runtime: tokio::runtime::Runtime) {
+    let thread = std::thread::Builder::new()
+        .name("lam-tui-command-shutdown".to_owned())
+        .spawn(move || drop(runtime));
+    if let Ok(handle) = thread {
+        let _ = handle.join();
     }
 }
 
@@ -1223,8 +1283,9 @@ mod tests {
 
     use super::{
         AnyModel, ConfiguredModel, EffortCodec, EffortControl, HistoryKind, Projector,
-        append_model_projection, coding_instruction, first_user_message, fold_projector,
-        insert_json_path, runtime_notice,
+        append_model_projection, coding_instruction, drop_runtime_outside_async,
+        first_user_message, fold_projector, insert_json_path, quiesce_command_runtime,
+        runtime_notice,
     };
     use crate::config::ModelChoice;
     use crate::session::Session;
@@ -1818,5 +1879,58 @@ mod tests {
         );
         assert_eq!(request["body"]["reasoning"]["effort"], "low");
         assert!(control.set("max").is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropping_a_multi_thread_runtime_inside_an_async_context_panics() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(runtime)));
+        assert!(
+            panic.is_err(),
+            "tokio forbids dropping a multi-thread runtime inside an async context"
+        );
+    }
+
+    #[test]
+    fn dropping_a_multi_thread_runtime_outside_async_does_not_panic() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        drop_runtime_outside_async(runtime);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn quiesce_drains_in_flight_tasks_then_drops_the_command_runtime() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let mut runtime = Some(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let handles = std::sync::Mutex::new(Vec::new());
+        let finished = Arc::new(AtomicBool::new(false));
+        let flag = finished.clone();
+        let handle = runtime.as_ref().unwrap().spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            flag.store(true, Ordering::SeqCst);
+        });
+        handles.lock().unwrap().push(handle);
+
+        quiesce_command_runtime(&mut runtime, &handles).await;
+
+        assert!(runtime.is_none(), "quiesce takes the command runtime");
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "quiesce waits for in-flight command tasks to finish"
+        );
     }
 }

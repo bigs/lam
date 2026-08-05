@@ -187,7 +187,9 @@ async fn tokio_main() -> Result<(), AppError> {
                                             .terminal
                                             .draw(|frame| ui::render(frame, &mut app))
                                             .map_err(AppError::Terminal)?;
-                                        runtime.system.shutdown().await.map_err(|error| {
+                                        let shutdown = runtime.system.shutdown().await;
+                                        runtime.quiesce().await;
+                                        shutdown.map_err(|error| {
                                             AppError::Shutdown(error.to_string())
                                         })?;
                                         drop(runtime);
@@ -290,11 +292,9 @@ async fn tokio_main() -> Result<(), AppError> {
         }
     }
 
-    runtime
-        .system
-        .abort()
-        .await
-        .map_err(|error| AppError::Shutdown(error.to_string()))?;
+    let shutdown = runtime.system.abort().await;
+    runtime.quiesce().await;
+    shutdown.map_err(|error| AppError::Shutdown(error.to_string()))?;
     terminal.restore()?;
     Ok(())
 }
