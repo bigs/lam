@@ -380,13 +380,11 @@ impl ModelProvider for ChatCompletionsProvider {
                         tool_argument_bytes = emitted.tool_argument_bytes,
                         "completed Chat Completions stream"
                     );
-                    Ok(response_payload(
-                        CHAT_RESPONSE_CODEC_ID,
-                        request.output_kind,
-                        &model,
-                        "chunks",
-                        Value::Array(chunks),
-                    ))
+                    folded_response(request.output_kind, &model, &chunks).map_err(|error| {
+                        ProviderError::Codec {
+                            message: error.to_string(),
+                        }
+                    })
                 }
                 StreamBody::Json(response) => {
                     if let Some(error) = response.get("error") {
@@ -478,6 +476,7 @@ const fn provider_error_kind(error: &ProviderError) -> &'static str {
         ProviderError::InvalidEventJson { .. } => "invalid_event_json",
         ProviderError::Api { .. } => "api",
         ProviderError::MissingTerminal { .. } => "missing_terminal",
+        ProviderError::Codec { .. } => "codec",
     }
 }
 
@@ -955,6 +954,46 @@ fn streamed_finish_reason(chunks: &[Value]) -> Option<String> {
         .map(str::to_owned)
 }
 
+fn streamed_usage(chunks: &[Value]) -> Option<Value> {
+    chunks
+        .iter()
+        .rev()
+        .find_map(|chunk| chunk.get("usage").cloned())
+}
+
+/// Folds a completed Chat Completions SSE stream into the native response
+/// shape the codec replays, instead of persisting the raw chunk transport.
+///
+/// The folded object mirrors the non-streaming endpoint response under the
+/// response field, so every reader (response_message, response_metadata,
+/// and encode_context) treats streamed and non-streamed responses identically.
+fn folded_response(
+    output_kind: OutputKind,
+    model: &str,
+    chunks: &[Value],
+) -> Result<EncodedPayload, CodecError> {
+    let resolved_model = chunks
+        .iter()
+        .rev()
+        .find_map(|chunk| chunk.get("model").and_then(Value::as_str))
+        .unwrap_or(model);
+    Ok(response_payload(
+        CHAT_RESPONSE_CODEC_ID,
+        output_kind,
+        resolved_model,
+        "response",
+        json!({
+            "model": resolved_model,
+            "choices": [{
+                "index": 0,
+                "message": assemble_message(chunks)?,
+                "finish_reason": streamed_finish_reason(chunks),
+            }],
+            "usage": streamed_usage(chunks),
+        }),
+    ))
+}
+
 fn assemble_message(chunks: &[Value]) -> Result<Value, CodecError> {
     let mut message = Value::Object(Map::new());
     let mut found = false;
@@ -1351,5 +1390,111 @@ mod tests {
 
         let error = assemble_message(&chunks).expect_err("object tool_calls must be rejected");
         assert!(error.to_string().contains("not an array or null"));
+    }
+
+    #[test]
+    fn folded_stream_persists_the_native_response_not_raw_chunks() {
+        let chunks = json!([
+            {
+                "id": "chat_1",
+                "model": "accounts/test/model",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "role": "assistant",
+                        "content": "hello ",
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "call_1",
+                            "type": "function",
+                            "function": { "name": "eval", "arguments": "{\"source\":\"2" }
+                        }]
+                    },
+                    "finish_reason": null
+                }]
+            },
+            {
+                "id": "chat_1",
+                "model": "accounts/test/model",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "content": "world",
+                        "tool_calls": [{
+                            "index": 0,
+                            "function": { "arguments": " + 2\"}" }
+                        }]
+                    },
+                    "finish_reason": "tool_calls"
+                }],
+                "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
+            }
+        ]);
+        let chunks = chunks.as_array().expect("chunks array");
+        let response = folded_response(OutputKind::Text, "accounts/test/model", chunks)
+            .expect("valid stream fold");
+        assert!(
+            response.value.get("chunks").is_none(),
+            "raw chunks must not be persisted"
+        );
+        let envelope = parse_response(&response, CHAT_RESPONSE_CODEC_ID, "response")
+            .expect("native response shape");
+        let message = &envelope.value["choices"][0]["message"];
+        assert_eq!(message["content"], "hello world");
+        assert_eq!(
+            message["tool_calls"][0]["function"]["arguments"],
+            "{\"source\":\"2 + 2\"}"
+        );
+        assert_eq!(envelope.value["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(envelope.value["usage"]["total_tokens"], json!(15));
+        assert_eq!(envelope.value["model"], "accounts/test/model");
+
+        let (_, codec) = ChatCompletions::builder("accounts/test/model")
+            .build_parts()
+            .expect("valid adapter");
+        let projection = codec
+            .project_response(&response)
+            .expect("valid eval directive");
+        assert_eq!(
+            projection.directive,
+            ModelDirective::Eval(lam::EvalRequest {
+                intent: "Evaluate TypeScript".to_owned(),
+                source: "2 + 2".to_owned(),
+                timeout: None,
+            })
+        );
+    }
+
+    #[test]
+    fn folded_output_stream_reconstructs_display_text() {
+        let chunks = json!([
+            {
+                "id": "chat_1",
+                "choices": [{
+                    "index": 0,
+                    "delta": { "role": "assistant", "content": "thinking " },
+                    "finish_reason": null
+                }]
+            },
+            {
+                "id": "chat_1",
+                "choices": [{
+                    "index": 0,
+                    "delta": { "content": "aloud" },
+                    "finish_reason": "stop"
+                }]
+            }
+        ]);
+        let chunks = chunks.as_array().expect("chunks array");
+        let response = folded_response(OutputKind::Text, "accounts/test/model", chunks)
+            .expect("valid stream fold");
+        let (_, codec) = ChatCompletions::builder("accounts/test/model")
+            .build_parts()
+            .expect("valid adapter");
+        let projection = codec.project_response(&response).expect("valid output");
+        assert_eq!(
+            projection.display,
+            [ModelDelta::Text("thinking aloud".to_owned())]
+        );
     }
 }

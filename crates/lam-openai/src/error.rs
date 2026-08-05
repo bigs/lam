@@ -92,6 +92,12 @@ pub enum ProviderError {
         /// Expected terminal event.
         expected: &'static str,
     },
+    /// A completed stream could not be folded into the native response.
+    #[error("completed stream could not be folded into a response: {message}")]
+    Codec {
+        /// Codec diagnostic.
+        message: String,
+    },
 }
 
 impl ProviderError {

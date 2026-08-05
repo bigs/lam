@@ -367,6 +367,7 @@ const fn provider_error_kind(error: &ProviderError) -> &'static str {
         ProviderError::InvalidEventJson { .. } => "invalid_event_json",
         ProviderError::Api { .. } => "api",
         ProviderError::MissingTerminal { .. } => "missing_terminal",
+        ProviderError::Codec { .. } => "codec",
     }
 }
 

@@ -1249,7 +1249,7 @@ async fn responses_provider_sends_store_false_and_returns_completed_native_respo
 }
 
 #[tokio::test]
-async fn chat_provider_preserves_every_chunk_and_streams_reasoning() {
+async fn chat_provider_folds_streamed_chunks_and_streams_reasoning() {
     let first = json!({
         "id": "chat_1",
         "choices": [{
@@ -1321,7 +1321,23 @@ async fn chat_provider_preserves_every_chunk_and_streams_reasoning() {
         "runtime instructions"
     );
     assert_eq!(captured.body["stream_options"]["include_usage"], true);
-    assert_eq!(response.value["chunks"], json!([first, second]));
+    let folded = &response.value["response"];
+    assert!(
+        response.value.get("chunks").is_none(),
+        "raw chunks must not persist"
+    );
+    assert_eq!(folded["choices"][0]["message"]["content"], "done");
+    assert_eq!(
+        folded["choices"][0]["message"]["reasoning_content"],
+        "think"
+    );
+    assert_eq!(
+        folded["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+        "{\"source\":\"1 + 1\"}"
+    );
+    assert_eq!(folded["choices"][0]["finish_reason"], "stop");
+    assert_eq!(folded["usage"]["total_tokens"], 34);
+    assert_eq!(folded["usage"]["provider_extension"], true);
     let metadata = codec.response_metadata(&response);
     assert_eq!(
         metadata.model.as_deref(),
@@ -1381,7 +1397,13 @@ async fn chat_provider_accepts_a_terminal_chunk_before_a_truncated_body() {
         .await
         .expect("terminal response should survive a trailing body failure");
 
-    assert_eq!(response.value["chunks"], json!([terminal]));
+    let folded = &response.value["response"];
+    assert!(
+        response.value.get("chunks").is_none(),
+        "raw chunks must not persist"
+    );
+    assert_eq!(folded["choices"][0]["message"]["content"], "complete");
+    assert_eq!(folded["choices"][0]["finish_reason"], "stop");
     server.finish();
 }
 
