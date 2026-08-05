@@ -18,6 +18,7 @@ use crate::runtime::{
 const MOUSE_SCROLL_LINES: usize = 2;
 const INTERRUPTION_ARM_WINDOW: Duration = Duration::from_millis(1_500);
 const INTERRUPTION_WARNING: &str = "Press Esc again to stop the current run";
+const SESSION_PICKER_HINT: &str = "ctrl+d delete the highlighted session";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Focus {
@@ -128,6 +129,19 @@ pub(crate) struct SessionChoice {
     pub(crate) preview: Option<String>,
 }
 
+/// The one advisory line under the palette: a pending destructive
+/// confirmation, or the picker's key hint when nothing is armed.
+pub(crate) struct Notice<'a> {
+    pub(crate) text: &'a str,
+    pub(crate) kind: NoticeKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NoticeKind {
+    Warning,
+    Hint,
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct InputBuffer {
     pub(crate) text: String,
@@ -201,6 +215,13 @@ pub(crate) struct App {
     command_in_flight: bool,
     interruption_deadline: Option<Instant>,
     interruption_in_progress: bool,
+    /// Session armed for deletion by a first ctrl+d in the session palette.
+    /// Sticky until the next keystroke, whatever it is.
+    armed_session: Option<u64>,
+    /// What the session palette has to say about deletion: the armed
+    /// confirmation, worded differently for the open session because deleting
+    /// it replaces it. Cleared with the arming.
+    session_notice: Option<String>,
 }
 
 struct AgentConversation {
@@ -311,6 +332,8 @@ impl App {
             command_in_flight: false,
             interruption_deadline: None,
             interruption_in_progress: false,
+            armed_session: None,
+            session_notice: None,
         }
     }
 
@@ -361,6 +384,10 @@ impl App {
 
     pub(crate) fn replace_sessions(&mut self, sessions: Vec<SessionChoice>) {
         self.sessions = sessions;
+        // A deletion can shrink the palette under the highlight.
+        self.suggestion_index = self
+            .suggestion_index
+            .min(self.suggestions().len().saturating_sub(1));
     }
 
     pub(crate) fn session_change_failed(&mut self, error: impl Into<String>) {
@@ -368,8 +395,41 @@ impl App {
         self.push_error("Session change failed", error.into());
     }
 
+    /// Confirms a session dropped from the catalog while another one stays
+    /// open, so nothing about the running session changes.
+    pub(crate) fn session_deleted(&mut self, id: u64) {
+        self.status = format!("Deleted session #{id}");
+    }
+
+    /// Confirms a replaced session: this app already renders the successor, so
+    /// the status names both halves of the exchange.
+    pub(crate) fn session_replaced(&mut self, deleted: u64) {
+        self.status = format!("Deleted session #{deleted}; started #{}", self.session_id);
+    }
+
     pub(crate) fn interruption_warning(&self) -> Option<&'static str> {
         self.interruption_deadline.map(|_| INTERRUPTION_WARNING)
+    }
+
+    /// The advisory line under the palette. Warnings win: an armed deletion or
+    /// interruption always displaces the picker's key hint.
+    pub(crate) fn notice(&self) -> Option<Notice<'_>> {
+        if let Some(warning) = self.interruption_warning() {
+            return Some(Notice {
+                text: warning,
+                kind: NoticeKind::Warning,
+            });
+        }
+        if let Some(notice) = self.session_notice.as_deref() {
+            return Some(Notice {
+                text: notice,
+                kind: NoticeKind::Warning,
+            });
+        }
+        self.session_palette_open().then_some(Notice {
+            text: SESSION_PICKER_HINT,
+            kind: NoticeKind::Hint,
+        })
     }
 
     pub(crate) const fn interruption_deadline(&self) -> Option<Instant> {
@@ -440,24 +500,9 @@ impl App {
                 })
                 .collect();
         }
-        if input == "/session" || input.starts_with("/session ") {
-            let query = input
-                .strip_prefix("/session")
-                .unwrap_or_default()
-                .trim()
-                .trim_start_matches('#')
-                .to_lowercase();
-            return self
-                .sessions
-                .iter()
-                .filter(|session| {
-                    query.is_empty()
-                        || session.id.to_string().contains(&query)
-                        || session
-                            .preview
-                            .as_deref()
-                            .is_some_and(|preview| preview.to_lowercase().contains(&query))
-                })
+        if let Some(sessions) = self.session_matches() {
+            return sessions
+                .into_iter()
                 .map(|session| Suggestion {
                     label: format!("#{}", session.id),
                     detail: session
@@ -495,9 +540,52 @@ impl App {
         .collect()
     }
 
+    fn session_palette_open(&self) -> bool {
+        let input = self.input.text.trim_start();
+        input == "/session" || input.starts_with("/session ")
+    }
+
+    /// Sessions offered by the `/session` palette, newest first, or `None`
+    /// when that palette is not open. Shared by the suggestion list and the
+    /// deletion binding so both agree on which row is highlighted.
+    fn session_matches(&self) -> Option<Vec<&SessionChoice>> {
+        if !self.session_palette_open() {
+            return None;
+        }
+        let query = self
+            .input
+            .text
+            .trim_start()
+            .strip_prefix("/session")
+            .unwrap_or_default()
+            .trim()
+            .trim_start_matches('#')
+            .to_lowercase();
+        Some(
+            self.sessions
+                .iter()
+                .filter(|session| {
+                    query.is_empty()
+                        || session.id.to_string().contains(&query)
+                        || session
+                            .preview
+                            .as_deref()
+                            .is_some_and(|preview| preview.to_lowercase().contains(&query))
+                })
+                .collect(),
+        )
+    }
+
     pub(crate) fn handle_key(&mut self, key: KeyEvent) -> Option<Command> {
         if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
             return None;
+        }
+        let deleting =
+            key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('d');
+        if !deleting {
+            // Arming survives until the next keystroke, including Esc and
+            // selection movement, so it is resolved before anything else runs.
+            self.disarm_session_deletion();
         }
         if key.code == KeyCode::Esc {
             return (key.kind == KeyEventKind::Press)
@@ -505,6 +593,13 @@ impl App {
                 .flatten();
         }
         self.disarm_interruption();
+        if deleting {
+            // As with Esc, only a physical press arms or confirms, so holding
+            // the key down cannot delete a session.
+            return (key.kind == KeyEventKind::Press)
+                .then(|| self.handle_session_deletion())
+                .flatten();
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             if self.input.text.is_empty() {
                 self.should_exit = true;
@@ -553,6 +648,38 @@ impl App {
 
     fn disarm_interruption(&mut self) {
         self.interruption_deadline = None;
+    }
+
+    /// ctrl+d in the session palette: the first press arms the highlighted
+    /// session, a second press on the same session deletes it, and anything
+    /// else disarms. Deleting the open session replaces it — a fresh session
+    /// takes over before the old journal goes away — so it arms like any other
+    /// row, only with wording that says so.
+    fn handle_session_deletion(&mut self) -> Option<Command> {
+        // A highlight left past the end of a shrunken palette arms nothing;
+        // the next frame clamps it.
+        let id = self.session_matches()?.get(self.suggestion_index)?.id;
+        let open = id == self.session_id;
+        if self.armed_session == Some(id) {
+            self.disarm_session_deletion();
+            return Some(if open {
+                Command::ReplaceSession { delete: id }
+            } else {
+                Command::DeleteSession(id)
+            });
+        }
+        self.armed_session = Some(id);
+        self.session_notice = Some(if open {
+            format!("Press ctrl+d again to delete the open session #{id} and start a fresh one")
+        } else {
+            format!("Press ctrl+d again to delete session #{id}")
+        });
+        None
+    }
+
+    fn disarm_session_deletion(&mut self) {
+        self.armed_session = None;
+        self.session_notice = None;
     }
 
     fn handle_input_key(&mut self, key: KeyEvent, suggestions: &[Suggestion]) -> Option<Command> {
@@ -2287,8 +2414,8 @@ mod tests {
     use ratatui::layout::Rect;
 
     use super::{
-        App, EntryKind, Focus, Hitbox, InputBuffer, PendingSteer, SessionChoice, SessionView,
-        partial_eval_intent,
+        App, EntryKind, Focus, Hitbox, InputBuffer, PendingSteer, SESSION_PICKER_HINT,
+        SessionChoice, SessionView, partial_eval_intent,
     };
     use crate::config::ModelChoice;
     use crate::runtime::{
@@ -2340,6 +2467,24 @@ mod tests {
             0,
             "high",
         )
+    }
+
+    /// An app whose directory holds the open session plus two older ones.
+    fn session_picker() -> App {
+        let mut app = app();
+        app.sessions.push(SessionChoice {
+            id: 4,
+            preview: None,
+        });
+        app.sessions.push(SessionChoice {
+            id: 3,
+            preview: None,
+        });
+        app
+    }
+
+    fn control_d() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)
     }
 
     #[test]
@@ -2699,6 +2844,151 @@ mod tests {
 
         assert!(matches!(command, Some(Command::LoadSession(4))));
         assert_eq!(app.status, "Loading session #4…");
+    }
+
+    #[test]
+    fn session_deletion_needs_a_second_control_d_on_the_same_session() {
+        let mut app = session_picker();
+
+        assert!(
+            app.handle_key(control_d()).is_none(),
+            "ctrl+d is inert outside the session palette"
+        );
+        assert!(app.notice().is_none());
+
+        app.input = InputBuffer::at_end("/session ".to_owned());
+        // The palette lists #7 (the open session), #4, then #3.
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+
+        assert!(app.handle_key(control_d()).is_none());
+        assert_eq!(
+            app.notice().map(|notice| notice.text),
+            Some("Press ctrl+d again to delete session #4")
+        );
+
+        assert!(
+            app.handle_key(KeyEvent::new_with_kind(
+                KeyCode::Char('d'),
+                KeyModifiers::CONTROL,
+                KeyEventKind::Repeat,
+            ))
+            .is_none(),
+            "a held key never confirms a deletion"
+        );
+        assert_eq!(app.armed_session, Some(4));
+
+        let command = app.handle_key(control_d());
+
+        assert!(matches!(command, Some(Command::DeleteSession(4))));
+        assert!(app.armed_session.is_none());
+        assert_eq!(
+            app.notice().map(|notice| notice.text),
+            Some(SESSION_PICKER_HINT)
+        );
+
+        // The catalog answers with the surviving sessions, so the highlight
+        // must not outrun the shortened palette.
+        app.replace_sessions(vec![SessionChoice {
+            id: 7,
+            preview: None,
+        }]);
+        app.session_deleted(4);
+        assert_eq!(app.suggestion_index, 0);
+        assert_eq!(app.status, "Deleted session #4");
+    }
+
+    #[test]
+    fn session_deletion_disarms_on_movement_and_other_keys() {
+        let mut app = session_picker();
+        app.input = InputBuffer::at_end("/session ".to_owned());
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert!(app.handle_key(control_d()).is_none());
+
+        // Moving to another session disarms, so the next ctrl+d arms that one
+        // instead of deleting anything.
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert!(app.armed_session.is_none());
+        assert_eq!(
+            app.notice().map(|notice| notice.text),
+            Some(SESSION_PICKER_HINT)
+        );
+        assert!(app.handle_key(control_d()).is_none());
+        assert_eq!(app.armed_session, Some(3));
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.armed_session.is_none());
+        assert!(app.session_notice.is_none());
+
+        assert!(app.handle_key(control_d()).is_none());
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(app.armed_session.is_none());
+    }
+
+    #[test]
+    fn deleting_the_open_session_asks_for_a_replacement() {
+        let mut app = session_picker();
+        app.input = InputBuffer::at_end("/session ".to_owned());
+
+        // The palette opens on #7, the session this app has open.
+        assert!(app.handle_key(control_d()).is_none());
+        assert_eq!(app.armed_session, Some(7));
+        assert_eq!(
+            app.notice().map(|notice| notice.text),
+            Some("Press ctrl+d again to delete the open session #7 and start a fresh one")
+        );
+
+        assert!(
+            app.handle_key(KeyEvent::new_with_kind(
+                KeyCode::Char('d'),
+                KeyModifiers::CONTROL,
+                KeyEventKind::Repeat,
+            ))
+            .is_none(),
+            "a held key never confirms a replacement"
+        );
+        assert_eq!(app.armed_session, Some(7));
+
+        let command = app.handle_key(control_d());
+
+        assert!(matches!(
+            command,
+            Some(Command::ReplaceSession { delete: 7 })
+        ));
+        assert!(app.armed_session.is_none());
+        assert_eq!(
+            app.notice().map(|notice| notice.text),
+            Some(SESSION_PICKER_HINT)
+        );
+
+        // The successor is a whole new app; it reports both halves of the swap.
+        let mut successor = session_picker();
+        successor.session_id = 9;
+        successor.session_replaced(7);
+        assert_eq!(successor.status, "Deleted session #7; started #9");
+    }
+
+    #[test]
+    fn arming_the_open_session_disarms_like_any_other_row() {
+        let mut app = session_picker();
+        app.input = InputBuffer::at_end("/session ".to_owned());
+        assert!(app.handle_key(control_d()).is_none());
+        assert_eq!(app.armed_session, Some(7));
+
+        // Moving off the open session arms the next one from scratch rather
+        // than confirming anything.
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert!(app.armed_session.is_none());
+        assert!(app.handle_key(control_d()).is_none());
+        assert_eq!(app.armed_session, Some(4));
+
+        // Coming back needs its own confirmation for the replacement.
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert!(app.handle_key(control_d()).is_none());
+        assert_eq!(app.armed_session, Some(7));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(app.armed_session.is_none());
+        assert!(app.session_notice.is_none());
     }
 
     #[test]

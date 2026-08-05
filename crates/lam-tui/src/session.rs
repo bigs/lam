@@ -217,6 +217,65 @@ impl SessionCatalog {
         })
     }
 
+    /// Drops a session from the catalog and removes its files. The session
+    /// must belong to `cwd` and must not be open anywhere: the running TUI
+    /// holds its own lease, so its active session is refused here too.
+    pub(crate) fn delete(&self, id: u64, cwd: &Path) -> Result<(), SessionError> {
+        let cwd = cwd_key(cwd)?;
+        self.with_write_database(|database| {
+            let record = {
+                let read = database.begin_read().map_err(database_error)?;
+                let sessions = read.open_table(SESSIONS).map_err(database_error)?;
+                let encoded = sessions
+                    .get(id)
+                    .map_err(database_error)?
+                    .ok_or(SessionError::MissingRecord { id })?;
+                serde_json::from_slice::<SessionRecord>(encoded.value())
+                    .map_err(SessionError::Serialize)?
+            };
+            validate_record(&record, id)?;
+            if record.cwd != cwd {
+                return Err(SessionError::WrongWorkingDirectory { id });
+            }
+
+            let session = self.session(id, &cwd);
+            // Claim the journal for the deletion: another TUI holding the
+            // lease is still using this session, and removing its files would
+            // strand it.
+            let lease = SessionLease::acquire(&session)?;
+            let write = database.begin_write().map_err(database_error)?;
+            {
+                let mut sessions = write.open_table(SESSIONS).map_err(database_error)?;
+                sessions.remove(id).map_err(database_error)?;
+                let mut latest = write.open_table(LATEST_BY_CWD).map_err(database_error)?;
+                let was_latest = latest
+                    .get(cwd.as_str())
+                    .map_err(database_error)?
+                    .is_some_and(|current| current.value() == id);
+                if was_latest {
+                    match newest_for_cwd(&sessions, &cwd)? {
+                        Some(newest) => {
+                            latest
+                                .insert(cwd.as_str(), newest)
+                                .map_err(database_error)?;
+                        }
+                        None => {
+                            latest.remove(cwd.as_str()).map_err(database_error)?;
+                        }
+                    }
+                }
+            }
+            write.commit().map_err(database_error)?;
+
+            // The index no longer names this session and this operation still
+            // holds the index lock, so releasing the lease before removing its
+            // own file opens no window for another TUI to claim the session.
+            drop(lease);
+            remove_session_files(&session);
+            Ok(())
+        })
+    }
+
     fn create_for_key(
         &self,
         database: &Database,
@@ -387,6 +446,50 @@ impl SessionLease {
     }
 }
 
+/// The newest session still recorded for `cwd`, or `None` when the directory
+/// has none left. Identifiers ascend with creation, so iteration order makes
+/// the last match the newest — the same order the picker lists sessions in.
+fn newest_for_cwd(
+    sessions: &impl ReadableTable<u64, &'static [u8]>,
+    cwd: &str,
+) -> Result<Option<u64>, SessionError> {
+    let mut newest = None;
+    for item in sessions.iter().map_err(database_error)? {
+        let (id, encoded) = item.map_err(database_error)?;
+        let id = id.value();
+        let record = serde_json::from_slice::<SessionRecord>(encoded.value())
+            .map_err(SessionError::Serialize)?;
+        validate_record(&record, id)?;
+        if record.cwd == cwd {
+            newest = Some(id);
+        }
+    }
+    Ok(newest)
+}
+
+/// Removes a deleted session's journal, its lease file, and its diagnostic
+/// log. The index is the source of truth and no longer names the session, so
+/// every removal is best-effort: leftover files are inert.
+fn remove_session_files(session: &Session) {
+    for path in [
+        session.database_path.clone(),
+        session.database_path.with_extension("lock"),
+        session.diagnostic_log_path(),
+    ] {
+        if let Err(error) = fs::remove_file(&path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                target: "lam_tui::session",
+                session_id = session.id,
+                path = %path.display(),
+                %error,
+                "deleted session file could not be removed"
+            );
+        }
+    }
+}
+
 fn validate_record(record: &SessionRecord, id: u64) -> Result<(), SessionError> {
     if record.schema_version != INDEX_SCHEMA_VERSION || record.id != id {
         return Err(SessionError::InvalidRecord { id });
@@ -490,7 +593,7 @@ pub(crate) enum SessionError {
 mod tests {
     use std::fs;
 
-    use super::SessionCatalog;
+    use super::{SessionCatalog, SessionError};
 
     #[test]
     fn resumes_the_latest_session_for_each_canonical_directory() {
@@ -617,5 +720,142 @@ mod tests {
             catalog.store_preview(9_999, "orphan").is_err(),
             "previews only attach to existing records"
         );
+    }
+
+    #[test]
+    fn delete_drops_the_record_and_removes_the_session_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        let catalog = SessionCatalog::open(temp.path().join("lam-home")).unwrap();
+
+        let (session, lease) = catalog.create(&cwd).unwrap();
+        fs::write(session.diagnostic_log_path(), b"{}\n").unwrap();
+        drop(lease);
+
+        catalog.delete(session.id, &cwd).unwrap();
+
+        assert!(catalog.list(&cwd).unwrap().is_empty());
+        assert!(!session.database_path.exists());
+        assert!(!session.database_path.with_extension("lock").exists());
+        assert!(!session.diagnostic_log_path().exists());
+        assert!(
+            matches!(
+                catalog.delete(session.id, &cwd),
+                Err(SessionError::MissingRecord { id }) if id == session.id
+            ),
+            "a deleted session has no record left to delete"
+        );
+    }
+
+    #[test]
+    fn deleting_the_current_session_repoints_the_directory_at_the_newest_remaining() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        let catalog = SessionCatalog::open(temp.path().join("lam-home")).unwrap();
+
+        let (oldest, oldest_lease) = catalog.create(&cwd).unwrap();
+        let (middle, middle_lease) = catalog.create(&cwd).unwrap();
+        let (newest, newest_lease) = catalog.create(&cwd).unwrap();
+        drop((oldest_lease, middle_lease, newest_lease));
+
+        catalog.delete(newest.id, &cwd).unwrap();
+        let resumed = catalog.resume_or_create(&cwd).unwrap();
+        assert!(resumed.resumed);
+        assert_eq!(resumed.session.id, middle.id);
+        drop(resumed);
+
+        catalog.delete(middle.id, &cwd).unwrap();
+        let resumed = catalog.resume_or_create(&cwd).unwrap();
+        assert!(resumed.resumed);
+        assert_eq!(resumed.session.id, oldest.id);
+        drop(resumed);
+
+        // The last session for the directory leaves no selection behind.
+        catalog.delete(oldest.id, &cwd).unwrap();
+        let fresh = catalog.resume_or_create(&cwd).unwrap();
+        assert!(!fresh.resumed);
+        assert_eq!(catalog.list(&cwd).unwrap().len(), 1);
+    }
+
+    /// The replacement path in the TUI: create the successor, release the old
+    /// lease, then delete the session it replaced.
+    #[test]
+    fn replacing_the_only_session_leaves_the_successor_current() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        let catalog = SessionCatalog::open(temp.path().join("lam-home")).unwrap();
+
+        let replaced = catalog.resume_or_create(&cwd).unwrap();
+        let (successor, successor_lease) = catalog.create(&cwd).unwrap();
+        drop(replaced.lease);
+        catalog.delete(replaced.session.id, &cwd).unwrap();
+
+        assert_eq!(
+            catalog
+                .list(&cwd)
+                .unwrap()
+                .into_iter()
+                .map(|listing| listing.session.id)
+                .collect::<Vec<_>>(),
+            vec![successor.id]
+        );
+        assert!(!replaced.session.database_path.exists());
+        // Creating the successor already claimed the directory, so deleting the
+        // session it replaced must not repoint it.
+        drop(successor_lease);
+        let resumed = catalog.resume_or_create(&cwd).unwrap();
+        assert!(resumed.resumed);
+        assert_eq!(resumed.session.id, successor.id);
+    }
+
+    #[test]
+    fn delete_refuses_a_session_held_by_another_lease() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        let catalog = SessionCatalog::open(temp.path().join("lam-home")).unwrap();
+
+        let (session, lease) = catalog.create(&cwd).unwrap();
+        assert!(matches!(
+            catalog.delete(session.id, &cwd),
+            Err(SessionError::SessionInUse { id }) if id == session.id
+        ));
+
+        assert!(session.database_path.is_file());
+        assert_eq!(
+            catalog
+                .list(&cwd)
+                .unwrap()
+                .into_iter()
+                .map(|listing| listing.session.id)
+                .collect::<Vec<_>>(),
+            vec![session.id]
+        );
+        drop(lease);
+        assert_eq!(
+            catalog.resume_or_create(&cwd).unwrap().session.id,
+            session.id
+        );
+    }
+
+    #[test]
+    fn delete_refuses_a_session_from_another_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("project");
+        let other_cwd = temp.path().join("elsewhere");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&other_cwd).unwrap();
+        let cwd = cwd.canonicalize().unwrap();
+        let other_cwd = other_cwd.canonicalize().unwrap();
+        let catalog = SessionCatalog::open(temp.path().join("lam-home")).unwrap();
+
+        let (session, lease) = catalog.create(&cwd).unwrap();
+        drop(lease);
+
+        assert!(matches!(
+            catalog.delete(session.id, &other_cwd),
+            Err(SessionError::WrongWorkingDirectory { id }) if id == session.id
+        ));
+        assert!(session.database_path.is_file());
+        assert_eq!(catalog.list(&cwd).unwrap().len(), 1);
     }
 }

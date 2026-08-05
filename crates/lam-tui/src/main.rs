@@ -259,6 +259,106 @@ async fn tokio_main() -> Result<(), AppError> {
                                             }
                                         }
                                     }
+                                    // Deleting a catalog entry never touches the
+                                    // open session, so the runtime keeps running.
+                                    Command::DeleteSession(id) => match sessions.delete(id, &cwd) {
+                                        Ok(()) => {
+                                            match reconcile_session_choices(
+                                                &sessions,
+                                                &cwd,
+                                                &app.sessions,
+                                                None,
+                                            )
+                                            .await
+                                            {
+                                                Ok(choices) => {
+                                                    app.replace_sessions(choices);
+                                                    app.session_deleted(id);
+                                                }
+                                                Err(error) => {
+                                                    app.session_change_failed(error.to_string())
+                                                }
+                                            }
+                                        }
+                                        Err(error) => app.session_change_failed(error.to_string()),
+                                    },
+                                    // Deleting the open session means replacing
+                                    // it: the successor is claimed first, so a
+                                    // failure anywhere leaves the user with a
+                                    // session, and the old journal is only
+                                    // deletable once this runtime and its lease
+                                    // have let go of it.
+                                    Command::ReplaceSession { delete: old_id } => {
+                                        // A replacement starts fresh, so it
+                                        // carries the current preferences like
+                                        // Command::New does.
+                                        let preferences = app.runtime_preferences();
+                                        let (session, next_lease) = match sessions.create(&cwd) {
+                                            Ok(claimed) => claimed,
+                                            Err(error) => {
+                                                app.session_change_failed(error.to_string());
+                                                redraw = true;
+                                                continue 'main;
+                                            }
+                                        };
+                                        terminal
+                                            .terminal
+                                            .draw(|frame| ui::render(frame, &mut app))
+                                            .map_err(AppError::Terminal)?;
+                                        let shutdown = runtime.system.shutdown().await;
+                                        runtime.quiesce().await;
+                                        shutdown.map_err(|error| {
+                                            AppError::Shutdown(error.to_string())
+                                        })?;
+                                        // No teardown checkpoints and no
+                                        // compaction: this journal is about to
+                                        // be removed, so both would be wasted
+                                        // work. Releasing the store is what the
+                                        // deletion needs.
+                                        drop(runtime.into_store());
+                                        drop(session_lease);
+                                        session_lease = next_lease;
+                                        let deleted = sessions.delete(old_id, &cwd);
+                                        // Listed after the deletion, so the
+                                        // replaced session is already gone from
+                                        // the palette.
+                                        let choices = reconcile_session_choices(
+                                            &sessions,
+                                            &cwd,
+                                            &app.sessions,
+                                            Some(session.id),
+                                        )
+                                        .await?;
+                                        if let Some(diagnostics) = &diagnostics {
+                                            diagnostics
+                                                .activate(&session)
+                                                .map_err(AppError::Diagnostics)?;
+                                        }
+                                        (runtime, app) = open_session(
+                                            &config,
+                                            &cwd,
+                                            session,
+                                            false,
+                                            &config_path,
+                                            choices,
+                                            Some(&preferences),
+                                        )
+                                        .await?;
+                                        // A failed deletion never aborts the
+                                        // switch: the old session survives in
+                                        // the catalog and the picker can drop it
+                                        // later.
+                                        match deleted {
+                                            Ok(()) => app.session_replaced(old_id),
+                                            Err(error) => {
+                                                app.session_change_failed(error.to_string())
+                                            }
+                                        }
+                                        // The runtime and app were replaced; do
+                                        // not keep draining against them.
+                                        redraw = true;
+                                        continue 'main;
+                                    }
                                     command => runtime.execute(command, command_results.clone()),
                                 }
                             }
@@ -684,7 +784,7 @@ impl Drop for TerminalSession {
 
 fn print_help() {
     println!(
-        "lam-agent — a minimal TypeScript coding agent\n\nUSAGE:\n    lam-agent [--config PATH] [--debug-log]\n\nOPTIONS:\n    --config PATH  Read providers from PATH instead of ~/.lam/providers.toml\n    --debug-log    Append metadata-only diagnostics beside the session journal\n    -h, --help     Show this help\n    -V, --version  Show the version\n\nLam resumes the latest durable session for the current directory. Inside the TUI,\ntype / for commands, including /new for a fresh session and /session to restore\nan earlier one. Tab switches focus between the input shelf and conversation;\narrows select transcript rows; Enter expands the selected row. While the root is\nworking, a submitted message is queued above the input as a pending steer and is delivered at the next model boundary. Press Escape twice within 1.5 seconds to stop its complete agent tree."
+        "lam-agent — a minimal TypeScript coding agent\n\nUSAGE:\n    lam-agent [--config PATH] [--debug-log]\n\nOPTIONS:\n    --config PATH  Read providers from PATH instead of ~/.lam/providers.toml\n    --debug-log    Append metadata-only diagnostics beside the session journal\n    -h, --help     Show this help\n    -V, --version  Show the version\n\nLam resumes the latest durable session for the current directory. Inside the TUI,\ntype / for commands, including /new for a fresh session and /session to restore\nan earlier one; in that picker, Ctrl+D twice deletes the highlighted session.\nTab switches focus between the input shelf and conversation;\narrows select transcript rows; Enter expands the selected row. While the root is\nworking, a submitted message is queued above the input as a pending steer and is delivered at the next model boundary. Press Escape twice within 1.5 seconds to stop its complete agent tree."
     );
 }
 

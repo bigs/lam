@@ -7,7 +7,8 @@ use tui_markdown::{Options as MarkdownOptions, StyleSheet, from_str_with_options
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{
-    App, ConversationEntry, EntryKind, EntryLayout, Focus, Hitbox, LayoutKey, Suggestion,
+    App, ConversationEntry, EntryKind, EntryLayout, Focus, Hitbox, LayoutKey, NoticeKind,
+    Suggestion,
 };
 
 const ACCENT: Color = Color::Rgb(105, 210, 190);
@@ -716,22 +717,22 @@ fn render_shelf(frame: &mut Frame<'_>, area: Rect, app: &mut App, suggestions: &
     let input_rows = app.input.rows(input_width);
 
     // Allocate by priority: the input keeps every row it needs, then the
-    // warning, then pending steers, and the palette takes the remainder.
+    // notice, then pending steers, and the palette takes the remainder.
     let inner_height = usize::from(inner.height);
     let input_height = input_rows.len().clamp(1, inner_height.max(1));
     let remaining = inner_height.saturating_sub(input_height);
-    let warning_height = usize::from(app.interruption_warning().is_some()).min(remaining);
-    let remaining = remaining.saturating_sub(warning_height);
+    let notice_height = usize::from(app.notice().is_some()).min(remaining);
+    let remaining = remaining.saturating_sub(notice_height);
     let steer_height = app
         .pending_steers
         .len()
         .min(MAX_PENDING_STEER_ROWS)
         .min(remaining);
     let palette_height = remaining.saturating_sub(steer_height);
-    let [palette_area, steer_area, warning_area, input_area] = Layout::vertical([
+    let [palette_area, steer_area, notice_area, input_area] = Layout::vertical([
         Constraint::Length(to_u16(palette_height)),
         Constraint::Length(to_u16(steer_height)),
-        Constraint::Length(to_u16(warning_height)),
+        Constraint::Length(to_u16(notice_height)),
         Constraint::Min(1),
     ])
     .areas(inner);
@@ -742,14 +743,18 @@ fn render_shelf(frame: &mut Frame<'_>, area: Rect, app: &mut App, suggestions: &
     if !suggestions.is_empty() && palette_area.height > 0 {
         render_palette(frame, palette_area, suggestions, app.suggestion_index);
     }
-    if let Some(warning) = app.interruption_warning() {
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
+    if let Some(notice) = app.notice() {
+        let line = match notice.kind {
+            NoticeKind::Warning => Line::from(vec![
                 Span::styled("   ! ", Style::default().fg(Color::Yellow).bold()),
-                Span::styled(warning, Style::default().fg(Color::Yellow)),
-            ])),
-            warning_area,
-        );
+                Span::styled(notice.text, Style::default().fg(Color::Yellow)),
+            ]),
+            NoticeKind::Hint => Line::from(Span::styled(
+                format!("   {}", notice.text),
+                Style::default().fg(DIM),
+            )),
+        };
+        frame.render_widget(Paragraph::new(line), notice_area);
     }
 
     let input_lines = input_rows
@@ -876,9 +881,9 @@ fn shelf_height(area: Rect, app: &App, suggestions: &[Suggestion]) -> u16 {
         })
         .0;
     let palette_rows = suggestions.len() + provider_headers;
-    let warning_rows = usize::from(app.interruption_warning().is_some());
+    let notice_rows = usize::from(app.notice().is_some());
     let steer_rows = app.pending_steers.len().min(MAX_PENDING_STEER_ROWS);
-    let desired = 1 + input_rows + steer_rows + palette_rows + warning_rows;
+    let desired = 1 + input_rows + steer_rows + palette_rows + notice_rows;
     let maximum = usize::from((area.height * 2 / 5).max(3));
     to_u16(desired.clamp(2, maximum))
 }
@@ -1220,6 +1225,25 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("/root/worker"));
+    }
+
+    #[test]
+    fn session_palette_advertises_the_delete_binding() {
+        let mut app = test_app(Vec::new());
+        app.input.text = "/session ".to_owned();
+        app.input.cursor = app.input.char_count();
+
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("ctrl+d delete the highlighted session"));
     }
 
     #[test]

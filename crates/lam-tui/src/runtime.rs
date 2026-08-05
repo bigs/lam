@@ -127,6 +127,15 @@ pub(crate) enum Command {
     New,
     LoadSession(u64),
     RefreshSessions,
+    /// Drop a session from the catalog. Never the active session, so the
+    /// running runtime is untouched.
+    DeleteSession(u64),
+    /// Replace the active session: a fresh session opens first and the session
+    /// named here — the one being replaced — is dropped afterwards, because its
+    /// lease only frees once this runtime has released its journal.
+    ReplaceSession {
+        delete: u64,
+    },
 }
 
 /// Command results carry state transitions only. Transcript content always
@@ -515,7 +524,11 @@ impl Runtime {
                         result,
                     }
                 }
-                Command::New | Command::LoadSession(_) | Command::RefreshSessions => return,
+                Command::New
+                | Command::LoadSession(_)
+                | Command::RefreshSessions
+                | Command::DeleteSession(_)
+                | Command::ReplaceSession { .. } => return,
             };
             let _ = output.send(result);
         });
