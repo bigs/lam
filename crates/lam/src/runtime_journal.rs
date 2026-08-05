@@ -31,10 +31,24 @@ where
         .read_checkpoint(actor_id)
         .await
         .map_err(journal_error)?
-        && let Ok(checkpoint) = serde_json::from_slice::<Checkpoint>(&blob)
-        && let Ok(state) = refresh_state(store, actor_id, checkpoint.into_state()).await
+        && let Ok(checkpoint) = Checkpoint::decode(&blob)
     {
-        return Ok(state);
+        // Checkpoints written before projections truncated covered context
+        // (or in the legacy uncompressed format) cost a large decode on
+        // every load. Rewrite such a checkpoint once in the current compact
+        // form so only this load pays that price.
+        let stale = !Checkpoint::blob_is_current(&blob) || checkpoint.has_covered_context();
+        if let Ok(state) = refresh_state(store, actor_id, checkpoint.into_state()).await {
+            if stale && let Err(error) = write_checkpoint(store, actor_id, &state).await {
+                tracing::warn!(
+                    target: "lam::journal",
+                    %actor_id,
+                    %error,
+                    "stale checkpoint rewrite failed; later loads pay the full decode"
+                );
+            }
+            return Ok(state);
+        }
     }
     refresh_state(store, actor_id, ActorState::new()).await
 }
@@ -52,9 +66,7 @@ where
     S: JournalStore,
 {
     let checkpoint = Checkpoint::from_state(state);
-    let blob = serde_json::to_vec(&checkpoint).map_err(|error| ActorError::State {
-        message: format!("checkpoint for {actor_id} could not be encoded: {error}"),
-    })?;
+    let blob = checkpoint.encode();
     store
         .write_checkpoint(actor_id, state.revision(), &blob)
         .await
@@ -624,5 +636,93 @@ mod tests {
             .expect("full replay");
         assert_eq!(bootstrapped, full);
         assert_eq!(bootstrapped.messages().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn load_state_rewrites_stale_checkpoints_in_the_current_form() {
+        let store = Arc::new(MemStore::new());
+        let actor = root();
+        let run = RunId::new("r1").expect("run id");
+        let m1 = envelope("m1", "one");
+        let events = vec![
+            ActorEvent::message_admitted(m1.clone()),
+            ActorEvent::context_appended(ContextEntry {
+                transition: ContextTransition::Messages {
+                    run_id: run.clone(),
+                    consumed_message_ids: vec![m1.message_id().clone()],
+                },
+                payload: EncodedPayload::lam_json("payload").expect("payload"),
+                recorded_at: Timestamp::from_unix_millis(1),
+            }),
+            ActorEvent::context_appended(ContextEntry {
+                transition: ContextTransition::Model {
+                    run_id: run.clone(),
+                    progress: RunProgress::Complete,
+                },
+                payload: EncodedPayload::lam_json("done").expect("payload"),
+                recorded_at: Timestamp::from_unix_millis(2),
+            }),
+            ActorEvent::context_appended(ContextEntry {
+                transition: ContextTransition::Compaction {
+                    covers_through: lam_core::ContextSequence::new(2),
+                    run_id: None,
+                },
+                payload: EncodedPayload::lam_json("summary").expect("payload"),
+                recorded_at: Timestamp::from_unix_millis(3),
+            }),
+        ];
+        let mut expected = Revision::ZERO;
+        for event in events {
+            let _ = store
+                .append(&actor, expected, EventBatch::one(event))
+                .await
+                .expect("append");
+            expected = expected.checked_advance(1).expect("revision fits");
+        }
+        let state = refresh_state(store.as_ref(), &actor, ActorState::new())
+            .await
+            .expect("full replay");
+
+        // Persist the shape checkpoints had before truncation existed: the
+        // legacy uncompressed format, still carrying the covered entries.
+        let mut checkpoint = Checkpoint::from_state(&state);
+        for (index, event) in [(1u64, "payload"), (2, "done")].into_iter().enumerate() {
+            let (sequence, payload) = event;
+            checkpoint.context.insert(
+                index,
+                lam_core::CheckpointEntry {
+                    sequence: lam_core::ContextSequence::new(sequence),
+                    revision: Revision::new(sequence + 1),
+                    entry: ContextEntry {
+                        transition: ContextTransition::Model {
+                            run_id: run.clone(),
+                            progress: RunProgress::Continue,
+                        },
+                        payload: EncodedPayload::lam_json(payload).expect("payload"),
+                        recorded_at: Timestamp::from_unix_millis(1),
+                    },
+                },
+            );
+        }
+        assert!(checkpoint.has_covered_context());
+        let legacy = serde_json::to_vec(&checkpoint).expect("legacy blob serializes");
+        store
+            .write_checkpoint(&actor, state.revision(), &legacy)
+            .await
+            .expect("checkpoint write");
+
+        // Loading normalizes the projection and rewrites the checkpoint so
+        // only this load pays the stale-blob decode.
+        let loaded = load_state(store.as_ref(), &actor).await.expect("load");
+        assert_eq!(loaded, state);
+        let (revision, blob) = store
+            .read_checkpoint(&actor)
+            .await
+            .expect("checkpoint read")
+            .expect("checkpoint present");
+        assert_eq!(revision, state.revision());
+        assert!(Checkpoint::blob_is_current(&blob));
+        let rewritten = Checkpoint::decode(&blob).expect("rewritten blob decodes");
+        assert!(!rewritten.has_covered_context());
     }
 }
