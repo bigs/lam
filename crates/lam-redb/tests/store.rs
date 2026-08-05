@@ -281,3 +281,202 @@ fn legacy_database_gains_the_checkpoint_table_on_open() {
         assert_eq!(read, Some((Revision::new(7), b"bytes".to_vec())));
     });
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn compact_reclaims_orphaned_checkpoint_pages() {
+    let directory = tempfile::tempdir().expect("temporary directory should exist");
+    let path = directory.path().join("compact.redb");
+    let actor = ActorId::new("/root").expect("fixture actor id is valid");
+    let mut store = RedbStore::create(&path).expect("redb store should open");
+    let blob = vec![b'x'; 256 * 1024];
+    for revision in 1..=20u64 {
+        store
+            .write_checkpoint(&actor, Revision::new(revision), &blob)
+            .await
+            .expect("checkpoint write should succeed");
+    }
+    let before = std::fs::metadata(&path)
+        .expect("file metadata should exist")
+        .len();
+    let compacted = store.compact().expect("compaction should succeed");
+    let after = std::fs::metadata(&path)
+        .expect("file metadata should exist")
+        .len();
+    assert!(
+        compacted,
+        "checkpoint rewrites orphan pages which compaction reclaims"
+    );
+    assert!(after < before, "compaction shrinks the journal file");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn read_only_open_succeeds_after_compaction_and_clean_close() {
+    let directory = tempfile::tempdir().expect("temporary directory should exist");
+    let path = directory.path().join("compact-then-read.redb");
+    let actor = ActorId::new("/root").expect("fixture actor id is valid");
+    {
+        let mut store = RedbStore::create(&path).expect("redb store should open");
+        let blob = vec![b'x'; 256 * 1024];
+        for revision in 1..=8u64 {
+            store
+                .write_checkpoint(&actor, Revision::new(revision), &blob)
+                .await
+                .expect("checkpoint write should succeed");
+        }
+        store.compact().expect("compaction should succeed");
+        // The store drops here; a clean close must leave the file readable
+        // by the cheap read-only path on the next boot.
+    }
+    lam_redb::ReadOnlyStore::open(&path)
+        .expect("a compact-then-quit journal must support read-only opens");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn mid_session_snapshot_reopens_without_a_full_repair() {
+    let directory = tempfile::tempdir().expect("temporary directory should exist");
+    let path = directory.path().join("mid-session.redb");
+    let probe_path = directory.path().join("mid-session-probe.redb");
+    let snapshot = directory.path().join("mid-session-snapshot.redb");
+    let actor = ActorId::new("/root").expect("fixture actor id is valid");
+
+    let store = RedbStore::create(&path).expect("redb store should open");
+    let mut revision = Revision::ZERO;
+    for index in 1..=16u64 {
+        let event = ActorEvent::message_admitted(message(
+            MessageId::new(format!("m{index}")).expect("fixture id is valid"),
+            DeliveryMode::Steer,
+            index as i64,
+        ));
+        match store
+            .append(&actor, revision, EventBatch::one(event))
+            .await
+            .expect("append should succeed")
+        {
+            AppendOutcome::Appended { head } => revision = head,
+            AppendOutcome::Conflict { .. } => panic!("no concurrent writers"),
+        }
+    }
+    store
+        .write_checkpoint(&actor, revision, &vec![b'x'; 128 * 1024])
+        .await
+        .expect("checkpoint write should succeed");
+
+    // Copying while the store is still open captures what a SIGKILL or a
+    // panic would leave behind: the last commit's bytes, with none of redb's
+    // teardown. Two identical copies so the repair probe and the reopen each
+    // get an untouched one.
+    std::fs::copy(&path, &probe_path).expect("probe copy should succeed");
+    std::fs::copy(&path, &snapshot).expect("snapshot copy should succeed");
+
+    // Aborting every repair turns "this file needed a full repair" into an
+    // open error, making the assertion deterministic instead of a timing
+    // comparison.
+    redb::Builder::new()
+        .set_repair_callback(|session| session.abort())
+        .open(&probe_path)
+        .expect("a mid-session snapshot should open without a full repair");
+
+    let reopened = RedbStore::open(&snapshot).expect("mid-session snapshot should reopen");
+    let page = reopened
+        .read(
+            &actor,
+            Revision::ZERO,
+            NonZeroUsize::new(8).expect("nonzero"),
+        )
+        .await
+        .expect("page read should succeed");
+    assert_eq!(page.head, Revision::new(16));
+    assert_eq!(page.events.len(), 8);
+    assert_eq!(page.events[0].revision, Revision::new(1));
+    assert_eq!(
+        reopened
+            .read_checkpoint(&actor)
+            .await
+            .expect("checkpoint read should succeed")
+            .map(|(revision, _)| revision),
+        Some(Revision::new(16))
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn footprint_reports_reclaimable_bloat_until_compaction() {
+    let directory = tempfile::tempdir().expect("temporary directory should exist");
+    let path = directory.path().join("footprint.redb");
+    let actor = ActorId::new("/root").expect("fixture actor id is valid");
+    let mut store = RedbStore::create(&path).expect("redb store should open");
+    let blob = vec![b'x'; 256 * 1024];
+    for revision in 1..=20u64 {
+        store
+            .write_checkpoint(&actor, Revision::new(revision), &blob)
+            .await
+            .expect("checkpoint write should succeed");
+    }
+    let bloated = store.footprint().expect("footprint should measure");
+    assert!(
+        bloated.reclaimable_bytes > 0,
+        "checkpoint rewrites leave reclaimable pages: {bloated:?}"
+    );
+    assert!(bloated.file_bytes >= bloated.reclaimable_bytes);
+
+    store.compact().expect("compaction should succeed");
+    let compacted = store.footprint().expect("footprint should measure");
+    assert!(
+        compacted.reclaimable_bytes < bloated.reclaimable_bytes,
+        "compaction reclaims the measured waste: {compacted:?} vs {bloated:?}"
+    );
+}
+
+#[test]
+fn compact_is_cheap_when_the_database_is_clean() {
+    let directory = tempfile::tempdir().expect("temporary directory should exist");
+    let path = directory.path().join("clean.redb");
+    let mut store = RedbStore::create(&path).expect("redb store should open");
+    let _ = store.compact().expect("first compaction should succeed");
+    assert!(
+        !store.compact().expect("second compaction should succeed"),
+        "an already-compacted database has nothing to reclaim"
+    );
+}
+
+#[test]
+fn read_only_store_returns_the_same_pages_as_the_writer() {
+    let directory = tempfile::tempdir().expect("temporary directory should exist");
+    let path = directory.path().join("readonly.redb");
+    let actor = ActorId::new("/root").expect("fixture actor id is valid");
+    {
+        let store = RedbStore::create(&path).expect("redb store should open");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("test runtime should build");
+        runtime.block_on(async {
+            let mut revision = Revision::ZERO;
+            for index in 1..=300u64 {
+                let event = ActorEvent::message_admitted(message(
+                    MessageId::new(format!("m{index}")).expect("fixture id is valid"),
+                    DeliveryMode::Steer,
+                    index as i64,
+                ));
+                match store
+                    .append(&actor, revision, EventBatch::one(event))
+                    .await
+                    .expect("append should succeed")
+                {
+                    AppendOutcome::Appended { head } => revision = head,
+                    AppendOutcome::Conflict { .. } => panic!("no concurrent writers"),
+                }
+            }
+        });
+    }
+    let read_only = lam_redb::ReadOnlyStore::open(&path).expect("read-only open should succeed");
+    let page = read_only
+        .read_page(
+            &actor,
+            Revision::ZERO,
+            NonZeroUsize::new(100).expect("nonzero"),
+        )
+        .expect("page read should succeed");
+    assert_eq!(page.head, Revision::new(300));
+    assert_eq!(page.events.len(), 100);
+    assert_eq!(page.events[0].revision, Revision::new(1));
+    assert_eq!(page.events[99].revision, Revision::new(100));
+}
