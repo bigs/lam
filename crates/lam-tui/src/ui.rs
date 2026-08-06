@@ -2,13 +2,13 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use tui_markdown::{Options as MarkdownOptions, StyleSheet, from_str_with_options};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{
-    App, ConversationEntry, EntryKind, EntryLayout, Focus, Hitbox, LayoutKey, NoticeKind,
-    Suggestion,
+    App, CellPos, ConversationEntry, CopyRow, EntryKind, EntryLayout, Focus, Hitbox, LayoutKey,
+    NoticeKind, Suggestion, TextSelection, Toast,
 };
 
 const ACCENT: Color = Color::Rgb(105, 210, 190);
@@ -79,6 +79,9 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
     .areas(area);
     render_header(frame, header, app);
     render_conversation(frame, conversation, app);
+    if let Some(toast) = &app.toast {
+        render_toast(frame, conversation, toast);
+    }
     render_shelf(frame, shelf, app, &suggestions);
 }
 
@@ -170,8 +173,11 @@ fn render_conversation(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     // Pass 2: materialize only the lines inside the viewport window.
     let window_end = offset.saturating_add(viewport);
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(viewport);
+    let mut pads: Vec<usize> = Vec::with_capacity(viewport);
     let mut cursor = 0usize;
     let mut previous_kind = None;
+    let selection = app.text_selection.as_ref().map(TextSelection::normalized);
+    let mut viewport_row = 0usize;
     for entry in &app.entries {
         if cursor >= window_end {
             break;
@@ -179,24 +185,41 @@ fn render_conversation(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         if needs_message_spacing(previous_kind, Some(entry.kind)) {
             if cursor >= offset {
                 lines.push(Line::default());
+                pads.push(0);
+                viewport_row += 1;
             }
             cursor += 1;
         }
-        let cached = &entry
-            .layout
-            .as_ref()
-            .expect("pass 1 ensured every layout")
-            .lines;
+        let layout = entry.layout.as_ref().expect("pass 1 ensured every layout");
+        let cached = &layout.lines;
+        let cached_pads = &layout.pads;
         let height = cached.len();
         if cursor.saturating_add(height) > offset && cursor < window_end {
             let from = offset.saturating_sub(cursor);
             let to = (window_end - cursor).min(height);
-            lines.extend(cached[from..to].iter().cloned());
+            for (index, line) in cached[from..to].iter().enumerate() {
+                lines.push(apply_selection_style(line, viewport_row, selection));
+                pads.push(cached_pads[from + index]);
+                viewport_row += 1;
+            }
         }
         cursor += height;
         previous_kind = Some(entry.kind);
     }
+    app.conversation_rows = lines
+        .iter()
+        .zip(&pads)
+        .map(|(line, pad)| CopyRow {
+            pad: *pad,
+            text: line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect(),
+        })
+        .collect();
     frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+    app.conversation_area = Some(inner);
 
     app.hitboxes.clear();
     for (index, (start, end)) in ranges.into_iter().enumerate() {
@@ -219,6 +242,87 @@ fn render_conversation(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     }
 }
 
+/// Restyles the cells of `line` covered by a drag selection, reversing the
+/// selected runs. `row` is the line's viewport row; `selection` is the
+/// normalized (start, end) pair in viewport coordinates.
+fn apply_selection_style(
+    line: &Line<'static>,
+    row: usize,
+    selection: Option<(CellPos, CellPos)>,
+) -> Line<'static> {
+    let Some((start, end)) = selection else {
+        return line.clone();
+    };
+    if row < start.row || row > end.row {
+        return line.clone();
+    }
+    let from_col = if row == start.row { start.col } else { 0 };
+    let to_col = if row == end.row { end.col } else { usize::MAX };
+    let mut spans = Vec::with_capacity(line.spans.len());
+    // Cell offsets accumulate across the row's spans: a span's first char
+    // starts where the previous span ended.
+    let mut cell = 0usize;
+    for span in &line.spans {
+        let mut run = String::new();
+        let mut run_selected = false;
+        let mut run_open = false;
+        for (grapheme, start, end) in crate::app::grapheme_cells(&span.content, cell) {
+            let selected = start <= to_col && end > from_col;
+            if run_open && run_selected != selected {
+                spans.push(selection_span(span, &run, run_selected));
+                run.clear();
+                run_selected = selected;
+            } else if !run_open {
+                run_selected = selected;
+                run_open = true;
+            }
+            run.push_str(grapheme);
+            cell = end;
+        }
+        if run_open {
+            spans.push(selection_span(span, &run, run_selected));
+        }
+    }
+    Line::from(spans).style(line.style)
+}
+
+fn selection_span(span: &Span<'static>, content: &str, selected: bool) -> Span<'static> {
+    if selected {
+        Span::styled(
+            content.to_owned(),
+            span.style.add_modifier(Modifier::REVERSED),
+        )
+    } else {
+        Span::styled(content.to_owned(), span.style)
+    }
+}
+
+/// Draws the copy toast in the conversation pane's top-right corner.
+fn render_toast(frame: &mut Frame<'_>, area: Rect, toast: &Toast) {
+    let text = format!(" {} ", toast.text);
+    let width = to_u16(UnicodeWidthStr::width(text.as_str()).max(4)).min(area.width);
+    let toast_area = Rect {
+        x: area.x.saturating_add(area.width).saturating_sub(width),
+        y: area.y,
+        width,
+        height: area.height.min(1),
+    };
+    if toast_area.width == 0 || toast_area.height == 0 {
+        return;
+    }
+    frame.render_widget(Clear, toast_area);
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            text,
+            Style::default()
+                .fg(Color::Black)
+                .bg(ACCENT)
+                .add_modifier(Modifier::BOLD),
+        )),
+        toast_area,
+    );
+}
+
 /// Rebuilds the row's cached layout if anything it depends on changed.
 fn ensure_entry_layout(entry: &mut ConversationEntry, width: usize, selected: bool) {
     let key = LayoutKey {
@@ -237,8 +341,9 @@ fn ensure_entry_layout(entry: &mut ConversationEntry, width: usize, selected: bo
         return;
     }
     let mut lines = Vec::new();
-    entry_lines(entry, width, selected, &mut lines);
-    entry.layout = Some(EntryLayout { key, lines });
+    let mut pads = Vec::new();
+    entry_lines(entry, width, selected, &mut lines, &mut pads);
+    entry.layout = Some(EntryLayout { key, lines, pads });
 }
 
 /// Tool and reasoning rows are ambient detail: they render faint once the
@@ -289,6 +394,7 @@ fn entry_lines(
     width: usize,
     selected: bool,
     lines: &mut Vec<Line<'static>>,
+    pads: &mut Vec<usize>,
 ) {
     let (marker, color) = entry_style(entry.kind);
     let selection = if selected { "│" } else { " " };
@@ -311,6 +417,9 @@ fn entry_lines(
         };
         elide_end(&body, width.saturating_sub(fixed))
     };
+    // The header's leading furniture: selection marker, disclosure and
+    // kind marker, the title, and the preview spacer when one follows.
+    let header_pad = 1 + 6 + title_width + if preview.is_empty() { 0 } else { 2 };
     lines.push(
         Line::from(vec![
             Span::styled(selection.to_owned(), Style::default().fg(ACCENT)),
@@ -331,6 +440,7 @@ fn entry_lines(
         ])
         .style(style),
     );
+    pads.push(header_pad);
     if entry.expanded {
         let body_width = width.saturating_sub(5).max(1);
         if renders_markdown(entry.kind) {
@@ -340,6 +450,7 @@ fn entry_lines(
                 spans.push(Span::raw("    "));
                 spans.extend(body_line.spans);
                 lines.push(Line::from(spans).style(style));
+                pads.push(4);
             }
         } else {
             for body_line in wrap_text(&entry.body, body_width) {
@@ -350,6 +461,7 @@ fn entry_lines(
                     ])
                     .style(style),
                 );
+                pads.push(4);
             }
         }
     }
@@ -988,7 +1100,9 @@ mod tests {
         PANEL, elide_end, markdown_lines, markdown_preview, needs_message_spacing, render,
         renders_markdown, viewport_offset, wrap_text,
     };
-    use crate::app::{App, EntryKind, Focus, SessionChoice, SessionView};
+    use crate::app::{
+        App, CellPos, CopyRow, EntryKind, Focus, SessionChoice, SessionView, TextSelection,
+    };
     use crate::config::ModelChoice;
     use crate::runtime::{AgentHistory, CommittedRow, HistoryEntry, HistoryKind};
 
@@ -1160,6 +1274,124 @@ mod tests {
         assert!(!renders_markdown(EntryKind::ToolResult));
         assert!(!renders_markdown(EntryKind::System));
         assert!(!renders_markdown(EntryKind::Error));
+    }
+
+    #[test]
+    fn drag_selection_reverses_selected_cells() {
+        let mut app = test_app(vec![HistoryEntry {
+            kind: HistoryKind::User,
+            title: "you".to_owned(),
+            body: "abc\ndef".to_owned(),
+        }]);
+        app.entries[0].expanded = true;
+        let backend = TestBackend::new(60, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let area = app.conversation_area.unwrap();
+        // Viewport row 0 is the leading message-spacing blank; row 1 is the
+        // header and row 2 is the first body row ("    abc"). Select its
+        // text cells and leave the rest untouched.
+        app.text_selection = Some(TextSelection {
+            anchor: CellPos { row: 2, col: 4 },
+            head: CellPos { row: 2, col: 6 },
+        });
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        for col in 4..=6 {
+            let cell = &buffer[(area.x + col as u16, area.y + 2)];
+            assert!(
+                cell.modifier.contains(Modifier::REVERSED),
+                "cell at ({}, {}) should be reversed: {:?}",
+                area.x + col as u16,
+                area.y + 2,
+                cell.symbol()
+            );
+        }
+        assert!(
+            !buffer[(area.x + 7, area.y + 2)]
+                .modifier
+                .contains(Modifier::REVERSED)
+        );
+        assert!(
+            !buffer[(area.x + 4, area.y + 3)]
+                .modifier
+                .contains(Modifier::REVERSED)
+        );
+    }
+
+    #[test]
+    fn conversation_rows_carry_presentation_pads() {
+        let mut app = test_app(vec![HistoryEntry {
+            kind: HistoryKind::User,
+            title: "you".to_owned(),
+            body: "abc\ndef".to_owned(),
+        }]);
+        app.entries[0].expanded = true;
+        let backend = TestBackend::new(60, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        // Viewport row 0 is the leading spacing blank; row 1 is the header
+        // (furniture only) and rows 2..3 are body rows with a 4-cell indent.
+        assert_eq!(
+            app.conversation_rows[1],
+            CopyRow {
+                pad: 10,
+                text: " ▾ you you".to_owned()
+            }
+        );
+        assert_eq!(
+            app.conversation_rows[2],
+            CopyRow {
+                pad: 4,
+                text: "    abc".to_owned()
+            }
+        );
+        assert_eq!(
+            app.conversation_rows[3],
+            CopyRow {
+                pad: 4,
+                text: "    def".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn copy_toast_renders_in_the_conversation_corner() {
+        let mut app = test_app(vec![HistoryEntry {
+            kind: HistoryKind::User,
+            title: "you".to_owned(),
+            body: "hello".to_owned(),
+        }]);
+        app.show_toast("Copied selection".to_owned());
+        let backend = TestBackend::new(60, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let joined = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(joined.contains("Copied selection"));
+    }
+
+    #[test]
+    fn copy_toast_is_clipped_to_the_conversation_area() {
+        let mut app = test_app(Vec::new());
+        app.show_toast("Copied selection".to_owned());
+        let backend = TestBackend::new(12, 5);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                super::render_toast(
+                    frame,
+                    ratatui::layout::Rect::new(7, 3, 4, 1),
+                    app.toast.as_ref().unwrap(),
+                );
+            })
+            .unwrap();
+        assert_eq!(terminal.backend().buffer()[(1, 3)].symbol(), " ");
     }
 
     #[test]

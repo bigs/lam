@@ -2,6 +2,7 @@
 
 mod app;
 mod boot;
+mod clipboard;
 mod config;
 mod diagnostics;
 mod runtime;
@@ -138,6 +139,7 @@ async fn tokio_main() -> Result<(), AppError> {
             next_frame = tokio::time::Instant::now() + FRAME_INTERVAL;
         }
         let interruption_deadline = app.interruption_deadline();
+        let toast_deadline = app.toast.as_ref().map(|toast| toast.deadline);
         // Resolve the select into a plain value first so the handlers below
         // can borrow both `app` and `runtime` freely — in particular to fold
         // the journal projectors, which need `&mut runtime`.
@@ -161,6 +163,7 @@ async fn tokio_main() -> Result<(), AppError> {
                 }
             }
             () = wait_for_interruption_deadline(interruption_deadline), if interruption_deadline.is_some() => Tick::Deadline,
+            () = wait_for_toast_deadline(toast_deadline), if toast_deadline.is_some() => Tick::Toast,
             () = tokio::time::sleep_until(next_frame), if redraw => Tick::Frame,
         };
         // Apply the awaited event plus everything else already queued, then
@@ -363,7 +366,14 @@ async fn tokio_main() -> Result<(), AppError> {
                                 }
                             }
                         }
-                        Event::Mouse(mouse) => app.handle_mouse(mouse),
+                        Event::Mouse(mouse) => {
+                            if let Some(selected) = app.handle_mouse(mouse) {
+                                match clipboard::copy_to_clipboard(&selected) {
+                                    Ok(()) => app.show_toast("Copied selection".to_owned()),
+                                    Err(error) => app.show_toast(format!("Copy failed: {error}")),
+                                }
+                            }
+                        }
                         Event::Paste(text) => app.handle_paste(&text),
                         Event::Resize(_, _) | Event::FocusGained | Event::FocusLost => {}
                     }
@@ -401,6 +411,10 @@ async fn tokio_main() -> Result<(), AppError> {
                 }
                 Tick::Deadline => {
                     redraw |= app.expire_interruption(std::time::Instant::now());
+                }
+                Tick::Toast => {
+                    app.toast = None;
+                    redraw = true;
                 }
                 Tick::Frame | Tick::Idle => {}
             }
@@ -443,11 +457,19 @@ async fn wait_for_interruption_deadline(deadline: Option<std::time::Instant>) {
     }
 }
 
+async fn wait_for_toast_deadline(deadline: Option<tokio::time::Instant>) {
+    if let Some(deadline) = deadline {
+        tokio::time::sleep_until(deadline).await;
+    }
+}
+
 enum Tick {
     Terminal(io::Result<Event>),
     Agent(AgentSystemEvent),
     Command(CommandResult),
     Deadline,
+    /// A copy toast's display window elapsed; clear it and repaint.
+    Toast,
     /// A throttled redraw came due; the frame renders at the top of the loop.
     Frame,
     Idle,

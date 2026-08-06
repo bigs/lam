@@ -1,13 +1,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
+use tokio::time::Instant as TokioInstant;
+
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use lam::{ModelDelta, RunEvent, RunId, RuntimeEvent, ToolCallDelta};
 use lam_agents::{AgentOutcome, AgentSystemEvent, StopReason};
 use ratatui::layout::Rect;
-use unicode_width::UnicodeWidthChar;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::config::ModelChoice;
 use crate::runtime::{
@@ -16,6 +19,7 @@ use crate::runtime::{
 };
 
 const MOUSE_SCROLL_LINES: usize = 2;
+const TOAST_DURATION: Duration = Duration::from_millis(2_000);
 const INTERRUPTION_ARM_WINDOW: Duration = Duration::from_millis(1_500);
 const INTERRUPTION_WARNING: &str = "Press Esc again to stop the current run";
 const SESSION_PICKER_HINT: &str = "ctrl+d delete the highlighted session";
@@ -65,6 +69,10 @@ pub(crate) struct ConversationEntry {
 pub(crate) struct EntryLayout {
     pub(crate) key: LayoutKey,
     pub(crate) lines: Vec<ratatui::text::Line<'static>>,
+    /// Presentation-padding cell width of each line: the alignment
+    /// indentation and header furniture the renderer adds, which copied
+    /// text should not include.
+    pub(crate) pads: Vec<usize>,
 }
 
 /// Everything the visual layout of a row depends on.
@@ -160,6 +168,125 @@ struct InputLayout {
     cursor_positions: Vec<(usize, usize)>,
 }
 
+/// A cell position in the conversation viewport: a layout row and column
+/// relative to the conversation pane's top-left corner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CellPos {
+    pub(crate) row: usize,
+    pub(crate) col: usize,
+}
+
+/// An in-progress drag selection over the conversation viewport. The anchor
+/// is where the drag started and the head follows the cursor; a completed
+/// selection is copied to the clipboard and cleared.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TextSelection {
+    pub(crate) anchor: CellPos,
+    pub(crate) head: CellPos,
+}
+
+impl TextSelection {
+    /// The selection as an ordered (start, end) pair for rendering and copy.
+    pub(crate) fn normalized(&self) -> (CellPos, CellPos) {
+        if (self.anchor.row, self.anchor.col) <= (self.head.row, self.head.col) {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        }
+    }
+}
+
+/// A transient status toast drawn over the conversation pane until its
+/// deadline, then cleared by the main loop.
+pub(crate) struct Toast {
+    pub(crate) text: String,
+    pub(crate) deadline: TokioInstant,
+}
+
+/// One visible conversation viewport row, plus how many leading cells are
+/// presentation padding (alignment indentation and header furniture) added
+/// purely for layout. Copying skips those cells so pasted text keeps only
+/// the row's content, including any content-level indentation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CopyRow {
+    pub(crate) pad: usize,
+    pub(crate) text: String,
+}
+
+/// Maps a terminal row/column onto a viewport cell, clamped to the pane.
+fn cell_pos(row: u16, column: u16, area: Rect) -> CellPos {
+    CellPos {
+        row: usize::from(row.saturating_sub(area.y))
+            .min(usize::from(area.height.saturating_sub(1))),
+        col: usize::from(column.saturating_sub(area.x))
+            .min(usize::from(area.width.saturating_sub(1))),
+    }
+}
+
+/// The copied text for a selection over the viewport's visible rows: the
+/// selected content cells of each row in order, joined with newlines, with
+/// trailing whitespace trimmed per row. Each row's presentation padding is
+/// skipped, so alignment indentation and header furniture never reach the
+/// clipboard. The selection is normalized, so the anchor may be below or
+/// to the right of the head.
+pub(crate) fn selected_text(rows: &[CopyRow], anchor: CellPos, head: CellPos) -> String {
+    let (start, end) = if (anchor.row, anchor.col) <= (head.row, head.col) {
+        (anchor, head)
+    } else {
+        (head, anchor)
+    };
+    if rows.is_empty() || start.row >= rows.len() {
+        return String::new();
+    }
+    let last = rows.len() - 1;
+    let mut parts = Vec::new();
+    let last_row = end.row.min(last);
+    for (row, copy_row) in rows.iter().enumerate().take(last_row + 1).skip(start.row) {
+        let from_col = if row == start.row {
+            start.col.max(copy_row.pad)
+        } else {
+            copy_row.pad
+        };
+        let to_col = if row == end.row { end.col } else { usize::MAX };
+        parts.push(
+            slice_cells(&copy_row.text, from_col, to_col)
+                .trim_end()
+                .to_owned(),
+        );
+    }
+    parts.join("\n")
+}
+
+/// Yields each grapheme cluster in `text` with its half-open terminal-cell
+/// range, beginning at `start_cell`.
+pub(crate) fn grapheme_cells(
+    text: &str,
+    start_cell: usize,
+) -> impl Iterator<Item = (&str, usize, usize)> {
+    let mut cell = start_cell;
+    text.graphemes(true).map(move |grapheme| {
+        let start = cell;
+        cell = cell.saturating_add(UnicodeWidthStr::width(grapheme));
+        (grapheme, start, cell)
+    })
+}
+
+/// The substring of `text` occupying terminal cells `from_cell..=to_cell`.
+/// Cells are counted by display width, and every grapheme that overlaps the
+/// selection is kept whole.
+pub(crate) fn slice_cells(text: &str, from_cell: usize, to_cell: usize) -> String {
+    let mut out = String::new();
+    for (grapheme, start, end) in grapheme_cells(text, 0) {
+        if start > to_cell {
+            break;
+        }
+        if start <= to_cell && end > from_cell {
+            out.push_str(grapheme);
+        }
+    }
+    out
+}
+
 pub(crate) struct App {
     pub(crate) cwd: String,
     pub(crate) session_id: u64,
@@ -191,6 +318,16 @@ pub(crate) struct App {
     /// Visible click targets for the conversation, one per entry with at
     /// least one row in the viewport.
     pub(crate) hitboxes: Vec<Hitbox>,
+    /// A drag in progress over the conversation viewport, if any.
+    pub(crate) text_selection: Option<TextSelection>,
+    /// Visible text and presentation padding of each conversation viewport
+    /// row from the last frame, so mouse-up can slice the selected cells
+    /// into copied text without the layout indentation.
+    pub(crate) conversation_rows: Vec<CopyRow>,
+    /// Terminal geometry of the conversation pane from the last frame, so
+    /// mouse events can be mapped to viewport cell positions.
+    pub(crate) conversation_area: Option<Rect>,
+    pub(crate) toast: Option<Toast>,
     pub(crate) current_agent: String,
     /// Durably admitted user messages not yet consumed into model-visible
     /// context, shown above the input bar until the runner delivers them at
@@ -319,6 +456,10 @@ impl App {
             context_tokens: root.context_tokens,
             should_exit: false,
             hitboxes: Vec::new(),
+            text_selection: None,
+            conversation_rows: Vec::new(),
+            conversation_area: None,
+            toast: None,
             current_agent: root.address,
             pending_steers: Vec::new(),
             input_history: None,
@@ -580,6 +721,8 @@ impl App {
         if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
             return None;
         }
+        // Any keystroke dismisses an in-progress drag selection.
+        self.text_selection = None;
         let deleting =
             key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('d');
         if !deleting {
@@ -1057,13 +1200,17 @@ impl App {
         }
     }
 
-    pub(crate) fn handle_mouse(&mut self, mouse: MouseEvent) {
+    pub(crate) fn handle_mouse(&mut self, mouse: MouseEvent) -> Option<String> {
         match mouse.kind {
             MouseEventKind::ScrollUp => {
+                self.text_selection = None;
                 self.scroll_conversation(-1);
+                None
             }
             MouseEventKind::ScrollDown => {
+                self.text_selection = None;
                 self.scroll_conversation(1);
+                None
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 if let Some(area) = self.input_area
@@ -1071,13 +1218,14 @@ impl App {
                     && mouse.row < area.y.saturating_add(area.height)
                     && mouse.column >= area.x
                 {
+                    self.text_selection = None;
                     self.focus = Focus::Input;
                     let row = usize::from(mouse.row - area.y);
                     let column = usize::from(mouse.column - area.x).saturating_sub(3);
                     self.input.cursor = self.input.cursor_at(self.input_width, row, column);
                     self.input.preferred_column = None;
                     self.suggestion_index = 0;
-                    return;
+                    return None;
                 }
                 if let Some(hitbox) = self
                     .hitboxes
@@ -1089,14 +1237,62 @@ impl App {
                     self.follow_conversation_tail = hitbox.entry + 1 == self.entries.len();
                     self.selection_drives_viewport = true;
                     // Only the header line toggles expand/collapse; clicking
-                    // a body row just moves focus and selection.
+                    // a body row selects the entry and arms text selection.
                     if hitbox.header == Some(mouse.row) {
                         self.toggle_selected();
+                        return None;
                     }
                 }
+                self.begin_selection(mouse.row, mouse.column);
+                None
             }
-            _ => {}
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(selection) = &mut self.text_selection
+                    && let Some(area) = self.conversation_area
+                {
+                    selection.head = cell_pos(mouse.row, mouse.column, area);
+                }
+                None
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if let Some(selection) = self.text_selection.take()
+                    && selection.anchor != selection.head
+                {
+                    return Some(selected_text(
+                        &self.conversation_rows,
+                        selection.anchor,
+                        selection.head,
+                    ));
+                }
+                None
+            }
+            _ => None,
         }
+    }
+
+    /// Arms a drag selection at the pressed cell, or does nothing when the
+    /// press landed outside the conversation pane.
+    fn begin_selection(&mut self, row: u16, column: u16) {
+        let Some(area) = self.conversation_area else {
+            return;
+        };
+        if row < area.y || row >= area.y.saturating_add(area.height) || column < area.x {
+            return;
+        }
+        self.focus = Focus::Conversation;
+        let position = cell_pos(row, column, area);
+        self.text_selection = Some(TextSelection {
+            anchor: position,
+            head: position,
+        });
+    }
+
+    /// Shows a transient status toast in the conversation pane corner.
+    pub(crate) fn show_toast(&mut self, text: impl Into<String>) {
+        self.toast = Some(Toast {
+            text: text.into(),
+            deadline: TokioInstant::now() + TOAST_DURATION,
+        });
     }
 
     pub(crate) fn handle_paste(&mut self, text: &str) {
@@ -2423,8 +2619,9 @@ mod tests {
     use ratatui::layout::Rect;
 
     use super::{
-        App, EntryKind, Focus, Hitbox, InputBuffer, PendingSteer, SESSION_PICKER_HINT,
-        SessionChoice, SessionView, partial_eval_intent,
+        App, CellPos, CopyRow, EntryKind, Focus, Hitbox, InputBuffer, PendingSteer,
+        SESSION_PICKER_HINT, SessionChoice, SessionView, TextSelection, partial_eval_intent,
+        selected_text,
     };
     use crate::config::ModelChoice;
     use crate::runtime::{
@@ -2699,7 +2896,10 @@ mod tests {
         app.input.cursor = 2;
         app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
         assert_eq!(app.input.text, "aλ\nb");
-        assert_eq!(app.input.cursor, 3, "cursor lands at the start of the new line");
+        assert_eq!(
+            app.input.cursor, 3,
+            "cursor lands at the start of the new line"
+        );
 
         // The new logical line is navigable: Ctrl-A and Ctrl-E stay within it.
         app.input.cursor = 4;
@@ -2778,6 +2978,13 @@ mod tests {
         app.handle_paste("first line\nsecond line");
         assert_eq!(app.input.text, "first line\nsecond line");
         assert_eq!(app.input.cursor, 22);
+    }
+
+    #[test]
+    fn cell_slicing_keeps_graphemes_that_overlap_the_selection() {
+        assert_eq!(super::slice_cells("界x", 1, 1), "界");
+        assert_eq!(super::slice_cells("界x", 2, 2), "x");
+        assert_eq!(super::slice_cells("e\u{301}x", 0, 0), "e\u{301}");
     }
 
     #[test]
@@ -4676,6 +4883,317 @@ mod tests {
 
         assert_eq!(app.selected_entry, Some(entry));
         assert!(app.entries[entry].expanded);
+    }
+
+    fn selection_app() -> App {
+        let mut app = app();
+        app.conversation_area = Some(Rect {
+            x: 2,
+            y: 2,
+            width: 40,
+            height: 8,
+        });
+        app.conversation_rows = vec![
+            CopyRow {
+                pad: 0,
+                text: "first line".to_owned(),
+            },
+            CopyRow {
+                pad: 0,
+                text: "second line".to_owned(),
+            },
+            CopyRow {
+                pad: 0,
+                text: "third line".to_owned(),
+            },
+            CopyRow {
+                pad: 0,
+                text: String::new(),
+            },
+        ];
+        app
+    }
+
+    fn mouse_event(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn drag_selects_visible_rows_and_returns_them_on_release() {
+        let mut app = selection_app();
+        app.handle_mouse(mouse_event(MouseEventKind::Down(MouseButton::Left), 5, 3));
+        app.handle_mouse(mouse_event(MouseEventKind::Drag(MouseButton::Left), 12, 5));
+        let copied = app.handle_mouse(mouse_event(MouseEventKind::Up(MouseButton::Left), 12, 5));
+        assert_eq!(copied.as_deref(), Some("ond line\nthird line\n"));
+        assert!(app.text_selection.is_none());
+    }
+
+    #[test]
+    fn dragging_upwards_selects_backwards() {
+        let mut app = selection_app();
+        app.handle_mouse(mouse_event(MouseEventKind::Down(MouseButton::Left), 12, 5));
+        app.handle_mouse(mouse_event(MouseEventKind::Drag(MouseButton::Left), 5, 3));
+        let copied = app.handle_mouse(mouse_event(MouseEventKind::Up(MouseButton::Left), 5, 3));
+        assert_eq!(copied.as_deref(), Some("ond line\nthird line\n"));
+    }
+
+    #[test]
+    fn plain_click_copies_nothing() {
+        let mut app = selection_app();
+        app.handle_mouse(mouse_event(MouseEventKind::Down(MouseButton::Left), 5, 3));
+        assert!(
+            app.handle_mouse(mouse_event(MouseEventKind::Up(MouseButton::Left), 5, 3))
+                .is_none()
+        );
+        assert!(app.text_selection.is_none());
+    }
+
+    #[test]
+    fn header_click_toggles_without_arming_selection() {
+        let mut app = selection_app();
+        app.push_entry(EntryKind::System, "Expanded", "body");
+        let entry = app.entries.len() - 1;
+        app.entries[entry].expanded = true;
+        app.hitboxes = vec![Hitbox {
+            top: 2,
+            bottom: 2,
+            header: Some(2),
+            entry,
+        }];
+        app.handle_mouse(mouse_event(MouseEventKind::Down(MouseButton::Left), 5, 2));
+        assert!(!app.entries[entry].expanded);
+        assert!(app.text_selection.is_none());
+    }
+
+    #[test]
+    fn body_click_selects_the_entry_and_arms_selection() {
+        let mut app = selection_app();
+        app.push_entry(EntryKind::System, "Expanded", "first line\nsecond line");
+        let entry = app.entries.len() - 1;
+        app.entries[entry].expanded = true;
+        app.hitboxes = vec![Hitbox {
+            top: 2,
+            bottom: 4,
+            header: Some(2),
+            entry,
+        }];
+        app.handle_mouse(mouse_event(MouseEventKind::Down(MouseButton::Left), 5, 3));
+        assert_eq!(app.selected_entry, Some(entry));
+        assert_eq!(
+            app.text_selection,
+            Some(TextSelection {
+                anchor: CellPos { row: 1, col: 3 },
+                head: CellPos { row: 1, col: 3 },
+            })
+        );
+    }
+
+    #[test]
+    fn click_outside_the_conversation_clears_selection() {
+        let mut app = selection_app();
+        app.input_area = Some(Rect {
+            x: 2,
+            y: 10,
+            width: 60,
+            height: 1,
+        });
+        app.text_selection = Some(TextSelection {
+            anchor: CellPos { row: 1, col: 0 },
+            head: CellPos { row: 2, col: 4 },
+        });
+        app.handle_mouse(mouse_event(MouseEventKind::Down(MouseButton::Left), 5, 10));
+        assert!(app.text_selection.is_none());
+        assert_eq!(app.focus, Focus::Input);
+    }
+
+    #[test]
+    fn wheel_scroll_clears_selection() {
+        let mut app = selection_app();
+        app.text_selection = Some(TextSelection {
+            anchor: CellPos { row: 1, col: 0 },
+            head: CellPos { row: 2, col: 4 },
+        });
+        app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 0, 0));
+        assert!(app.text_selection.is_none());
+    }
+
+    #[test]
+    fn keystroke_clears_selection() {
+        let mut app = selection_app();
+        app.text_selection = Some(TextSelection {
+            anchor: CellPos { row: 1, col: 0 },
+            head: CellPos { row: 2, col: 4 },
+        });
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(app.text_selection.is_none());
+    }
+
+    #[test]
+    fn selected_text_joins_rows_and_trims_trailing_whitespace() {
+        let rows = vec![
+            CopyRow {
+                pad: 0,
+                text: "abcdef".to_owned(),
+            },
+            CopyRow {
+                pad: 0,
+                text: "ghijkl   ".to_owned(),
+            },
+        ];
+        assert_eq!(
+            selected_text(
+                &rows,
+                CellPos { row: 0, col: 1 },
+                CellPos { row: 1, col: 2 }
+            ),
+            "bcdef\nghi"
+        );
+    }
+
+    #[test]
+    fn selected_text_slices_wide_characters_by_cells() {
+        let rows = vec![CopyRow {
+            pad: 0,
+            text: "ab界cd".to_owned(),
+        }];
+        assert_eq!(
+            selected_text(
+                &rows,
+                CellPos { row: 0, col: 0 },
+                CellPos { row: 0, col: 3 }
+            ),
+            "ab界"
+        );
+        assert_eq!(
+            selected_text(
+                &rows,
+                CellPos { row: 0, col: 0 },
+                CellPos { row: 0, col: 1 }
+            ),
+            "ab"
+        );
+        assert_eq!(
+            selected_text(
+                &rows,
+                CellPos { row: 0, col: 4 },
+                CellPos { row: 0, col: 5 }
+            ),
+            "cd"
+        );
+    }
+
+    #[test]
+    fn selected_text_normalizes_reverse_drags() {
+        let rows = vec![CopyRow {
+            pad: 0,
+            text: "abcdef".to_owned(),
+        }];
+        assert_eq!(
+            selected_text(
+                &rows,
+                CellPos { row: 0, col: 4 },
+                CellPos { row: 0, col: 1 }
+            ),
+            "bcde"
+        );
+    }
+
+    #[test]
+    fn selected_text_out_of_bounds_is_empty() {
+        let rows = vec![CopyRow {
+            pad: 0,
+            text: "abc".to_owned(),
+        }];
+        assert_eq!(
+            selected_text(
+                &rows,
+                CellPos { row: 5, col: 0 },
+                CellPos { row: 6, col: 1 }
+            ),
+            ""
+        );
+    }
+
+    #[test]
+    fn selected_text_omits_presentation_padding() {
+        let rows = vec![
+            CopyRow {
+                pad: 4,
+                text: "    Hello".to_owned(),
+            },
+            CopyRow {
+                pad: 4,
+                text: "    There".to_owned(),
+            },
+        ];
+        assert_eq!(
+            selected_text(
+                &rows,
+                CellPos { row: 0, col: 0 },
+                CellPos { row: 1, col: 9 }
+            ),
+            "Hello\nThere"
+        );
+    }
+
+    #[test]
+    fn selected_text_keeps_content_level_indentation() {
+        let rows = vec![CopyRow {
+            pad: 4,
+            text: "    let x = 1".to_owned(),
+        }];
+        assert_eq!(
+            selected_text(
+                &rows,
+                CellPos { row: 0, col: 0 },
+                CellPos { row: 0, col: 12 }
+            ),
+            "let x = 1"
+        );
+    }
+
+    #[test]
+    fn selected_text_starting_inside_padding_skips_it() {
+        let rows = vec![CopyRow {
+            pad: 4,
+            text: "    Hello".to_owned(),
+        }];
+        assert_eq!(
+            selected_text(
+                &rows,
+                CellPos { row: 0, col: 2 },
+                CellPos { row: 0, col: 8 }
+            ),
+            "Hello"
+        );
+    }
+
+    #[test]
+    fn selected_text_header_furniture_copies_nothing() {
+        let rows = vec![CopyRow {
+            pad: 10,
+            text: " ▾ you you".to_owned(),
+        }];
+        assert_eq!(
+            selected_text(
+                &rows,
+                CellPos { row: 0, col: 0 },
+                CellPos { row: 0, col: 9 }
+            ),
+            ""
+        );
+    }
+
+    #[test]
+    fn show_toast_records_text() {
+        let mut app = app();
+        app.show_toast("Copied selection".to_owned());
+        assert_eq!(app.toast.as_ref().unwrap().text, "Copied selection");
     }
 
     #[test]
