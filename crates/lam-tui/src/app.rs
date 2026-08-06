@@ -352,6 +352,10 @@ pub(crate) struct App {
     /// Whether the currently viewed agent has a live harness run. For
     /// \`/root\` this mirrors \`root_run_active\`; for children it is independent.
     current_run_active: bool,
+    /// Create order of the currently viewed agent (0 for `/root`).
+    current_created_ord: u64,
+    /// Next create-order value to assign to a newly observed agent.
+    next_agent_ord: u64,
     /// A blocking command (compact, model switch, session change) awaits its
     /// result. Messages are never blocking; they queue as steers.
     command_in_flight: bool,
@@ -378,6 +382,9 @@ struct AgentConversation {
     model: Option<String>,
     /// Whether this agent currently has a live harness run.
     run_active: bool,
+    /// Monotonic create order for this session view (higher = newer).
+    /// Assigned when the agent is first observed (Hosted / ensure / restore).
+    created_ord: u64,
     committed_len: usize,
     overlay_turn: u64,
     dead_runs: BTreeSet<String>,
@@ -431,11 +438,16 @@ impl App {
             .iter()
             .position(|effort| effort == selected_effort)
             .unwrap_or(selected_efforts[selected_model]);
+        // Restored agents have no durable create clock; assign increasing
+        // ords in load order so sibling ordering stays stable within a boot.
+        let mut next_agent_ord = 1u64;
         let inactive_agents = agents
             .into_iter()
             .map(|agent| {
                 let address = agent.address.clone();
-                (address, AgentConversation::from_history(agent))
+                let created_ord = next_agent_ord;
+                next_agent_ord = next_agent_ord.saturating_add(1);
+                (address, AgentConversation::from_history(agent, created_ord))
             })
             .collect();
         Self {
@@ -478,6 +490,8 @@ impl App {
             dead_runs: BTreeSet::new(),
             root_run_active,
             current_run_active: root_run_active,
+            current_created_ord: 0,
+            next_agent_ord,
             command_in_flight: false,
             interruption_deadline: None,
             interruption_in_progress: false,
@@ -2043,11 +2057,59 @@ impl App {
         }
     }
 
+    /// Hierarchical agent list for the drawer: DFS from `/root`, with siblings
+    /// ordered newest-created first (session create order, not last activity).
     fn agent_addresses(&self) -> Vec<String> {
-        let mut addresses = self.inactive_agents.keys().cloned().collect::<Vec<_>>();
-        addresses.push(self.current_agent.clone());
-        addresses.sort();
-        addresses
+        let mut nodes: BTreeMap<String, (Option<String>, u64)> = BTreeMap::new();
+        for (address, agent) in &self.inactive_agents {
+            nodes.insert(address.clone(), (agent.parent.clone(), agent.created_ord));
+        }
+        nodes.insert(
+            self.current_agent.clone(),
+            (self.current_parent.clone(), self.current_created_ord),
+        );
+
+        let mut children: BTreeMap<String, Vec<(u64, String)>> = BTreeMap::new();
+        let mut roots = Vec::new();
+        for (address, (parent, ord)) in &nodes {
+            match parent {
+                Some(parent) if nodes.contains_key(parent) => {
+                    children
+                        .entry(parent.clone())
+                        .or_default()
+                        .push((*ord, address.clone()));
+                }
+                _ => roots.push((*ord, address.clone())),
+            }
+        }
+        for siblings in children.values_mut() {
+            siblings.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+        }
+        roots.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+
+        fn dfs(
+            address: &str,
+            children: &BTreeMap<String, Vec<(u64, String)>>,
+            ordered: &mut Vec<String>,
+        ) {
+            ordered.push(address.to_owned());
+            if let Some(kids) = children.get(address) {
+                for (_, child) in kids {
+                    dfs(child, children, ordered);
+                }
+            }
+        }
+
+        let mut ordered = Vec::with_capacity(nodes.len());
+        if nodes.contains_key("/root") {
+            dfs("/root", &children, &mut ordered);
+        }
+        for (_, address) in roots {
+            if !ordered.iter().any(|seen| seen == &address) {
+                dfs(&address, &children, &mut ordered);
+            }
+        }
+        ordered
     }
 
     /// Whether the input bar is currently driving the expanded agents drawer.
@@ -2207,9 +2269,20 @@ impl App {
             }
             return;
         }
-        self.inactive_agents
-            .entry(address.to_owned())
-            .or_insert_with(|| AgentConversation::empty(parent, status));
+        if self.inactive_agents.contains_key(address) {
+            return;
+        }
+        let created_ord = self.alloc_created_ord();
+        self.inactive_agents.insert(
+            address.to_owned(),
+            AgentConversation::empty(parent, status, created_ord),
+        );
+    }
+
+    fn alloc_created_ord(&mut self) -> u64 {
+        let ord = self.next_agent_ord;
+        self.next_agent_ord = self.next_agent_ord.saturating_add(1);
+        ord
     }
 
     fn switch_agent(&mut self, address: &str) -> bool {
@@ -2235,6 +2308,7 @@ impl App {
             parent: self.current_parent.take(),
             model: self.current_model.take(),
             run_active: previous_run_active,
+            created_ord: self.current_created_ord,
             committed_len: self.committed_len,
             overlay_turn: self.overlay_turn,
             dead_runs: std::mem::take(&mut self.dead_runs),
@@ -2251,6 +2325,7 @@ impl App {
         self.current_parent = next.parent;
         self.current_model = next.model;
         self.current_run_active = next.run_active;
+        self.current_created_ord = next.created_ord;
         if address == "/root" {
             self.root_run_active = next.run_active;
             self.recompute_busy();
@@ -2298,7 +2373,7 @@ fn elide_end_plain(text: &str, width: usize) -> String {
 }
 
 impl AgentConversation {
-    fn empty(parent: Option<String>, status: &str) -> Self {
+    fn empty(parent: Option<String>, status: &str, created_ord: u64) -> Self {
         Self {
             entries: Vec::new(),
             selected_entry: None,
@@ -2310,13 +2385,14 @@ impl AgentConversation {
             parent,
             model: None,
             run_active: false,
+            created_ord,
             committed_len: 0,
             overlay_turn: 0,
             dead_runs: BTreeSet::new(),
         }
     }
 
-    fn from_history(history: AgentHistory) -> Self {
+    fn from_history(history: AgentHistory, created_ord: u64) -> Self {
         let entries = conversation_from_rows(history.history);
         Self {
             selected_entry: entries.len().checked_sub(1),
@@ -2330,6 +2406,7 @@ impl AgentConversation {
             parent: history.parent,
             model: history.model,
             run_active: !history.run_completed,
+            created_ord,
             overlay_turn: 0,
             dead_runs: BTreeSet::new(),
         }
@@ -5546,6 +5623,37 @@ mod tests {
         );
         assert!(suggestions[0].label.contains("[root]"));
         assert!(!suggestions[0].running);
+    }
+
+    #[test]
+    fn agent_picker_orders_siblings_newest_created_first() {
+        let mut app = app();
+        let older = ActorAddress::new("/root/older").unwrap();
+        let newer = ActorAddress::new("/root/newer").unwrap();
+        let root = ActorAddress::new("/root").unwrap();
+        app.apply_agent_event(AgentSystemEvent::Hosted {
+            address: older,
+            parent: Some(root.clone()),
+        });
+        app.apply_agent_event(AgentSystemEvent::Hosted {
+            address: newer,
+            parent: Some(root),
+        });
+        app.open_agents_drawer();
+        let labels = app
+            .suggestions()
+            .iter()
+            .map(|suggestion| suggestion.label.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            labels,
+            vec![
+                "◉ [root]".to_owned(),
+                "  └─ newer".to_owned(),
+                "  └─ older".to_owned(),
+            ],
+            "siblings should list newest-created first: {labels:?}"
+        );
     }
 
     #[test]
