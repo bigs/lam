@@ -3,6 +3,7 @@
 ## Agent runtime
 
 - [ ] Implement world state for dynamic agent state.
+  - Codex-style: model-writable, durable world state (e.g. an AGENTS.md-backed memory file the agent can update), re-read each turn rather than only at boot.
 - [x] Esc to recoverably interrupt all running agents.
   - Scope is always `/root` and its complete active descendant tree, regardless of the selected `/agents` view or focused pane.
   - Escape has this singular purpose: it never clears draft input or changes pane focus, and it does nothing when no root work is active.
@@ -19,6 +20,11 @@
   - Resolve cancellation races at the journal append boundary and document that external tool side effects are not rolled back.
   - After committing their interruption records, descendants retire and release residency. Their durable journals remain browseable in `/agents`, their addresses remain non-reusable, and `/root` alone remains resident for later conversation.
   - Interruption permanently closes the active run. A later user message starts a new run from the retained context and interruption notice; cancelled provider requests, evals, and tool loops are never restarted automatically.
+- [x] Interpolate project instructions (AGENTS.md preferred, CLAUDE.md fallback) into the root system prompt at boot.
+  - Codex discovery semantics: walk from cwd up to the nearest `.git` marker; when none exists, only cwd is considered.
+  - Collect every AGENTS.md/CLAUDE.md from the project root down to cwd, inclusive, ordered root-first (deeper files take precedence on conflicts).
+  - Grok-style rendering: `## From: <path>` heading per file inside a "Project instructions" section.
+  - Read once at boot; root actor only (subagents do not inherit); no global/home fallback; no UI notice.
 - [x] Ctrl+C clears nonempty draft input first; when the input is empty, it quits through the existing system-abort cleanup.
 - [x] Streaming Markdown rendering for expanded user, assistant, and reasoning messages; collapsed previews remain plain.
 - [ ] Bound console capture and spill oversized serialized eval results through embedding-provided storage.

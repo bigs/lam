@@ -113,6 +113,20 @@ most custom Responses proxies). Completed summaries are durable in the native
 response payload and reappear after restart; partial streamed summary text is
 ephemeral like other token deltas.
 
+## Project instructions
+
+At boot, Lam follows the Codex convention for project instruction files: it
+walks from the working directory up to the nearest ancestor containing a
+`.git` marker and reads `AGENTS.md` (preferred) or `CLAUDE.md` (fallback) at
+every directory from that root down to the working directory, inclusive. When
+no `.git` marker exists, only the working directory is considered.
+
+The discovered files are interpolated into the root agent's system prompt as a
+single `Project instructions` section, ordered root-first so deeper files take
+precedence on conflicts. The section is read once at boot and is not shown in
+the transcript; subagents do not inherit it, and no global or home-directory
+file is consulted.
+
 ## Sessions
 
 Lam keeps durable, directory-scoped sessions under `~/.lam/sessions`. The

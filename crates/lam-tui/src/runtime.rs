@@ -298,6 +298,28 @@ impl Runtime {
             .map(|configured| configured.choice.clone())
             .collect::<Vec<_>>();
         let instruction = coding_instruction(&cwd, &active_choices, initial_index);
+        let project_instructions = phase_sync("project_instructions", || {
+            let entries = load_project_instructions(&cwd);
+            match format_project_instructions(&entries) {
+                Some(section) => {
+                    tracing::info!(
+                        target: "lam_tui::runtime",
+                        event = "project_instructions.loaded",
+                        sources = entries.len(),
+                        "interpolated project instructions into the root system prompt"
+                    );
+                    Some(section)
+                }
+                None => {
+                    tracing::debug!(
+                        target: "lam_tui::runtime",
+                        event = "project_instructions.none",
+                        "no AGENTS.md or CLAUDE.md found below the git root"
+                    );
+                    None
+                }
+            }
+        });
 
         let mut root_builder = initial
             .model
@@ -306,6 +328,9 @@ impl Runtime {
             .state_store(system.state_store())
             .namespaces(coding.namespaces())
             .annotate_system_prompt(&instruction);
+        if let Some(project_instructions) = &project_instructions {
+            root_builder = root_builder.annotate_system_prompt(project_instructions);
+        }
         for configured in &models {
             if configured.choice.registry_id != initial.choice.registry_id {
                 root_builder = configured
@@ -1516,6 +1541,90 @@ Subagent models: call `lam.agents.models()` to list allowed models grouped by pr
     )
 }
 
+/// One project-instruction file discovered between the git root and the
+/// working directory.
+struct ProjectInstruction {
+    /// Absolute path of the file the content was read from.
+    path: PathBuf,
+    /// The file's full text.
+    content: String,
+}
+
+/// Discovers project instruction files the way Codex does: walk from `cwd`
+/// up to the nearest ancestor containing a `.git` marker (the project
+/// root); when no marker exists, only `cwd` is considered. Every
+/// `AGENTS.md` (preferred) or `CLAUDE.md` fallback along the path from the
+/// project root down to `cwd`, inclusive, is collected in that order
+/// (root first, nearest last). No global or home-directory file is
+/// consulted.
+fn load_project_instructions(cwd: &Path) -> Vec<ProjectInstruction> {
+    let root = git_root(cwd).unwrap_or_else(|| cwd.to_path_buf());
+    let mut directories = Vec::new();
+    let mut cursor = Some(cwd);
+    while let Some(directory) = cursor {
+        directories.push(directory.to_path_buf());
+        if directory == root {
+            break;
+        }
+        cursor = directory.parent();
+    }
+    directories.reverse();
+
+    let mut instructions = Vec::new();
+    for directory in directories {
+        for name in ["AGENTS.md", "CLAUDE.md"] {
+            let candidate = directory.join(name);
+            if candidate.is_file()
+                && let Ok(content) = std::fs::read_to_string(&candidate)
+                && !content.trim().is_empty()
+            {
+                instructions.push(ProjectInstruction {
+                    path: candidate,
+                    content,
+                });
+                break;
+            }
+        }
+    }
+    instructions
+}
+
+/// Nearest ancestor of `cwd` containing a `.git` entry (a directory, or a
+/// file as in worktrees and submodules), or `None` when no ancestor does.
+fn git_root(cwd: &Path) -> Option<PathBuf> {
+    let mut cursor = Some(cwd);
+    while let Some(directory) = cursor {
+        if directory.join(".git").exists() {
+            return Some(directory.to_path_buf());
+        }
+        cursor = directory.parent();
+    }
+    None
+}
+
+/// Renders discovered project instructions as a system-prompt section in
+/// the Grok style: one `## From: <path>` heading per file, ordered root
+/// first so deeper files take precedence on conflicts.
+fn format_project_instructions(instructions: &[ProjectInstruction]) -> Option<String> {
+    if instructions.is_empty() {
+        return None;
+    }
+    let mut section = String::from(
+        "Project instructions (AGENTS.md / CLAUDE.md), ordered from the repository root to the working directory — deeper files take precedence on conflicts:",
+    );
+    for instruction in instructions {
+        section.push_str(&format!(
+            "\n\n## From: {}\n{}",
+            instruction.path.display(),
+            instruction.content.trim()
+        ));
+    }
+    section.push_str(
+        "\n\nFollow these instructions exactly. When working in subdirectories not listed above, check for additional project instruction files (AGENTS.md, CLAUDE.md, etc.).",
+    );
+    Some(section)
+}
+
 #[derive(Debug, Error)]
 pub(crate) enum RuntimeError {
     #[error("could not open the durable session journal: {0}")]
@@ -1531,6 +1640,7 @@ pub(crate) enum RuntimeError {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use std::path::PathBuf;
 
     use lam::{
         ActorEvent, ActorId, ActorState, AppendOutcome, CodecId, CodecRef, ContextEntry,
@@ -1548,9 +1658,10 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        AnyModel, ConfiguredModel, EffortCodec, EffortControl, HistoryKind, Projector,
-        append_model_projection, checkpoint_projector, coding_instruction,
-        drop_runtime_outside_async, first_user_message, fold_projector, insert_json_path,
+        AnyModel, ConfiguredModel, EffortCodec, EffortControl, HistoryKind, ProjectInstruction,
+        Projector, append_model_projection, checkpoint_projector, coding_instruction,
+        drop_runtime_outside_async, first_user_message, fold_projector,
+        format_project_instructions, insert_json_path, load_project_instructions,
         quiesce_command_runtime, runtime_notice,
     };
     use crate::config::ModelChoice;
@@ -2247,6 +2358,122 @@ mod tests {
         assert!(instruction.contains("`openai/gpt-5.6-luna`"));
         assert!(!instruction.contains("Configured inference providers and models:"));
         assert!(!instruction.contains("accounts/fireworks/models/deepseek-v4-flash-0731"));
+    }
+
+    #[test]
+    fn project_instructions_prefers_agents_md_over_claude_md() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join(".git")).unwrap();
+        std::fs::write(directory.path().join("AGENTS.md"), "agents rules").unwrap();
+        std::fs::write(directory.path().join("CLAUDE.md"), "claude rules").unwrap();
+
+        let instructions = load_project_instructions(directory.path());
+
+        assert_eq!(instructions.len(), 1);
+        assert_eq!(instructions[0].path, directory.path().join("AGENTS.md"));
+        assert_eq!(instructions[0].content, "agents rules");
+    }
+
+    #[test]
+    fn project_instructions_fall_back_to_claude_md() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join(".git")).unwrap();
+        std::fs::write(directory.path().join("CLAUDE.md"), "claude rules").unwrap();
+
+        let instructions = load_project_instructions(directory.path());
+
+        assert_eq!(instructions.len(), 1);
+        assert_eq!(instructions[0].path, directory.path().join("CLAUDE.md"));
+        assert_eq!(instructions[0].content, "claude rules");
+    }
+
+    #[test]
+    fn project_instructions_collect_from_git_root_down_to_cwd_root_first() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join(".git")).unwrap();
+        std::fs::write(directory.path().join("AGENTS.md"), "root rules").unwrap();
+        let nested = directory.path().join("src").join("deep");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("CLAUDE.md"), "nested rules").unwrap();
+
+        let instructions = load_project_instructions(&nested);
+
+        assert_eq!(instructions.len(), 2);
+        assert_eq!(instructions[0].path, directory.path().join("AGENTS.md"));
+        assert_eq!(instructions[0].content, "root rules");
+        assert_eq!(instructions[1].path, nested.join("CLAUDE.md"));
+        assert_eq!(instructions[1].content, "nested rules");
+    }
+
+    #[test]
+    fn project_instructions_without_git_root_consider_only_cwd() {
+        let directory = tempfile::tempdir().unwrap();
+        // No `.git` marker anywhere above; a sibling file must not be picked up.
+        let nested = directory.path().join("src");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(directory.path().join("AGENTS.md"), "outside rules").unwrap();
+
+        let instructions = load_project_instructions(&nested);
+
+        assert!(instructions.is_empty());
+    }
+
+    #[test]
+    fn project_instructions_skip_empty_files() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join(".git")).unwrap();
+        std::fs::write(directory.path().join("AGENTS.md"), "   \n").unwrap();
+
+        let instructions = load_project_instructions(directory.path());
+
+        assert!(instructions.is_empty());
+    }
+
+    #[test]
+    fn project_instructions_prefer_git_root_over_cwd_when_both_exist() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join(".git")).unwrap();
+        std::fs::write(directory.path().join("AGENTS.md"), "root rules").unwrap();
+        std::fs::write(directory.path().join("CLAUDE.md"), "root claude").unwrap();
+        let nested = directory.path().join("src");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("AGENTS.md"), "nested rules").unwrap();
+
+        let instructions = load_project_instructions(&nested);
+
+        assert_eq!(instructions.len(), 2);
+        assert_eq!(instructions[0].path, directory.path().join("AGENTS.md"));
+        assert_eq!(instructions[0].content, "root rules");
+        assert_eq!(instructions[1].path, nested.join("AGENTS.md"));
+        assert_eq!(instructions[1].content, "nested rules");
+    }
+
+    #[test]
+    fn format_project_instructions_renders_grok_style_sections() {
+        let instructions = vec![
+            ProjectInstruction {
+                path: PathBuf::from("/work/project/AGENTS.md"),
+                content: "root rules".to_owned(),
+            },
+            ProjectInstruction {
+                path: PathBuf::from("/work/project/src/CLAUDE.md"),
+                content: "nested rules".to_owned(),
+            },
+        ];
+
+        let section = format_project_instructions(&instructions).unwrap();
+
+        assert!(section.starts_with("Project instructions (AGENTS.md / CLAUDE.md)"));
+        assert!(section.contains("## From: /work/project/AGENTS.md\nroot rules"));
+        assert!(section.contains("## From: /work/project/src/CLAUDE.md\nnested rules"));
+        assert!(section.ends_with(
+            "check for additional project instruction files (AGENTS.md, CLAUDE.md, etc.)."
+        ));
+    }
+
+    #[test]
+    fn format_project_instructions_returns_none_when_empty() {
+        assert!(format_project_instructions(&[]).is_none());
     }
 
     #[test]
