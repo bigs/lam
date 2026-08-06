@@ -1164,7 +1164,7 @@ fn durable_interruption_replays_eval_failure_and_notice_in_both_protocols() {
 }
 
 #[tokio::test]
-async fn responses_provider_sends_store_false_and_returns_completed_native_response() {
+async fn responses_provider_accepts_mislabeled_sse_and_returns_completed_native_response() {
     let completed = json!({
         "id": "resp_1",
         "object": "response",
@@ -1185,7 +1185,7 @@ async fn responses_provider_sends_store_false_and_returns_completed_native_respo
         }
     });
     let stream = format!(
-        "event: response.output_item.added\ndata: {}\n\nevent: response.function_call_arguments.delta\ndata: {}\n\nevent: response.output_text.delta\ndata: {}\n\nevent: response.completed\ndata: {}\n\n",
+        "event: ping\ndata: keep-alive\n\nevent: response.output_item.added\ndata: {}\n\nevent: response.function_call_arguments.delta\ndata: {}\n\nevent: response.output_text.delta\ndata: {}\n\nevent: response.completed\ndata: {}\n\n",
         json!({
             "type": "response.output_item.added",
             "output_index": 1,
@@ -1204,7 +1204,7 @@ async fn responses_provider_sends_store_false_and_returns_completed_native_respo
         json!({ "type": "response.output_text.delta", "delta": "hello" }),
         json!({ "type": "response.completed", "response": completed })
     );
-    let server = MockServer::start("text/event-stream", stream);
+    let server = MockServer::start("text/plain; charset=utf-8", stream);
     let (provider, codec) = Responses::builder("gpt-test")
         .api_key("test-key")
         .base_url(format!("{}/v1", server.origin))
@@ -1258,6 +1258,61 @@ async fn responses_provider_sends_store_false_and_returns_completed_native_respo
             }),
             ModelDelta::Text("hello".to_owned()),
         ]
+    );
+}
+
+#[tokio::test]
+async fn responses_provider_reconstructs_codex_output_from_done_items() {
+    let message = json!({
+        "type": "message",
+        "role": "assistant",
+        "content": [{ "type": "output_text", "text": "hello from Codex" }]
+    });
+    let completed = json!({
+        "id": "resp_codex",
+        "usage": {
+            "input_tokens": 10,
+            "output_tokens": 4,
+            "total_tokens": 14
+        }
+    });
+    let stream = format!(
+        "event: response.output_text.delta\ndata: {}\n\nevent: response.output_item.done\ndata: {}\n\nevent: response.completed\ndata: {}\n\n",
+        json!({ "type": "response.output_text.delta", "delta": "hello from Codex" }),
+        json!({ "type": "response.output_item.done", "item": message }),
+        json!({ "type": "response.completed", "response": completed })
+    );
+    let server = MockServer::start("text/event-stream", stream);
+    let (provider, codec) = Responses::builder("gpt-test")
+        .api_key("test-key")
+        .base_url(format!("{}/v1", server.origin))
+        .build_parts()
+        .expect("valid adapter");
+    let request = codec
+        .encode_request(
+            &[user_message("hello")],
+            &ModelRequestConfig::agent(&OutputContract::Text, ""),
+        )
+        .expect("valid request");
+    let deltas = Arc::new(Mutex::new(Vec::new()));
+    let captured_deltas = Arc::clone(&deltas);
+    let response = provider
+        .invoke(
+            request,
+            ModelEventSink::new(move |delta| captured_deltas.lock().unwrap().push(delta)),
+        )
+        .await
+        .expect("successful response");
+    server.finish();
+
+    assert_eq!(response.value["response"]["output"], json!([message]));
+    assert_eq!(
+        codec.project_response(&response).unwrap().directive,
+        ModelDirective::Output(Value::String("hello from Codex".to_owned()))
+    );
+    assert_eq!(
+        *deltas.lock().unwrap(),
+        vec![ModelDelta::Text("hello from Codex".to_owned())]
     );
 }
 

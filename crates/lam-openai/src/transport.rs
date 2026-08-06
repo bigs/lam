@@ -220,11 +220,16 @@ impl HttpTransport {
                 });
             }
 
-            let is_event_stream = response
+            let content_type = response
                 .headers()
                 .get(CONTENT_TYPE)
                 .and_then(|value| value.to_str().ok())
-                .is_some_and(|value| value.starts_with("text/event-stream"));
+                .map(str::to_owned);
+            let is_event_stream = content_type.as_deref().is_some_and(|value| {
+                value.split(';').next().is_some_and(|media_type| {
+                    media_type.trim().eq_ignore_ascii_case("text/event-stream")
+                })
+            });
             if !is_event_stream {
                 let body = match response.bytes().await {
                     Ok(body) => body,
@@ -235,16 +240,34 @@ impl HttpTransport {
                     }
                 };
                 tracing::debug!(
-                    event = "http.json_body_completed",
+                    event = "http.buffered_body_completed",
                     body_bytes = body.len(),
-                    "received complete model JSON response"
+                    content_type = ?content_type,
+                    "received complete model response body"
                 );
-                let value = serde_json::from_slice(&body).map_err(|error| {
-                    ProviderError::InvalidEventJson {
-                        message: error.to_string(),
-                    }
-                })?;
-                return Ok(StreamBody::Json(value));
+                let json_error = match serde_json::from_slice(&body) {
+                    Ok(value) => return Ok(StreamBody::Json(value)),
+                    Err(error) => error,
+                };
+                if !looks_like_sse(&body) {
+                    return Err(ProviderError::InvalidEventJson {
+                        message: json_error.to_string(),
+                    });
+                }
+
+                tracing::warn!(
+                    event = "http.mislabeled_sse_body",
+                    body_bytes = body.len(),
+                    content_type = ?content_type,
+                    "model response used SSE framing without an SSE content type"
+                );
+                let mut decoder = SseDecoder::default();
+                let mut events = decoder.push(&body)?;
+                events.extend(decoder.finish()?);
+                for event in events {
+                    on_event(event)?;
+                }
+                return Ok(StreamBody::Events);
             }
 
             let mut decoder = SseDecoder::default();
@@ -481,6 +504,15 @@ fn bounded_body(body: &[u8]) -> String {
     bounded
 }
 
+fn looks_like_sse(body: &[u8]) -> bool {
+    body.split(|byte| *byte == b'\n')
+        .map(|line| line.trim_ascii())
+        .find(|line| !line.is_empty())
+        .is_some_and(|line| {
+            line.starts_with(b"data:") || line.starts_with(b"event:") || line.starts_with(b":")
+        })
+}
+
 #[derive(Default)]
 struct SseDecoder {
     pending: Vec<u8>,
@@ -564,7 +596,7 @@ mod tests {
     use lam::ServiceUnavailableRetry;
     use serde_json::json;
 
-    use super::{HttpTransport, SseDecoder, sanitized_endpoint};
+    use super::{HttpTransport, SseDecoder, looks_like_sse, sanitized_endpoint};
     use crate::error::ProviderError;
 
     fn fast_retry(max_retries: u32) -> ServiceUnavailableRetry {
@@ -592,6 +624,16 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event.as_deref(), Some("example"));
         assert_eq!(events[0].data, "one\ntwo");
+    }
+
+    #[test]
+    fn identifies_sse_framing_without_using_body_content() {
+        assert!(looks_like_sse(
+            b"\r\nevent: response.completed\ndata: {}\n\n"
+        ));
+        assert!(looks_like_sse(b": keep-alive\n\ndata: {}\n\n"));
+        assert!(!looks_like_sse(b"{\"event\":\"response.completed\"}"));
+        assert!(!looks_like_sse(b"upstream service unavailable"));
     }
 
     #[test]

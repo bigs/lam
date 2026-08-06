@@ -23,6 +23,7 @@ const TOAST_DURATION: Duration = Duration::from_millis(2_000);
 const INTERRUPTION_ARM_WINDOW: Duration = Duration::from_millis(1_500);
 const INTERRUPTION_WARNING: &str = "Press Esc again to stop the current run";
 const SESSION_PICKER_HINT: &str = "ctrl+d delete the highlighted session";
+const MODEL_PICKER_HINT: &str = "up/down choose · Enter select · type to filter";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Focus {
@@ -604,8 +605,14 @@ impl App {
                 kind: NoticeKind::Warning,
             });
         }
-        self.session_palette_open().then_some(Notice {
-            text: SESSION_PICKER_HINT,
+        if self.session_palette_open() {
+            return Some(Notice {
+                text: SESSION_PICKER_HINT,
+                kind: NoticeKind::Hint,
+            });
+        }
+        self.model_palette_open().then_some(Notice {
+            text: MODEL_PICKER_HINT,
             kind: NoticeKind::Hint,
         })
     }
@@ -732,6 +739,11 @@ impl App {
         input == "/session" || input.starts_with("/session ")
     }
 
+    fn model_palette_open(&self) -> bool {
+        let input = self.input.text.trim_start();
+        input == "/model" || input.starts_with("/model ")
+    }
+
     /// Sessions offered by the `/session` palette, newest first, or `None`
     /// when that palette is not open. Shared by the suggestion list and the
     /// deletion binding so both agree on which row is highlighted.
@@ -807,6 +819,17 @@ impl App {
             self.open_agents_drawer();
             return None;
         }
+        // Alt+M opens the provider/model picker from either focus target.
+        if key.kind == KeyEventKind::Press
+            && key.modifiers.contains(KeyModifiers::ALT)
+            && matches!(key.code, KeyCode::Char('m') | KeyCode::Char('M'))
+        {
+            self.input = InputBuffer::at_end("/model ".to_owned());
+            self.input_history = None;
+            self.suggestion_index = 0;
+            self.focus = Focus::Input;
+            return None;
+        }
 
         let suggestions = self.suggestions();
         if !suggestions.is_empty() {
@@ -824,9 +847,8 @@ impl App {
     }
 
     fn handle_escape(&mut self, now: Instant) -> Option<Command> {
-        // Dismiss the agents drawer before interruption arming so Esc is a
-        // reliable way out of /agents even while root is busy.
-        if self.agents_palette_open() {
+        // Dismiss a global picker before interruption arming.
+        if self.agents_palette_open() || self.model_palette_open() {
             self.input = InputBuffer::default();
             self.input_history = None;
             self.suggestion_index = 0;
@@ -2941,9 +2963,9 @@ mod tests {
     use ratatui::layout::Rect;
 
     use super::{
-        App, CellPos, CopyRow, EntryKind, Focus, Hitbox, InputBuffer, PendingSteer,
-        SESSION_PICKER_HINT, SessionChoice, SessionView, TextSelection, partial_eval_intent,
-        selected_text,
+        App, CellPos, CopyRow, EntryKind, Focus, Hitbox, InputBuffer, MODEL_PICKER_HINT,
+        PendingSteer, SESSION_PICKER_HINT, SessionChoice, SessionView, TextSelection,
+        partial_eval_intent, selected_text,
     };
     use crate::config::ModelChoice;
     use crate::runtime::{
@@ -3351,6 +3373,27 @@ mod tests {
         let suggestions = app.suggestions();
         assert_eq!(suggestions[0].label, "openai / GPT-5");
         assert_eq!(suggestions[0].replacement, "/model openai/gpt-5");
+    }
+
+    #[test]
+    fn alt_m_opens_the_provider_and_model_picker_and_escape_closes_it() {
+        let mut app = app();
+        app.focus = Focus::Conversation;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT));
+
+        assert_eq!(app.focus, Focus::Input);
+        assert_eq!(app.input.text, "/model ");
+        assert_eq!(
+            app.notice().map(|notice| notice.text),
+            Some(MODEL_PICKER_HINT)
+        );
+        assert!(!app.suggestions().is_empty());
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(app.input.text.is_empty());
+        assert!(app.notice().is_none());
     }
 
     #[test]
