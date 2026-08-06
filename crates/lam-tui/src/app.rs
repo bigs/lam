@@ -1292,14 +1292,20 @@ impl App {
                 {
                     self.focus = Focus::Conversation;
                     self.selected_entry = Some(hitbox.entry);
-                    self.follow_conversation_tail = hitbox.entry + 1 == self.entries.len();
-                    self.selection_drives_viewport = true;
                     // Only the header line toggles expand/collapse; clicking
                     // a body row selects the entry and arms text selection.
+                    // Body clicks must not steal the scroll position: long
+                    // expanded messages are often taller than the viewport,
+                    // and follow-tail / selection-driven scrolling would jump
+                    // to the end and make upward copy selections impossible.
                     if hitbox.header == Some(mouse.row) {
+                        self.follow_conversation_tail = false;
+                        self.selection_drives_viewport = true;
                         self.toggle_selected();
                         return None;
                     }
+                    self.follow_conversation_tail = false;
+                    self.selection_drives_viewport = false;
                 }
                 self.begin_selection(mouse.row, mouse.column);
                 None
@@ -5160,6 +5166,10 @@ mod tests {
             entry,
         }];
 
+        app.follow_conversation_tail = true;
+        app.selection_drives_viewport = true;
+        app.conversation_offset = 7;
+
         app.handle_mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: 5,
@@ -5170,6 +5180,43 @@ mod tests {
         assert_eq!(app.focus, Focus::Conversation);
         assert_eq!(app.selected_entry, Some(entry));
         assert!(app.entries[entry].expanded);
+        // Preserve scroll so tall expanded bodies stay put for copy selection.
+        assert!(!app.follow_conversation_tail);
+        assert!(!app.selection_drives_viewport);
+        assert_eq!(app.conversation_offset, 7);
+    }
+
+    #[test]
+    fn body_click_on_last_entry_does_not_enable_follow_tail() {
+        let mut app = app();
+        // Ensure the clicked entry is the last one — the previous bug set
+        // follow_conversation_tail whenever entry + 1 == len.
+        app.push_entry(EntryKind::Assistant, "Long", "line
+".repeat(40));
+        let entry = app.entries.len() - 1;
+        app.entries[entry].expanded = true;
+        app.follow_conversation_tail = true;
+        app.selection_drives_viewport = true;
+        app.conversation_offset = 12;
+        app.hitboxes = vec![Hitbox {
+            top: 5,
+            bottom: 20,
+            header: Some(5),
+            entry,
+        }];
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 8,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        assert_eq!(app.selected_entry, Some(entry));
+        assert_eq!(entry + 1, app.entries.len());
+        assert!(!app.follow_conversation_tail);
+        assert!(!app.selection_drives_viewport);
+        assert_eq!(app.conversation_offset, 12);
     }
 
     #[test]
