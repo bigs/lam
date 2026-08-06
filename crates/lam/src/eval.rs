@@ -26,7 +26,7 @@ pub enum EvalOutcome {
 impl EvalOutcome {
     pub(crate) fn parallel_tool_call_rejected() -> Self {
         Self::Rejected {
-            message: "This eval call was not executed because the model response contained multiple tool calls. Lam executes only the first tool call. Combine multiple actions in one eval program: await dependent work sequentially and use Promise.all for independent work."
+            message: "This eval was not executed because it was emitted alongside another tool call in the same model response. Lam executes only the first. After receiving that result, issue the remaining eval as a new tool call, or combine genuinely concurrent work into one TypeScript program with `Promise.all`."
                 .to_owned(),
         }
     }

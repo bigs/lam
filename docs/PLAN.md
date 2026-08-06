@@ -1083,9 +1083,11 @@ The provider performs the external request and returns the untouched completed
 native payload. Only that payload is durable; the system instructions are
 configuration and the interpreted directive is a recomputable view.
 
-A model response should request exactly one eval. Sequential and parallel work
-belong inside that single TypeScript program, including `Promise.all` when
-appropriate. Provider parallel-tool-call controls are disabled where available.
+A model response should request exactly one eval. After its result, a later model
+response may request another, enabling ordinary inspect, edit, and test loops.
+Related operations requested in one response belong inside that response's single
+TypeScript program, including `Promise.all` when appropriate. Provider
+parallel-tool-call controls are disabled where available.
 If a compatible provider still emits sibling eval calls, Lam executes the first,
 returns explicit rejection results for the rest, and continues the model loop.
 

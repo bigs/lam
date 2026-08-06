@@ -131,7 +131,13 @@ fn responses_request_is_stateless_and_replays_encrypted_reasoning_unchanged() {
         body["tools"][0]["description"]
             .as_str()
             .unwrap()
-            .contains("at most once per assistant response")
+            .contains("at most one eval tool call in the current model output")
+    );
+    assert!(
+        body["tools"][0]["description"]
+            .as_str()
+            .unwrap()
+            .contains("another eval call in the next assistant continuation")
     );
 }
 
@@ -668,7 +674,13 @@ fn chat_replays_reasoning_extensions_and_tool_calls_from_native_chunks() {
         body["tools"][0]["function"]["description"]
             .as_str()
             .unwrap()
-            .contains("at most once per assistant response")
+            .contains("at most one eval tool call in the current model output")
+    );
+    assert!(
+        body["tools"][0]["function"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("another eval call in the next assistant continuation")
     );
 }
 
@@ -1841,8 +1853,8 @@ async fn chat_adapter_executes_first_terminal_parallel_eval_and_rejects_siblings
     assert_eq!(third["status"], "rejected");
     for rejected in [second, third] {
         let message = rejected["message"].as_str().unwrap();
-        assert!(message.contains("executes only the first tool call"));
-        assert!(message.contains("one eval program"));
+        assert!(message.contains("same model response"));
+        assert!(message.contains("issue the remaining eval as a new tool call"));
         assert!(message.contains("Promise.all"));
     }
 }
