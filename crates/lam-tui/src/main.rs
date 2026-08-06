@@ -641,6 +641,7 @@ async fn open_session(
         runtime.models.clone(),
         runtime.selected_model,
         &selected_effort,
+        runtime.startup_warnings.clone(),
     );
     Ok((runtime, app))
 }

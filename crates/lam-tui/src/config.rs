@@ -96,7 +96,9 @@ impl LoadedConfig {
 }
 
 impl ProviderConfig {
-    pub(crate) fn resolved_api_key(&self) -> Result<Option<String>, ConfigError> {
+    /// Structural check only: rejects contradictory or empty key fields.
+    /// Missing environment variables are not an error here — runtime soft-skips.
+    pub(crate) fn validate_api_key_fields(&self) -> Result<(), ConfigError> {
         match (&self.api_key, &self.api_key_env) {
             (Some(_), Some(_)) => Err(ConfigError::Invalid {
                 message: format!(
@@ -107,19 +109,31 @@ impl ProviderConfig {
             (Some(key), None) if key.trim().is_empty() => Err(ConfigError::Invalid {
                 message: format!("provider `{}` has an empty api_key", self.name),
             }),
-            (Some(key), None) => Ok(Some(key.clone())),
             (None, Some(variable)) if variable.trim().is_empty() => Err(ConfigError::Invalid {
                 message: format!("provider `{}` has an empty api_key_env", self.name),
             }),
-            (None, Some(variable)) => {
-                env::var(variable)
-                    .map(Some)
-                    .map_err(|_| ConfigError::MissingEnvironmentKey {
-                        provider: self.name.clone(),
-                        variable: variable.clone(),
-                    })
-            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Resolve the provider API key for runtime use.
+    ///
+    /// Returns `Ok(None)` when no key is configured. Returns
+    /// `Err(MissingEnvironmentKey)` when `api_key_env` is set but absent so
+    /// the caller can soft-skip that provider with a clear warning.
+    pub(crate) fn resolved_api_key(&self) -> Result<Option<String>, ConfigError> {
+        self.validate_api_key_fields()?;
+        match (&self.api_key, &self.api_key_env) {
+            (Some(key), None) => Ok(Some(key.clone())),
+            (None, Some(variable)) => match env::var(variable) {
+                Ok(value) if !value.trim().is_empty() => Ok(Some(value)),
+                Ok(_) | Err(_) => Err(ConfigError::MissingEnvironmentKey {
+                    provider: self.name.clone(),
+                    variable: variable.clone(),
+                }),
+            },
             (None, None) => Ok(None),
+            (Some(_), Some(_)) => unreachable!("validated above"),
         }
     }
 
@@ -175,7 +189,7 @@ fn validate(config: &ProvidersConfig) -> Result<(Vec<ModelChoice>, usize), Confi
             )));
         }
         if provider.protocol != ProviderProtocol::XaiSupergrok {
-            provider.resolved_api_key()?;
+            provider.validate_api_key_fields()?;
         }
         let effort_path = provider.resolved_effort_path()?;
 
@@ -506,5 +520,21 @@ efforts = ["high"]
                 .to_string()
                 .contains("configured more than once")
         );
+    }
+
+    #[test]
+    fn missing_api_key_env_is_not_a_config_error() {
+        let source = VALID.replace(
+            r#"api_key = "test-key""#,
+            r#"api_key_env = "LAM_TEST_MISSING_PROVIDER_KEY_XYZ""#,
+        );
+        let config: ProvidersConfig = toml::from_str(&source).unwrap();
+        // Structural validation succeeds; runtime soft-skips the provider.
+        validate(&config).expect("missing env key must not fail config load");
+        let err = config.providers[0].resolved_api_key().unwrap_err();
+        assert!(matches!(
+            err,
+            super::ConfigError::MissingEnvironmentKey { .. }
+        ));
     }
 }

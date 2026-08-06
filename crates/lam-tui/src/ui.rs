@@ -1258,6 +1258,7 @@ mod tests {
             }],
             0,
             "high",
+            Vec::new(),
         )
     }
 

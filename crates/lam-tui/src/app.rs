@@ -398,6 +398,7 @@ impl App {
         models: Vec<ModelChoice>,
         selected_model: usize,
         selected_effort: &str,
+        startup_warnings: Vec<String>,
     ) -> Self {
         let action = if session.resumed {
             "Resumed"
@@ -427,6 +428,15 @@ impl App {
             "Ready".to_owned(),
             ready_message,
         ));
+        // Host-only warnings (skipped providers, default fallback). Not folded
+        // from the journal — same class of local chrome as the Ready line.
+        for warning in startup_warnings {
+            entries.push(pinned_entry(
+                EntryKind::System,
+                "Provider unavailable".to_owned(),
+                warning,
+            ));
+        }
         let committed_len = entries.len();
         let selected_entry = entries.len().checked_sub(1);
         let mut selected_efforts = models
@@ -2950,6 +2960,7 @@ mod tests {
             }],
             0,
             "high",
+            Vec::new(),
         )
     }
 
@@ -4327,6 +4338,7 @@ mod tests {
             app.models,
             0,
             "high",
+            Vec::new(),
         );
 
         assert_eq!(restored.entries.len(), 4);

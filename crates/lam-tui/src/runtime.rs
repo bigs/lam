@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
@@ -26,7 +26,7 @@ use crate::boot::{phase, phase_sync};
 use crate::config::{LoadedConfig, ModelChoice, ModelConfig, ProviderConfig, ProviderProtocol};
 use crate::session::Session;
 use crate::xai::{
-    CLI_PROXY_BASE_URL, ProxyAffinityHeaders, XaiCredentialStore, device_login, ensure_fresh,
+    CLI_PROXY_BASE_URL, ProxyAffinityHeaders, XaiCredentialStore, ensure_fresh,
     proxy_default_headers, xai_auth_source,
 };
 
@@ -42,6 +42,8 @@ pub(crate) struct Runtime {
     pub(crate) events: AgentSystemEvents,
     pub(crate) models: Vec<ModelChoice>,
     pub(crate) selected_model: usize,
+    /// Host-only warnings from boot (e.g. skipped providers). Not journaled.
+    pub(crate) startup_warnings: Vec<String>,
     pub(crate) agents: Vec<AgentHistory>,
     effort_controls: Vec<EffortControl>,
     history_models: Arc<[ConfiguredModel]>,
@@ -216,26 +218,62 @@ impl Runtime {
         session: &Session,
         preferences: Option<&RuntimePreferences>,
     ) -> Result<Self, RuntimeError> {
-        let models = phase("configured_models", configured_models(config)).await?;
+        let (models, mut startup_warnings) =
+            phase("configured_models", configured_models(config)).await?;
         let effort_controls = models
             .iter()
             .map(|configured| configured.effort.clone())
             .collect::<Vec<_>>();
-        let initial_index = preferences
-            .and_then(|preferences| {
+        let preferred_id = preferences.map(|preferences| preferences.model_id.as_str());
+        let default_id = config
+            .models
+            .get(config.default_index)
+            .map(|model| model.registry_id.as_str());
+        let initial_index = preferred_id
+            .and_then(|id| {
                 models
                     .iter()
-                    .position(|model| model.choice.registry_id == preferences.model_id)
+                    .position(|model| model.choice.registry_id == id)
             })
-            .unwrap_or(config.default_index);
-        if let Some(preferences) = preferences {
-            effort_controls[initial_index]
-                .set(&preferences.effort)
-                .map_err(RuntimeError::Preferences)?;
+            .or_else(|| {
+                default_id.and_then(|id| {
+                    models
+                        .iter()
+                        .position(|model| model.choice.registry_id == id)
+                })
+            })
+            .unwrap_or(0);
+        if let Some(preferred) = preferred_id
+            && !models
+                .iter()
+                .any(|model| model.choice.registry_id == preferred)
+        {
+            startup_warnings.push(format!(
+                "Preferred model `{preferred}` is unavailable; using `{}`.",
+                models[initial_index].choice.registry_id
+            ));
+        } else if preferred_id.is_none()
+            && let Some(default) = default_id
+            && !models
+                .iter()
+                .any(|model| model.choice.registry_id == default)
+        {
+            startup_warnings.push(format!(
+                "Default model `{default}` is unavailable; using `{}`.",
+                models[initial_index].choice.registry_id
+            ));
         }
-        let initial = models
-            .get(initial_index)
-            .expect("the selected model index comes from the validated model list");
+        if let Some(preferences) = preferences
+            && effort_controls[initial_index]
+                .set(&preferences.effort)
+                .is_err()
+        {
+            startup_warnings.push(format!(
+                "Effort `{}` is not valid for `{}`; using the model default.",
+                preferences.effort, models[initial_index].choice.registry_id
+            ));
+        }
+        let initial = &models[initial_index];
         let coding = phase_sync("coding_pack_build", || {
             CodingPack::builder(&cwd)
                 .filesystem_access(FilesystemAccess::ReadWrite)
@@ -255,7 +293,11 @@ impl Runtime {
         let events = system
             .take_events()
             .expect("a new agent system owns its event receiver");
-        let instruction = coding_instruction(&cwd, &config.models, initial_index);
+        let active_choices = models
+            .iter()
+            .map(|configured| configured.choice.clone())
+            .collect::<Vec<_>>();
+        let instruction = coding_instruction(&cwd, &active_choices, initial_index);
 
         let mut root_builder = initial
             .model
@@ -370,11 +412,10 @@ impl Runtime {
             .model_id
             .as_str()
             .to_owned();
-        let selected_model = config
-            .models
+        let selected_model = history_models
             .iter()
-            .position(|model| model.registry_id == selected_model_id)
-            .expect("runtime registration mirrors the validated model list");
+            .position(|model| model.choice.registry_id == selected_model_id)
+            .unwrap_or(initial_index);
         // Built last so no error path in this function ever owns a multi-thread
         // tokio runtime: an unbuilt runtime needs no teardown, and a built one
         // is only dropped from quiesce on a blocking thread.
@@ -391,8 +432,9 @@ impl Runtime {
             system,
             root,
             events,
-            models: config.models.clone(),
+            models: active_choices,
             selected_model,
+            startup_warnings,
             agents,
             effort_controls,
             history_models,
@@ -1270,8 +1312,12 @@ fn display_json(value: &serde_json::Value) -> String {
     )
 }
 
-async fn configured_models(config: &LoadedConfig) -> Result<Vec<ConfiguredModel>, RuntimeError> {
+async fn configured_models(
+    config: &LoadedConfig,
+) -> Result<(Vec<ConfiguredModel>, Vec<String>), RuntimeError> {
     let mut configured = Vec::with_capacity(config.models.len());
+    let mut warnings = Vec::new();
+    let mut skipped_providers = BTreeSet::new();
     for (provider, model, choice) in config.config.providers.iter().flat_map(|provider| {
         provider.models.iter().map(move |model| {
             let registry_id = format!("{}/{}", provider.name, model.id);
@@ -1283,14 +1329,38 @@ async fn configured_models(config: &LoadedConfig) -> Result<Vec<ConfiguredModel>
             (provider, model, choice)
         })
     }) {
-        let (model, effort) = build_model(provider, model, choice).await?;
-        configured.push(ConfiguredModel {
-            choice: choice.clone(),
-            model,
-            effort,
-        });
+        match build_model(provider, model, choice).await {
+            Ok((model_handle, effort)) => configured.push(ConfiguredModel {
+                choice: choice.clone(),
+                model: model_handle,
+                effort,
+            }),
+            Err(error) => {
+                let message = error.to_string();
+                tracing::warn!(
+                    target: "lam_tui::runtime",
+                    provider = provider.name.as_str(),
+                    model = choice.registry_id.as_str(),
+                    error = message.as_str(),
+                    "skipping model: provider credentials or configuration unavailable"
+                );
+                if skipped_providers.insert(provider.name.clone()) {
+                    warnings.push(format!("Provider `{}` disabled: {message}", provider.name));
+                }
+            }
+        }
     }
-    Ok(configured)
+    if configured.is_empty() {
+        let detail = if warnings.is_empty() {
+            "no models were configured".to_owned()
+        } else {
+            warnings.join("; ")
+        };
+        return Err(RuntimeError::Model(format!(
+            "no usable models available ({detail})"
+        )));
+    }
+    Ok((configured, warnings))
 }
 
 async fn build_model(
@@ -1418,13 +1488,12 @@ async fn load_or_login_xai(
         );
         return Ok(credentials);
     }
-    eprintln!(
-        "lam-agent: no SuperGrok credentials at {}; starting device login…",
+    // Soft-skip: do not block boot on interactive device login when other
+    // providers may still be available. Users can run `lam-agent login xai`.
+    Err(RuntimeError::Model(format!(
+        "no SuperGrok credentials at {} (run `lam-agent login xai`)",
         store.path().display()
-    );
-    device_login(store, true)
-        .await
-        .map_err(|error| RuntimeError::Model(error.to_string()))
+    )))
 }
 
 fn default_worker_threads() -> usize {
@@ -1455,8 +1524,6 @@ pub(crate) enum RuntimeError {
     Model(String),
     #[error("could not configure coding capabilities: {0}")]
     CodingPack(String),
-    #[error("could not restore runtime preferences: {0}")]
-    Preferences(String),
     #[error("could not start the agent runtime: {0}")]
     AgentSystem(String),
 }
