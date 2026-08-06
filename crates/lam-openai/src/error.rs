@@ -51,6 +51,12 @@ pub enum ProviderError {
         /// Validation diagnostic.
         message: String,
     },
+    /// Authentication could not produce a usable credential.
+    #[error("model authentication failed: {message}")]
+    Auth {
+        /// Authentication diagnostic.
+        message: String,
+    },
     /// The HTTP request or response stream failed.
     #[error("model HTTP request failed: {0}")]
     Http(#[source] reqwest::Error),

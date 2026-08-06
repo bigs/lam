@@ -46,12 +46,43 @@ context_window = 32768
 efforts = ["low", "high"]
 ```
 
-The supported provider types are `openai-responses` and
-`openai-chat-completions`. A provider can set either `api_key` directly or
-`api_key_env` to resolve it from the process environment. When storing a key in
-the file, restrict its filesystem permissions. An optional model-level
-`extra_body` table carries provider-specific request options; Lam's protocol
-invariants still override conflicting keys.
+The supported provider types are `openai-responses`,
+`openai-chat-completions`, and `xai-supergrok`. A provider can set either
+`api_key` directly or `api_key_env` to resolve it from the process environment.
+When storing a key in the file, restrict its filesystem permissions. An optional
+model-level `extra_body` table carries provider-specific request options; Lam's
+protocol invariants still override conflicting keys.
+
+### SuperGrok subscription (`xai-supergrok`)
+
+Use a SuperGrok or X Premium subscription instead of an xAI console API key:
+
+```toml
+[[providers]]
+name = "xai"
+type = "xai-supergrok"
+
+[[providers.models]]
+id = "grok-4.5"
+name = "Grok 4.5"
+context_window = 500000
+efforts = ["low", "medium", "high"]
+```
+
+Sign in once with device-code OAuth:
+
+```bash
+lam-agent login xai
+# headless / SSH:
+lam-agent login xai --no-browser
+```
+
+Credentials are stored at `~/.lam/auth/xai.json` (mode `0600`). On first use of
+an `xai-supergrok` provider with no stored credentials, Lam also tries to import
+`~/.grok/auth.json` from the official Grok Build CLI, then falls back to an
+interactive device login. Inference goes to `https://cli-chat-proxy.grok.com/v1`
+via the Responses API and draws from the same weekly SuperGrok usage pool as
+Grok chat and Grok Build.
 
 Each model's required `efforts` array is ordered from least to most effort. Lam
 starts that model at the final (maximum) value and `/effort` can select any

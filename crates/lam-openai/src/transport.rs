@@ -2,19 +2,30 @@ use std::error::Error as _;
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde_json::Value;
 use tracing::{Instrument, field};
 
+use crate::auth::SharedAuthSource;
 use crate::error::ProviderError;
 
 const MAX_ERROR_BODY_CHARS: usize = 16 * 1024;
+
+/// Builds additional headers that must differ on every outbound request.
+pub trait RequestHeaderSource: Send + Sync {
+    /// Returns headers to merge into the current request.
+    fn headers(&self) -> HeaderMap;
+}
+
+// Re-export for crate consumers that need HeaderMap construction helpers.
 
 #[derive(Clone)]
 pub(crate) struct HttpTransport {
     client: reqwest::Client,
     endpoint: reqwest::Url,
-    authorization: Option<HeaderValue>,
+    authorization: Option<SharedAuthSource>,
+    default_headers: HeaderMap,
+    request_headers: Option<std::sync::Arc<dyn RequestHeaderSource>>,
     stream_idle_timeout: Duration,
 }
 
@@ -29,18 +40,33 @@ pub(crate) struct SseEvent {
 }
 
 impl HttpTransport {
-    pub(crate) const fn new(
+    pub(crate) fn new(
         client: reqwest::Client,
         endpoint: reqwest::Url,
-        authorization: Option<HeaderValue>,
+        authorization: Option<SharedAuthSource>,
         stream_idle_timeout: Duration,
     ) -> Self {
         Self {
             client,
             endpoint,
             authorization,
+            default_headers: HeaderMap::new(),
+            request_headers: None,
             stream_idle_timeout,
         }
+    }
+
+    pub(crate) fn with_default_headers(mut self, headers: HeaderMap) -> Self {
+        self.default_headers = headers;
+        self
+    }
+
+    pub(crate) fn with_request_headers(
+        mut self,
+        headers: std::sync::Arc<dyn RequestHeaderSource>,
+    ) -> Self {
+        self.request_headers = Some(headers);
+        self
     }
 
     pub(crate) fn child(&self, suffix: &str) -> Self {
@@ -51,6 +77,8 @@ impl HttpTransport {
             client: self.client.clone(),
             endpoint,
             authorization: self.authorization.clone(),
+            default_headers: self.default_headers.clone(),
+            request_headers: self.request_headers.clone(),
             stream_idle_timeout: self.stream_idle_timeout,
         }
     }
@@ -89,8 +117,21 @@ impl HttpTransport {
                 "sending model HTTP request"
             );
             let mut request = self.client.post(self.endpoint.clone()).json(body);
+            for (name, value) in &self.default_headers {
+                request = request.header(name, value);
+            }
+            if let Some(headers) = &self.request_headers {
+                // Owned HeaderMap iteration yields Option<HeaderName> for multi-maps.
+                for (name, value) in headers.headers() {
+                    if let Some(name) = name {
+                        request = request.header(name, value);
+                    }
+                }
+            }
             if let Some(authorization) = &self.authorization {
-                request = request.header(AUTHORIZATION, authorization);
+                if let Some(header) = authorization.authorization().await? {
+                    request = request.header(AUTHORIZATION, header);
+                }
             }
             let response = match request.send().await {
                 Ok(response) => response,
@@ -360,6 +401,7 @@ const fn provider_error_kind(error: &ProviderError) -> &'static str {
     match error {
         ProviderError::UnexpectedRequestCodec { .. } => "unexpected_request_codec",
         ProviderError::InvalidRequest { .. } => "invalid_request",
+        ProviderError::Auth { .. } => "auth",
         ProviderError::Http(_) => "http",
         ProviderError::StreamIdle { .. } => "stream_idle",
         ProviderError::HttpStatus { .. } => "http_status",
@@ -369,6 +411,23 @@ const fn provider_error_kind(error: &ProviderError) -> &'static str {
         ProviderError::MissingTerminal { .. } => "missing_terminal",
         ProviderError::Codec { .. } => "codec",
     }
+}
+
+/// Inserts a header when both the name and value are valid.
+pub fn try_insert_header(
+    headers: &mut HeaderMap,
+    name: &str,
+    value: &str,
+) -> Result<(), ProviderError> {
+    let header_name =
+        HeaderName::from_bytes(name.as_bytes()).map_err(|error| ProviderError::Auth {
+            message: format!("invalid HTTP header name `{name}`: {error}"),
+        })?;
+    let header_value = HeaderValue::from_str(value).map_err(|error| ProviderError::Auth {
+        message: format!("invalid HTTP header value for `{name}`: {error}"),
+    })?;
+    headers.insert(header_name, header_value);
+    Ok(())
 }
 
 fn bounded_body(body: &[u8]) -> String {

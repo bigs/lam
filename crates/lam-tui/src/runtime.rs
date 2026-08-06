@@ -24,6 +24,10 @@ use tokio::sync::mpsc;
 
 use crate::boot::{phase, phase_sync};
 use crate::config::{LoadedConfig, ModelChoice, ModelConfig, ProviderConfig, ProviderProtocol};
+use crate::xai::{
+    CLI_PROXY_BASE_URL, ProxyAffinityHeaders, XaiCredentialStore, device_login, ensure_fresh,
+    proxy_default_headers, xai_auth_source,
+};
 use crate::session::Session;
 
 /// How long a quit or session switch waits for in-flight command tasks before
@@ -209,7 +213,7 @@ impl Runtime {
         session: &Session,
         preferences: Option<&RuntimePreferences>,
     ) -> Result<Self, RuntimeError> {
-        let models = phase_sync("configured_models", || configured_models(config))?;
+        let models = phase("configured_models", configured_models(config)).await?;
         let effort_controls = models
             .iter()
             .map(|configured| configured.effort.clone())
@@ -1246,7 +1250,7 @@ fn display_json(value: &serde_json::Value) -> String {
     )
 }
 
-fn configured_models(config: &LoadedConfig) -> Result<Vec<ConfiguredModel>, RuntimeError> {
+async fn configured_models(config: &LoadedConfig) -> Result<Vec<ConfiguredModel>, RuntimeError> {
     let mut configured = Vec::with_capacity(config.models.len());
     for (provider, model, choice) in config.config.providers.iter().flat_map(|provider| {
         provider.models.iter().map(move |model| {
@@ -1259,7 +1263,7 @@ fn configured_models(config: &LoadedConfig) -> Result<Vec<ConfiguredModel>, Runt
             (provider, model, choice)
         })
     }) {
-        let (model, effort) = build_model(provider, model, choice)?;
+        let (model, effort) = build_model(provider, model, choice).await?;
         configured.push(ConfiguredModel {
             choice: choice.clone(),
             model,
@@ -1269,7 +1273,7 @@ fn configured_models(config: &LoadedConfig) -> Result<Vec<ConfiguredModel>, Runt
     Ok(configured)
 }
 
-fn build_model(
+async fn build_model(
     provider: &ProviderConfig,
     model_config: &ModelConfig,
     choice: &ModelChoice,
@@ -1339,7 +1343,68 @@ fn build_model(
             .with_context_window_tokens(choice.context_window);
             Ok((AnyModel::ChatCompletions(model), effort))
         }
+        ProviderProtocol::XaiSupergrok => {
+            let store = XaiCredentialStore::default_store()
+                .map_err(|error| RuntimeError::Model(error.to_string()))?;
+            let credentials = load_or_login_xai(&store).await?;
+            let credentials = ensure_fresh(&store, credentials)
+                .await
+                .map_err(|error| RuntimeError::Model(error.to_string()))?;
+            let base = provider.api_base.as_deref().unwrap_or(CLI_PROXY_BASE_URL);
+            let headers = proxy_default_headers("interactive")
+                .map_err(|error| RuntimeError::Model(error.to_string()))?;
+            let affinity = std::sync::Arc::new(ProxyAffinityHeaders::new(&choice.model));
+            let builder = Responses::builder(&choice.model)
+                .base_url(base)
+                .auth_source(xai_auth_source(store, credentials))
+                .default_headers(headers)
+                .request_headers(affinity)
+                .extra_body(extra_body);
+            let (transport, codec) = builder
+                .build_parts()
+                .map_err(|error| RuntimeError::Model(error.to_string()))?;
+            let model = Model::new(
+                transport,
+                EffortCodec {
+                    inner: codec,
+                    control: effort.clone(),
+                },
+            )
+            .with_descriptor(descriptor("xai/supergrok-responses"))
+            .with_context_window_tokens(choice.context_window);
+            Ok((AnyModel::Responses(model), effort))
+        }
     }
+}
+
+async fn load_or_login_xai(
+    store: &XaiCredentialStore,
+) -> Result<crate::xai::XaiCredentials, RuntimeError> {
+    if let Some(credentials) = store
+        .load()
+        .map_err(|error| RuntimeError::Model(error.to_string()))?
+    {
+        return Ok(credentials);
+    }
+    if let Some(credentials) = XaiCredentialStore::import_grok_cli()
+        .map_err(|error| RuntimeError::Model(error.to_string()))?
+    {
+        store
+            .save(&credentials)
+            .map_err(|error| RuntimeError::Model(error.to_string()))?;
+        eprintln!(
+            "lam-agent: imported SuperGrok credentials from ~/.grok/auth.json into {}",
+            store.path().display()
+        );
+        return Ok(credentials);
+    }
+    eprintln!(
+        "lam-agent: no SuperGrok credentials at {}; starting device login…",
+        store.path().display()
+    );
+    device_login(store, true)
+        .await
+        .map_err(|error| RuntimeError::Model(error.to_string()))
 }
 
 fn default_worker_threads() -> usize {

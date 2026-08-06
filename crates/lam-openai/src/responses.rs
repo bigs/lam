@@ -13,6 +13,9 @@ use lam::{
 };
 use serde_json::{Map, Value, json};
 
+use reqwest::header::HeaderMap;
+
+use crate::auth::SharedAuthSource;
 use crate::common::{
     BuiltConfig, CODEC_VERSION, EVAL_TOOL_DESCRIPTION, OutputKind, RESPONSES_REQUEST_CODEC_ID,
     RESPONSES_RESPONSE_CODEC_ID, SharedBuilder, codec, eval_parameters, invalid_eval_rejection,
@@ -25,7 +28,7 @@ use crate::context::{
 };
 use crate::error::{BuildError, CodecError, ProviderError};
 use crate::metadata::{ModelPricing, UsageDialect, response_metadata};
-use crate::transport::StreamBody;
+use crate::transport::{RequestHeaderSource, StreamBody};
 
 const RESPONSES_PATH: &str = "/responses";
 const COMPACTION_REPLACEMENT_CODEC_ID: &str = "openai/responses-compaction";
@@ -64,6 +67,30 @@ impl ResponsesBuilder {
     #[must_use]
     pub fn api_key(mut self, api_key: impl Into<String>) -> Self {
         self.shared = self.shared.api_key(api_key);
+        self
+    }
+
+    /// Uses a dynamic authorization source such as a refreshable OAuth token.
+    ///
+    /// When both an API key and an auth source are configured, the auth source
+    /// takes precedence.
+    #[must_use]
+    pub fn auth_source(mut self, auth: SharedAuthSource) -> Self {
+        self.shared = self.shared.auth_source(auth);
+        self
+    }
+
+    /// Adds default headers sent on every request to this provider.
+    #[must_use]
+    pub fn default_headers(mut self, headers: HeaderMap) -> Self {
+        self.shared = self.shared.default_headers(headers);
+        self
+    }
+
+    /// Adds headers that are regenerated for each outbound request.
+    #[must_use]
+    pub fn request_headers(mut self, headers: std::sync::Arc<dyn RequestHeaderSource>) -> Self {
+        self.shared = self.shared.request_headers(headers);
         self
     }
 

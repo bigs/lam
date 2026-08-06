@@ -260,6 +260,10 @@ renders a responsive conversation with expandable eval and lifecycle rows.
 See [`crates/lam-tui/README.md`](crates/lam-tui/README.md) for configuration and
 key bindings.
 
+SuperGrok / X Premium subscription access is available via the `xai-supergrok`
+provider type (`lam-agent login xai`); requests go through the Grok CLI chat
+proxy using the shared weekly subscription pool.
+
 ## Roadmap
 
 Independent follow-ups include HTTP/webhook capabilities, async monitors,

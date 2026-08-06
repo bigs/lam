@@ -6,6 +6,7 @@
 //! Chat Completions adapter stores every native chunk because that protocol
 //! does not return a second, completed response object after `[DONE]`.
 
+mod auth;
 mod common;
 mod context;
 mod error;
@@ -15,5 +16,7 @@ mod transport;
 pub mod chat_completions;
 pub mod responses;
 
+pub use auth::{AuthSource, SharedAuthSource, StaticBearer, bearer_header};
 pub use error::{BuildError, CodecError, ProviderError};
 pub use metadata::ModelPricing;
+pub use transport::{RequestHeaderSource, try_insert_header};

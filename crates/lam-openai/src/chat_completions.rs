@@ -469,6 +469,7 @@ const fn provider_error_kind(error: &ProviderError) -> &'static str {
     match error {
         ProviderError::UnexpectedRequestCodec { .. } => "unexpected_request_codec",
         ProviderError::InvalidRequest { .. } => "invalid_request",
+        ProviderError::Auth { .. } => "auth",
         ProviderError::Http(_) => "http",
         ProviderError::StreamIdle { .. } => "stream_idle",
         ProviderError::HttpStatus { .. } => "http_status",

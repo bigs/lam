@@ -8,6 +8,7 @@ mod diagnostics;
 mod runtime;
 mod session;
 mod ui;
+mod xai;
 
 use std::collections::BTreeMap;
 use std::env;
@@ -66,6 +67,9 @@ async fn tokio_main() -> Result<(), AppError> {
     if args.version {
         println!("lam {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
+    }
+    if let Some(command) = args.command {
+        return run_command(command).await;
     }
 
     let boot_started = std::time::Instant::now();
@@ -706,6 +710,17 @@ struct Args {
     debug_log: bool,
     help: bool,
     version: bool,
+    command: Option<CliCommand>,
+}
+
+enum CliCommand {
+    Login { provider: LoginProvider, no_browser: bool },
+    Logout { provider: LoginProvider },
+}
+
+#[derive(Clone, Copy)]
+enum LoginProvider {
+    Xai,
 }
 
 impl Args {
@@ -714,6 +729,7 @@ impl Args {
         let mut debug_log = false;
         let mut help = false;
         let mut version = false;
+        let mut command = None;
         let mut arguments = env::args_os().skip(1);
         while let Some(argument) = arguments.next() {
             match argument.to_str() {
@@ -726,6 +742,49 @@ impl Args {
                 Some("--debug-log") => debug_log = true,
                 Some("--help" | "-h") => help = true,
                 Some("--version" | "-V") => version = true,
+                Some("login") => {
+                    let provider = arguments
+                        .next()
+                        .and_then(|value| value.to_str().map(str::to_owned))
+                        .ok_or_else(|| {
+                            AppError::Arguments(
+                                "login requires a provider; try `lam-agent login xai`".to_owned(),
+                            )
+                        })?;
+                    let mut no_browser = false;
+                    while let Some(flag) = arguments.next() {
+                        match flag.to_str() {
+                            Some("--no-browser") => no_browser = true,
+                            Some(value) => {
+                                return Err(AppError::Arguments(format!(
+                                    "unknown login flag `{value}`; try --help"
+                                )));
+                            }
+                            None => {
+                                return Err(AppError::Arguments(
+                                    "arguments must be valid UTF-8".to_owned(),
+                                ));
+                            }
+                        }
+                    }
+                    command = Some(CliCommand::Login {
+                        provider: parse_login_provider(&provider)?,
+                        no_browser,
+                    });
+                }
+                Some("logout") => {
+                    let provider = arguments
+                        .next()
+                        .and_then(|value| value.to_str().map(str::to_owned))
+                        .ok_or_else(|| {
+                            AppError::Arguments(
+                                "logout requires a provider; try `lam-agent logout xai`".to_owned(),
+                            )
+                        })?;
+                    command = Some(CliCommand::Logout {
+                        provider: parse_login_provider(&provider)?,
+                    });
+                }
                 Some(value) => {
                     return Err(AppError::Arguments(format!(
                         "unknown argument `{value}`; try --help"
@@ -743,7 +802,43 @@ impl Args {
             debug_log,
             help,
             version,
+            command,
         })
+    }
+}
+
+fn parse_login_provider(value: &str) -> Result<LoginProvider, AppError> {
+    match value {
+        "xai" | "supergrok" | "grok" => Ok(LoginProvider::Xai),
+        other => Err(AppError::Arguments(format!(
+            "unknown auth provider `{other}`; supported: xai"
+        ))),
+    }
+}
+
+async fn run_command(command: CliCommand) -> Result<(), AppError> {
+    match command {
+        CliCommand::Login {
+            provider: LoginProvider::Xai,
+            no_browser,
+        } => {
+            let store = xai::XaiCredentialStore::default_store().map_err(AppError::Auth)?;
+            xai::device_login(&store, !no_browser)
+                .await
+                .map_err(AppError::OAuth)?;
+            Ok(())
+        }
+        CliCommand::Logout {
+            provider: LoginProvider::Xai,
+        } => {
+            let store = xai::XaiCredentialStore::default_store().map_err(AppError::Auth)?;
+            store.clear().map_err(AppError::Auth)?;
+            println!(
+                "Removed SuperGrok credentials from {}.",
+                store.path().display()
+            );
+            Ok(())
+        }
     }
 }
 
@@ -806,7 +901,7 @@ impl Drop for TerminalSession {
 
 fn print_help() {
     println!(
-        "lam-agent — a minimal TypeScript coding agent\n\nUSAGE:\n    lam-agent [--config PATH] [--debug-log]\n\nOPTIONS:\n    --config PATH  Read providers from PATH instead of ~/.lam/providers.toml\n    --debug-log    Append metadata-only diagnostics beside the session journal\n    -h, --help     Show this help\n    -V, --version  Show the version\n\nLam resumes the latest durable session for the current directory. Inside the TUI,\ntype / for commands, including /new for a fresh session and /session to restore\nan earlier one; in that picker, Ctrl+D twice deletes the highlighted session.\nTab switches focus between the input shelf and conversation;\narrows select transcript rows; Enter expands the selected row. While the root is\nworking, a submitted message is queued above the input as a pending steer and is delivered at the next model boundary. Press Escape twice within 1.5 seconds to stop its complete agent tree."
+        "lam-agent — a minimal TypeScript coding agent\n\nUSAGE:\n    lam-agent [--config PATH] [--debug-log]\n    lam-agent login xai [--no-browser]\n    lam-agent logout xai\n\nOPTIONS:\n    --config PATH  Read providers from PATH instead of ~/.lam/providers.toml\n    --debug-log    Append metadata-only diagnostics beside the session journal\n    -h, --help     Show this help\n    -V, --version  Show the version\n\nCOMMANDS:\n    login xai      Sign in with SuperGrok / X Premium via device-code OAuth\n    logout xai     Remove stored SuperGrok credentials from ~/.lam/auth/xai.json\n\nLam resumes the latest durable session for the current directory. Inside the TUI,\ntype / for commands, including /new for a fresh session and /session to restore\nan earlier one; in that picker, Ctrl+D twice deletes the highlighted session.\nTab switches focus between the input shelf and conversation;\narrows select transcript rows; Enter expands the selected row. While the root is\nworking, a submitted message is queued above the input as a pending steer and is delivered at the next model boundary. Press Escape twice within 1.5 seconds to stop its complete agent tree."
     );
 }
 
@@ -828,6 +923,10 @@ enum AppError {
     Diagnostics(crate::diagnostics::DiagnosticError),
     #[error(transparent)]
     Runtime(crate::runtime::RuntimeError),
+    #[error(transparent)]
+    Auth(crate::xai::AuthError),
+    #[error(transparent)]
+    OAuth(crate::xai::OAuthError),
     #[error("terminal operation failed: {0}")]
     Terminal(std::io::Error),
     #[error("could not start terminal event reader: {0}")]

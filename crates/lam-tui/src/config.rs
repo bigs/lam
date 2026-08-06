@@ -16,6 +16,9 @@ pub(crate) enum ProviderProtocol {
     OpenaiResponses,
     #[serde(alias = "openai_chat_completions")]
     OpenaiChatCompletions,
+    /// SuperGrok / X Premium subscription via OAuth and the Grok CLI chat proxy.
+    #[serde(alias = "xai_supergrok", alias = "supergrok")]
+    XaiSupergrok,
 }
 
 #[derive(Deserialize)]
@@ -122,7 +125,9 @@ impl ProviderConfig {
 
     pub(crate) fn resolved_effort_path(&self) -> Result<Vec<String>, ConfigError> {
         let path = self.effort_path.as_deref().unwrap_or(match self.protocol {
-            ProviderProtocol::OpenaiResponses => "reasoning.effort",
+            ProviderProtocol::OpenaiResponses | ProviderProtocol::XaiSupergrok => {
+                "reasoning.effort"
+            }
             ProviderProtocol::OpenaiChatCompletions => "reasoning_effort",
         });
         let segments = path.split('.').map(str::to_owned).collect::<Vec<_>>();
@@ -169,7 +174,9 @@ fn validate(config: &ProvidersConfig) -> Result<(Vec<ModelChoice>, usize), Confi
                 provider.name
             )));
         }
-        provider.resolved_api_key()?;
+        if provider.protocol != ProviderProtocol::XaiSupergrok {
+            provider.resolved_api_key()?;
+        }
         let effort_path = provider.resolved_effort_path()?;
 
         let mut provider_models = BTreeSet::new();
@@ -371,6 +378,16 @@ efforts = ["low", "medium", "high"]
         assert!(model_ids.contains(&("openai", "gpt-5.6-terra")));
         assert!(model_ids.contains(&("synthetic", "syn:large:text")));
         assert!(model_ids.contains(&("synthetic", "syn:small:vision")));
+        assert!(model_ids.contains(&("xai", "grok-4.5")));
+        assert!(model_ids.contains(&("xai", "grok-build-0.1")));
+        assert_eq!(
+            config
+                .providers
+                .iter()
+                .find(|provider| provider.name == "xai")
+                .map(|provider| provider.protocol),
+            Some(super::ProviderProtocol::XaiSupergrok)
+        );
     }
 
     #[test]

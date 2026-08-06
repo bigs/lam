@@ -1,13 +1,16 @@
 use std::time::Duration;
 
 use lam::{CodecId, CodecRef, EncodedPayload, EvalRequest, ModelDirective, OutputContract};
-use reqwest::header::HeaderValue;
+use std::sync::Arc;
+
+use reqwest::header::{HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
+use crate::auth::{SharedAuthSource, StaticBearer};
 use crate::error::{BuildError, CodecError, ProviderError};
 use crate::metadata::ModelPricing;
-use crate::transport::HttpTransport;
+use crate::transport::{HttpTransport, RequestHeaderSource};
 
 pub(crate) const EVAL_TOOL_DESCRIPTION: &str = "Run one TypeScript program with top-level await in a persistent Deno isolate. Emit at most one eval tool call in the current model output. Do not emit sibling or parallel eval calls together; Lam executes only the first. After receiving its tool result, you may issue another eval call in the next assistant continuation, so normal inspect, edit, and test loops are supported. Within one eval program, await dependent operations sequentially and use `Promise.all` for work that should actually run concurrently. Include a brief one-line intent describing the operation for the user. Top-level state persists across calls. Return a value with the final expression; `lam.result(value)` makes it explicit. Pass structured values directly to `lam.result` without `JSON.stringify`; the runtime handles encoding. Use registered lam APIs for host interaction.";
 
@@ -55,6 +58,9 @@ pub(crate) struct SharedBuilder {
     model: String,
     base_url: String,
     api_key: Option<String>,
+    auth: Option<SharedAuthSource>,
+    default_headers: HeaderMap,
+    request_headers: Option<std::sync::Arc<dyn RequestHeaderSource>>,
     extra_body: Value,
     pricing: Option<ModelPricing>,
     client: Option<reqwest::Client>,
@@ -74,6 +80,9 @@ impl SharedBuilder {
             model: model.into(),
             base_url: DEFAULT_OPENAI_BASE_URL.to_owned(),
             api_key: None,
+            auth: None,
+            default_headers: HeaderMap::new(),
+            request_headers: None,
             extra_body: Value::Object(Map::new()),
             pricing: None,
             client: None,
@@ -83,6 +92,24 @@ impl SharedBuilder {
 
     pub(crate) fn api_key(mut self, api_key: impl Into<String>) -> Self {
         self.api_key = Some(api_key.into());
+        self
+    }
+
+    pub(crate) fn auth_source(mut self, auth: SharedAuthSource) -> Self {
+        self.auth = Some(auth);
+        self
+    }
+
+    pub(crate) fn default_headers(mut self, headers: HeaderMap) -> Self {
+        self.default_headers = headers;
+        self
+    }
+
+    pub(crate) fn request_headers(
+        mut self,
+        headers: std::sync::Arc<dyn RequestHeaderSource>,
+    ) -> Self {
+        self.request_headers = Some(headers);
         self
     }
 
@@ -119,7 +146,7 @@ impl SharedBuilder {
         if self.model.trim().is_empty() {
             return Err(BuildError::EmptyModel);
         }
-        if require_api_key && self.api_key.is_none() {
+        if require_api_key && self.api_key.is_none() && self.auth.is_none() {
             return Err(BuildError::MissingApiKey);
         }
         let Value::Object(extra_body) = self.extra_body else {
@@ -137,28 +164,43 @@ impl SharedBuilder {
                 .build()
                 .map_err(BuildError::HttpClient)?,
         };
-        let authorization = self
-            .api_key
-            .map(|api_key| {
-                let mut value = HeaderValue::from_str(&format!("Bearer {api_key}"))
-                    .map_err(BuildError::InvalidApiKey)?;
-                value.set_sensitive(true);
-                Ok::<_, BuildError>(value)
-            })
-            .transpose()?;
+        let authorization = resolve_authorization(self.auth, self.api_key)?;
         let endpoint = endpoint(&self.base_url, path)?;
+        let mut transport =
+            HttpTransport::new(client, endpoint, authorization, self.stream_idle_timeout);
+        if !self.default_headers.is_empty() {
+            transport = transport.with_default_headers(self.default_headers);
+        }
+        if let Some(headers) = self.request_headers {
+            transport = transport.with_request_headers(headers);
+        }
         Ok(BuiltConfig {
             model: self.model,
             extra_body,
             pricing: self.pricing,
-            transport: HttpTransport::new(
-                client,
-                endpoint,
-                authorization,
-                self.stream_idle_timeout,
-            ),
+            transport,
         })
     }
+}
+
+fn resolve_authorization(
+    auth: Option<SharedAuthSource>,
+    api_key: Option<String>,
+) -> Result<Option<SharedAuthSource>, BuildError> {
+    if let Some(auth) = auth {
+        return Ok(Some(auth));
+    }
+    let Some(api_key) = api_key else {
+        return Ok(None);
+    };
+    // Validate the header shape with the same error type as before.
+    let mut value =
+        HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(BuildError::InvalidApiKey)?;
+    value.set_sensitive(true);
+    let _ = value;
+    Ok(Some(Arc::new(
+        StaticBearer::new(api_key).expect("header validation already succeeded"),
+    )))
 }
 
 fn endpoint(base_url: &str, path: &str) -> Result<reqwest::Url, BuildError> {
