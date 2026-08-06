@@ -70,10 +70,12 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
     }
 
     let suggestions = app.suggestions();
+    let agents_height = agents_drawer_height(area, app, &suggestions);
     let shelf_height = shelf_height(area, app, &suggestions);
-    let [header, conversation, shelf] = Layout::vertical([
+    let [header, conversation, agents, shelf] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
+        Constraint::Length(agents_height),
         Constraint::Length(shelf_height),
     ])
     .areas(area);
@@ -81,6 +83,9 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
     render_conversation(frame, conversation, app);
     if let Some(toast) = &app.toast {
         render_toast(frame, conversation, toast);
+    }
+    if agents_height > 0 {
+        render_agents_drawer(frame, agents, app, &suggestions);
     }
     render_shelf(frame, shelf, app, &suggestions);
 }
@@ -94,11 +99,12 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 // Prefer the viewed agent's raw model id when it is not in
                 // the local picker list. Never show root's selection while
                 // looking at another agent.
-                app.current_agent_model().unwrap_or(if app.current_agent == "/root" {
-                    app.selected_model().display_name.as_str()
-                } else {
-                    "—"
-                })
+                app.current_agent_model()
+                    .unwrap_or(if app.current_agent == "/root" {
+                        app.selected_model().display_name.as_str()
+                    } else {
+                        "—"
+                    })
             },
             |model| model.display_name.as_str(),
         );
@@ -838,7 +844,8 @@ fn render_shelf(frame: &mut Frame<'_>, area: Rect, app: &mut App, suggestions: &
     let input_rows = app.input.rows(input_width);
 
     // Allocate by priority: the input keeps every row it needs, then the
-    // notice, then pending steers, and the palette takes the remainder.
+    // notice, then pending steers, then the non-agents suggestion palette.
+    // The agents drawer lives above this shelf and never steals palette rows.
     let inner_height = usize::from(inner.height);
     let input_height = input_rows.len().clamp(1, inner_height.max(1));
     let remaining = inner_height.saturating_sub(input_height);
@@ -849,7 +856,13 @@ fn render_shelf(frame: &mut Frame<'_>, area: Rect, app: &mut App, suggestions: &
         .len()
         .min(MAX_PENDING_STEER_ROWS)
         .min(remaining);
-    let palette_height = remaining.saturating_sub(steer_height);
+    let remaining = remaining.saturating_sub(steer_height);
+    // /agents is rendered in the agents drawer, not inside the message shelf.
+    let palette_height = if app.agents_palette_open() {
+        0
+    } else {
+        remaining
+    };
     let [palette_area, steer_area, notice_area, input_area] = Layout::vertical([
         Constraint::Length(to_u16(palette_height)),
         Constraint::Length(to_u16(steer_height)),
@@ -864,6 +877,7 @@ fn render_shelf(frame: &mut Frame<'_>, area: Rect, app: &mut App, suggestions: &
     if !suggestions.is_empty() && palette_area.height > 0 {
         render_palette(frame, palette_area, suggestions, app.suggestion_index);
     }
+
     if let Some(notice) = app.notice() {
         let line = match notice.kind {
             NoticeKind::Warning => Line::from(vec![
@@ -950,10 +964,86 @@ fn render_pending_steers(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(lines), area);
 }
 
+/// Horizontal inset (each side) so the agents surface is visually distinct
+/// from the full-width message shelf beneath it.
+const AGENTS_DRAWER_INSET: u16 = 2;
+
+fn agents_drawer_height(area: Rect, app: &App, suggestions: &[Suggestion]) -> u16 {
+    if app.agents_palette_open() {
+        // Expand above the shelf; leave room for header + at least a 1-row
+        // message shelf + conversation chrome. +1 for the top border row.
+        let rows = suggestions.len().max(1) + 1;
+        let maximum = usize::from(area.height.saturating_sub(6))
+            .min(usize::from((area.height * 2 / 5).max(3)));
+        return to_u16(rows.clamp(2, maximum.max(2)));
+    }
+    if app.agents_collapsed_visible() {
+        // Top border + one content row. Borders::ALL would need 3.
+        2
+    } else {
+        0
+    }
+}
+
+fn inset_rect(area: Rect, cols: u16) -> Rect {
+    let cols = cols.min(area.width / 2);
+    Rect {
+        x: area.x.saturating_add(cols),
+        y: area.y,
+        width: area.width.saturating_sub(cols.saturating_mul(2)),
+        height: area.height,
+    }
+}
+
+fn render_agents_drawer(frame: &mut Frame<'_>, area: Rect, app: &App, suggestions: &[Suggestion]) {
+    let area = inset_rect(area, AGENTS_DRAWER_INSET);
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    // Soft panel above the shelf. Collapsed is only 2 rows tall, so use a
+    // top + side frame (no bottom) and keep one full content line visible.
+    let block = Block::default()
+        .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
+        .border_style(Style::default().fg(ACCENT))
+        .style(Style::default().bg(PANEL));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    if app.agents_palette_open() {
+        if suggestions.is_empty() {
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "  no agents",
+                    Style::default().fg(DIM),
+                ))),
+                inner,
+            );
+        } else {
+            render_palette(frame, inner, suggestions, app.suggestion_index);
+        }
+        return;
+    }
+    // Collapsed ambient summary.
+    let width = usize::from(inner.width.saturating_sub(2).max(1));
+    let summary = app.agents_collapsed_summary(width);
+    let line = Line::from(vec![
+        Span::styled(" ", Style::default().fg(ACCENT)),
+        Span::styled(
+            format!("{} ", agent_spinner_frame()),
+            Style::default().fg(ACCENT),
+        ),
+        Span::styled(summary, Style::default().fg(ACCENT)),
+    ]);
+    frame.render_widget(Paragraph::new(line), inner);
+}
+
 fn render_palette(frame: &mut Frame<'_>, area: Rect, suggestions: &[Suggestion], selected: usize) {
     let mut lines = Vec::new();
     let mut item_lines = Vec::with_capacity(suggestions.len());
     let mut provider = None;
+    let spinner = agent_spinner_frame();
     for (index, suggestion) in suggestions.iter().enumerate() {
         if suggestion.provider.as_deref() != provider {
             provider = suggestion.provider.as_deref();
@@ -967,15 +1057,23 @@ fn render_palette(frame: &mut Frame<'_>, area: Rect, suggestions: &[Suggestion],
         item_lines.push(lines.len());
         let style = if index == selected {
             Style::default().fg(Color::Black).bg(ACCENT)
+        } else if suggestion.running {
+            Style::default().fg(ACCENT)
         } else {
             Style::default().fg(Color::White)
         };
-        let label_width = UnicodeWidthStr::width(suggestion.label.as_str());
+        // Animate the static marker in agent rows while a run is live.
+        let label = if suggestion.running {
+            suggestion.label.replacen('●', &spinner.to_string(), 1)
+        } else {
+            suggestion.label.clone()
+        };
+        let label_width = UnicodeWidthStr::width(label.as_str());
         let available = usize::from(area.width).saturating_sub(6 + label_width);
         lines.push(
             Line::from(vec![
                 Span::styled(if index == selected { " › " } else { "   " }, style),
-                Span::styled(suggestion.label.clone(), style.add_modifier(Modifier::BOLD)),
+                Span::styled(label, style.add_modifier(Modifier::BOLD)),
                 Span::styled("  ", style),
                 Span::styled(elide_end(&suggestion.detail, available), style),
             ])
@@ -1001,7 +1099,12 @@ fn shelf_height(area: Rect, app: &App, suggestions: &[Suggestion]) -> u16 {
             )
         })
         .0;
-    let palette_rows = suggestions.len() + provider_headers;
+    // Agents palette lives in the drawer above this shelf.
+    let palette_rows = if app.agents_palette_open() {
+        0
+    } else {
+        suggestions.len() + provider_headers
+    };
     let notice_rows = usize::from(app.notice().is_some());
     let steer_rows = app.pending_steers.len().min(MAX_PENDING_STEER_ROWS);
     let desired = 1 + input_rows + steer_rows + palette_rows + notice_rows;
@@ -1045,6 +1148,15 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
 
 fn one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn agent_spinner_frame() -> char {
+    const FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    FRAMES[(nanos / 80) as usize % FRAMES.len()]
 }
 
 fn elide_end(text: &str, width: usize) -> String {

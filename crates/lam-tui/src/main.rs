@@ -141,9 +141,17 @@ async fn tokio_main() -> Result<(), AppError> {
                 .map_err(AppError::Terminal)?;
             redraw = false;
             next_frame = tokio::time::Instant::now() + FRAME_INTERVAL;
+            // Spinners need a steady frame clock even when no agent events
+            // arrive. Re-arm immediately so select keeps waking on cadence.
+            if app.agents_drawer_animates() {
+                redraw = true;
+            }
         }
         let interruption_deadline = app.interruption_deadline();
         let toast_deadline = app.toast.as_ref().map(|toast| toast.deadline);
+        // Wake for animation frames whenever the agents drawer is spinning,
+        // not only when some other event already set `redraw`.
+        let want_frame = redraw || app.agents_drawer_animates();
         // Resolve the select into a plain value first so the handlers below
         // can borrow both `app` and `runtime` freely — in particular to fold
         // the journal projectors, which need `&mut runtime`.
@@ -168,7 +176,7 @@ async fn tokio_main() -> Result<(), AppError> {
             }
             () = wait_for_interruption_deadline(interruption_deadline), if interruption_deadline.is_some() => Tick::Deadline,
             () = wait_for_toast_deadline(toast_deadline), if toast_deadline.is_some() => Tick::Toast,
-            () = tokio::time::sleep_until(next_frame), if redraw => Tick::Frame,
+            () = tokio::time::sleep_until(next_frame), if want_frame => Tick::Frame,
         };
         // Apply the awaited event plus everything else already queued, then
         // draw once: a burst costs one frame instead of one frame per event.
@@ -420,7 +428,13 @@ async fn tokio_main() -> Result<(), AppError> {
                     app.toast = None;
                     redraw = true;
                 }
-                Tick::Frame | Tick::Idle => {}
+                Tick::Frame => {
+                    // Animation tick: request a paint on the next loop top.
+                    if app.agents_drawer_animates() {
+                        redraw = true;
+                    }
+                }
+                Tick::Idle => {}
             }
             if app.should_exit {
                 break;
@@ -436,6 +450,11 @@ async fn tokio_main() -> Result<(), AppError> {
             } else {
                 break;
             };
+        }
+        // Keep the frame clock alive while the agents drawer (collapsed or
+        // expanded) needs a spinner — not gated on keystrokes.
+        if app.agents_drawer_animates() {
+            redraw = true;
         }
     }
 
@@ -714,8 +733,13 @@ struct Args {
 }
 
 enum CliCommand {
-    Login { provider: LoginProvider, no_browser: bool },
-    Logout { provider: LoginProvider },
+    Login {
+        provider: LoginProvider,
+        no_browser: bool,
+    },
+    Logout {
+        provider: LoginProvider,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -752,7 +776,7 @@ impl Args {
                             )
                         })?;
                     let mut no_browser = false;
-                    while let Some(flag) = arguments.next() {
+                    for flag in arguments.by_ref() {
                         match flag.to_str() {
                             Some("--no-browser") => no_browser = true,
                             Some(value) => {
