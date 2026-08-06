@@ -116,30 +116,48 @@ impl HttpTransport {
                 body_bytes = serde_json::to_vec(body).map_or(0, |body| body.len()),
                 "sending model HTTP request"
             );
-            let mut request = self.client.post(self.endpoint.clone()).json(body);
-            for (name, value) in &self.default_headers {
-                request = request.header(name, value);
-            }
-            if let Some(headers) = &self.request_headers {
-                // Owned HeaderMap iteration yields Option<HeaderName> for multi-maps.
-                for (name, value) in headers.headers() {
-                    if let Some(name) = name {
-                        request = request.header(name, value);
+            let mut retried_auth = false;
+            let response = loop {
+                let mut request = self.client.post(self.endpoint.clone()).json(body);
+                for (name, value) in &self.default_headers {
+                    request = request.header(name, value);
+                }
+                if let Some(headers) = &self.request_headers {
+                    for (name, value) in headers.headers() {
+                        if let Some(name) = name {
+                            request = request.header(name, value);
+                        }
                     }
                 }
-            }
-            if let Some(authorization) = &self.authorization
-                && let Some(header) = authorization.authorization().await?
-            {
-                request = request.header(AUTHORIZATION, header);
-            }
-            let response = match request.send().await {
-                Ok(response) => response,
-                Err(error) => {
-                    let error = error.without_url();
-                    trace_reqwest_error(&error, "send", 0, 0, 0, 0, 0);
-                    return Err(ProviderError::Http(error));
+                if let Some(authorization) = &self.authorization
+                    && let Some(header) = authorization.authorization().await?
+                {
+                    request = request.header(AUTHORIZATION, header);
                 }
+                let response = match request.send().await {
+                    Ok(response) => response,
+                    Err(error) => {
+                        let error = error.without_url();
+                        trace_reqwest_error(&error, "send", 0, 0, 0, 0, 0);
+                        return Err(ProviderError::Http(error));
+                    }
+                };
+                let status = response.status();
+                if status.as_u16() == 401
+                    && !retried_auth
+                    && let Some(authorization) = &self.authorization
+                    && authorization.on_unauthorized().await?
+                {
+                    tracing::debug!(
+                        event = "http.auth_retry",
+                        "model endpoint returned 401; refreshed credentials and retrying once"
+                    );
+                    retried_auth = true;
+                    // Drop the unauthorized body without materializing it.
+                    drop(response);
+                    continue;
+                }
+                break response;
             };
             let status = response.status();
             tracing::Span::current().record("status", status.as_u16());

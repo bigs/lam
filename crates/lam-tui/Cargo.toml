@@ -16,6 +16,7 @@ lam-agents = { path = "../lam-agents" }
 lam-code = { path = "../lam-code" }
 lam-openai = { path = "../lam-openai" }
 lam-redb = { path = "../lam-redb" }
+nix.workspace = true
 ratatui.workspace = true
 redb.workspace = true
 reqwest.workspace = true

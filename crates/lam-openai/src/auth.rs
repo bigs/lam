@@ -21,6 +21,16 @@ pub trait AuthSource: Send + Sync {
     fn authorization(
         &self,
     ) -> Pin<Box<dyn Future<Output = Result<Option<HeaderValue>, ProviderError>> + Send + '_>>;
+
+    /// Called when the model endpoint rejects the request with HTTP 401.
+    ///
+    /// Return `Ok(true)` after credentials were refreshed or reloaded so the
+    /// transport can retry once. The default is `Ok(false)` (no retry).
+    fn on_unauthorized(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, ProviderError>> + Send + '_>> {
+        Box::pin(async { Ok(false) })
+    }
 }
 
 /// Shared ownership of an [`AuthSource`].

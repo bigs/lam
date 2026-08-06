@@ -82,19 +82,63 @@ pub(crate) async fn device_login(
     Ok(credentials)
 }
 
-/// Returns a non-expired access token, refreshing and rewriting the store when needed.
+/// Returns credentials safe to use for a request.
+///
+/// When `force` is false, non-expired credentials are returned immediately.
+/// When expired (or `force` is true), takes the credential lock, reloads from
+/// disk (another process may already have refreshed), and only then refreshes
+/// against auth.x.ai if still needed. This keeps concurrent `lam-agent`
+/// processes from invalidating each other's refresh tokens.
 pub(crate) async fn ensure_fresh(
     store: &XaiCredentialStore,
     credentials: XaiCredentials,
 ) -> Result<XaiCredentials, OAuthError> {
-    if !credentials.is_expired() {
-        return Ok(credentials);
+    synchronize(store, credentials, false).await
+}
+
+/// Like [`ensure_fresh`], but always coordinates with disk and refreshes when
+/// the on-disk access token still matches the caller's (e.g. after HTTP 401).
+pub(crate) async fn force_refresh(
+    store: &XaiCredentialStore,
+    credentials: XaiCredentials,
+) -> Result<XaiCredentials, OAuthError> {
+    synchronize(store, credentials, true).await
+}
+
+async fn synchronize(
+    store: &XaiCredentialStore,
+    local: XaiCredentials,
+    force: bool,
+) -> Result<XaiCredentials, OAuthError> {
+    if !force && !local.is_expired() {
+        return Ok(local);
     }
+
+    let _lock = store.lock().map_err(OAuthError::Auth)?;
+    // Another process may have refreshed while we waited for the lock.
+    if let Some(disk) = store.load().map_err(OAuthError::Auth)? {
+        if !force && !disk.is_expired() {
+            return Ok(disk);
+        }
+        if force && disk.access_token != local.access_token && !disk.is_expired() {
+            // Peer already rotated past our rejected token.
+            return Ok(disk);
+        }
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(OAuthError::Http)?;
+        // Prefer the disk refresh token; it is the latest known secret.
+        let refreshed = refresh_token(&client, &disk).await?;
+        store.save(&refreshed).map_err(OAuthError::Auth)?;
+        return Ok(refreshed);
+    }
+
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
         .map_err(OAuthError::Http)?;
-    let refreshed = refresh_token(&client, &credentials).await?;
+    let refreshed = refresh_token(&client, &local).await?;
     store.save(&refreshed).map_err(OAuthError::Auth)?;
     Ok(refreshed)
 }
@@ -352,4 +396,71 @@ pub(crate) enum OAuthError {
     Denied(String),
     #[error("{0}")]
     Message(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::xai::auth::{XaiCredentialStore, XaiCredentials};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn future_credentials(access: &str, refresh: &str) -> XaiCredentials {
+        let expires_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3_600;
+        XaiCredentials {
+            access_token: access.to_owned(),
+            refresh_token: refresh.to_owned(),
+            expires_at,
+            token_type: Some("Bearer".to_owned()),
+            scope: None,
+            user_id: None,
+            email: None,
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ensure_fresh_returns_non_expired_without_network() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = XaiCredentialStore::new(dir.path().join("xai.json"));
+        let credentials = future_credentials("access-a", "refresh-a");
+        store.save(&credentials).unwrap();
+        let out = ensure_fresh(&store, credentials.clone()).await.unwrap();
+        assert_eq!(out.access_token, "access-a");
+        assert_eq!(out.refresh_token, "refresh-a");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ensure_fresh_prefers_fresher_disk_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = XaiCredentialStore::new(dir.path().join("xai.json"));
+        let stale = XaiCredentials {
+            access_token: "stale-access".to_owned(),
+            refresh_token: "stale-refresh".to_owned(),
+            expires_at: 1, // expired
+            token_type: Some("Bearer".to_owned()),
+            scope: None,
+            user_id: None,
+            email: None,
+        };
+        let fresh = future_credentials("fresh-access", "fresh-refresh");
+        store.save(&fresh).unwrap();
+        // Local is expired; disk already has a peer-refreshed token.
+        let out = ensure_fresh(&store, stale).await.unwrap();
+        assert_eq!(out.access_token, "fresh-access");
+        assert_eq!(out.refresh_token, "fresh-refresh");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn force_refresh_adopts_peer_rotated_token_without_network() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = XaiCredentialStore::new(dir.path().join("xai.json"));
+        let local = future_credentials("local-access", "local-refresh");
+        let peer = future_credentials("peer-access", "peer-refresh");
+        store.save(&peer).unwrap();
+        let out = force_refresh(&store, local).await.unwrap();
+        assert_eq!(out.access_token, "peer-access");
+    }
 }

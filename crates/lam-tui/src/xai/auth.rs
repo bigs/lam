@@ -1,6 +1,6 @@
 //! Durable SuperGrok OAuth credential storage under `~/.lam/auth/`.
 
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -37,6 +37,18 @@ pub(crate) struct XaiCredentials {
 struct AuthFile {
     version: u32,
     credentials: XaiCredentials,
+}
+
+/// Exclusive inter-process lock for SuperGrok credential read/refresh/write.
+///
+/// Held while reloading from disk and optionally refreshing so concurrent
+/// `lam-agent` processes do not race the single-use refresh token.
+#[derive(Debug)]
+pub(crate) struct CredentialLock {
+    #[cfg(unix)]
+    _guard: nix::fcntl::Flock<File>,
+    #[cfg(not(unix))]
+    _file: File,
 }
 
 /// File-backed SuperGrok credential store.
@@ -139,6 +151,49 @@ impl XaiCredentialStore {
                 path: self.path.clone(),
                 source,
             }),
+        }
+    }
+
+    /// Path of the sidecar lock file used for cross-process refresh coordination.
+    fn lock_path(&self) -> PathBuf {
+        self.path.with_extension("lock")
+    }
+
+    /// Acquire an exclusive lock for credential reload/refresh.
+    ///
+    /// On Unix this uses `flock(2)`. On other platforms the lock is best-effort
+    /// (open-only) so single-process use still works.
+    pub(crate) fn lock(&self) -> Result<CredentialLock, AuthError> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent).map_err(|source| AuthError::Io {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+        let path = self.lock_path();
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|source| AuthError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        #[cfg(unix)]
+        {
+            use nix::fcntl::{Flock, FlockArg};
+            let guard = Flock::lock(file, FlockArg::LockExclusive).map_err(|(_, source)| {
+                AuthError::Lock {
+                    path,
+                    message: source.to_string(),
+                }
+            })?;
+            return Ok(CredentialLock { _guard: guard });
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(CredentialLock { _file: file })
         }
     }
 
@@ -290,6 +345,8 @@ fn httpdate_to_unix(value: &str) -> Option<u64> {
 
 #[derive(Debug, Error)]
 pub(crate) enum AuthError {
+    #[error("could not lock SuperGrok credentials at `{path}`: {message}")]
+    Lock { path: PathBuf, message: String },
     #[error("could not determine the home directory for SuperGrok credentials")]
     HomeUnavailable,
     #[error("could not read SuperGrok credentials at `{path}`: {source}")]
@@ -337,5 +394,26 @@ mod tests {
     fn parses_rfc3339_expiry() {
         let stamp = httpdate_to_unix("2026-08-06T19:41:52.910372Z").unwrap();
         assert!(stamp > 1_700_000_000);
+    }
+    #[test]
+    fn exclusive_lock_can_be_acquired_and_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = XaiCredentialStore::new(dir.path().join("xai.json"));
+        let credentials = XaiCredentials {
+            access_token: "access".to_owned(),
+            refresh_token: "refresh".to_owned(),
+            expires_at: super::now_unix() + 3_600,
+            token_type: Some("Bearer".to_owned()),
+            scope: None,
+            user_id: None,
+            email: None,
+        };
+        store.save(&credentials).unwrap();
+        {
+            let _lock = store.lock().expect("lock");
+            // Nested load under lock works.
+            assert_eq!(store.load().unwrap().unwrap().access_token, "access");
+        }
+        let _lock2 = store.lock().expect("relock after drop");
     }
 }

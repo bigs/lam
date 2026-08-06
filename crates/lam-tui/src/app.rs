@@ -5191,8 +5191,13 @@ mod tests {
         let mut app = app();
         // Ensure the clicked entry is the last one — the previous bug set
         // follow_conversation_tail whenever entry + 1 == len.
-        app.push_entry(EntryKind::Assistant, "Long", "line
-".repeat(40));
+        app.push_entry(
+            EntryKind::Assistant,
+            "Long",
+            "line
+"
+            .repeat(40),
+        );
         let entry = app.entries.len() - 1;
         app.entries[entry].expanded = true;
         app.follow_conversation_tail = true;

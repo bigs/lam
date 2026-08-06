@@ -171,15 +171,28 @@ impl AuthSource for XaiAuthSource {
     ) -> Pin<Box<dyn Future<Output = Result<Option<HeaderValue>, ProviderError>> + Send + '_>> {
         Box::pin(async move {
             let mut guard = self.credentials.lock().await;
-            if guard.is_expired() {
-                let refreshed = oauth::ensure_fresh(&self.store, guard.clone())
-                    .await
-                    .map_err(|error| ProviderError::Auth {
-                        message: error.to_string(),
-                    })?;
-                *guard = refreshed;
-            }
+            let refreshed = oauth::ensure_fresh(&self.store, guard.clone())
+                .await
+                .map_err(|error| ProviderError::Auth {
+                    message: error.to_string(),
+                })?;
+            *guard = refreshed;
             Ok(Some(bearer_header(&guard.access_token)?))
+        })
+    }
+
+    fn on_unauthorized(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, ProviderError>> + Send + '_>> {
+        Box::pin(async move {
+            let mut guard = self.credentials.lock().await;
+            let refreshed = oauth::force_refresh(&self.store, guard.clone())
+                .await
+                .map_err(|error| ProviderError::Auth {
+                    message: error.to_string(),
+                })?;
+            *guard = refreshed;
+            Ok(true)
         })
     }
 }
