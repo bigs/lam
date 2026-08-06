@@ -66,11 +66,10 @@ impl XaiCredentialStore {
             path: self.path.clone(),
             source,
         })?;
-        let file: AuthFile =
-            serde_json::from_str(&source).map_err(|source| AuthError::Parse {
-                path: self.path.clone(),
-                source,
-            })?;
+        let file: AuthFile = serde_json::from_str(&source).map_err(|source| AuthError::Parse {
+            path: self.path.clone(),
+            source,
+        })?;
         if file.version != SCHEMA_VERSION {
             return Err(AuthError::UnsupportedVersion {
                 path: self.path.clone(),
@@ -229,7 +228,6 @@ impl XaiCredentials {
     pub(crate) fn is_expired(&self) -> bool {
         now_unix() >= self.expires_at
     }
-
 }
 
 pub(crate) fn default_auth_path() -> Result<PathBuf, AuthError> {
@@ -266,7 +264,11 @@ fn httpdate_to_unix(value: &str) -> Option<u64> {
     let hour: u32 = time_parts.next()?.parse().ok()?;
     let minute: u32 = time_parts.next()?.parse().ok()?;
     let second: u32 = time_parts.next()?.parse().ok()?;
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || minute > 59 || second > 60
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
     {
         return None;
     }

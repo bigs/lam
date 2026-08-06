@@ -12,7 +12,7 @@ use crate::error::{BuildError, CodecError, ProviderError};
 use crate::metadata::ModelPricing;
 use crate::transport::{HttpTransport, RequestHeaderSource};
 
-pub(crate) const EVAL_TOOL_DESCRIPTION: &str = "Run one TypeScript program with top-level await in a persistent Deno isolate. Emit at most one eval tool call in the current model output. Do not emit sibling or parallel eval calls together; Lam executes only the first. After receiving its tool result, you may issue another eval call in the next assistant continuation, so normal inspect, edit, and test loops are supported. Within one eval program, await dependent operations sequentially and use `Promise.all` for work that should actually run concurrently. Include a brief one-line intent describing the operation for the user. Top-level state persists across calls. Return a value with the final expression; `lam.result(value)` makes it explicit. Pass structured values directly to `lam.result` without `JSON.stringify`; the runtime handles encoding. Use registered lam APIs for host interaction.";
+pub(crate) const EVAL_TOOL_DESCRIPTION: &str = "Run one TypeScript program with top-level await in a persistent Deno isolate. Emit at most one eval tool call in the current model output. Do not emit sibling or parallel eval calls together; Lam executes only the first. After receiving its tool result, you may issue another eval call in the next assistant continuation, so normal inspect, edit, and test loops are supported. Within one eval program, await dependent operations sequentially and use Promise.all for work that should actually run concurrently. Include a brief one-line intent describing the operation for the user. Top-level state persists across calls. Return a value with the final expression; lam.result(value) makes it explicit. Pass structured values directly to lam.result without JSON.stringify; the runtime handles encoding. Use registered lam APIs for host interaction. Ordinary TypeScript template literals are fine, including ${interpolation}. A bare backtick character inside a template literal is invalid TypeScript and aborts transpile; escape it as \\` or, for multi-line payloads that contain backticks (patches, markdown, shell), pass a string[] of lines instead (lam.edit.apply patch and lam.edit.write content accept string | string[]).";
 
 const LEGACY_EVAL_INTENT: &str = "Evaluate TypeScript";
 const MAX_EVAL_INTENT_CHARS: usize = 120;
@@ -317,7 +317,7 @@ pub(crate) fn eval_parameters() -> Value {
             },
             "source": {
                 "type": "string",
-                "description": "A TypeScript program to evaluate in the persistent Deno isolate. Top-level await is supported."
+                "description": "A TypeScript program to evaluate in the persistent Deno isolate. Top-level await is supported. Template literals are ordinary TypeScript; if a string body must contain backtick characters, escape them or build the text from double-quoted strings / a string[] joined with newlines (lam.edit patch and content accept string | string[] for this)."
             },
             "timeoutMs": {
                 "type": ["integer", "null"],

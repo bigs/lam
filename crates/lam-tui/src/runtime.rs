@@ -10,8 +10,7 @@ use lam::{
     JournalStore, Lam, LamBuilder, MemStore, MessageId, MessageSource, Model, ModelCodec,
     ModelDelta, ModelDescriptor, ModelDirective, ModelRequestConfig, ModelResponseMetadata,
     ModelResponseProjection, ModelSelection, ProjectedContextEntry, Revision, RunProgress,
-    SYSTEM_NOTICE_CODEC_ID,
-    SystemNotice,
+    SYSTEM_NOTICE_CODEC_ID, SystemNotice,
 };
 use lam_agents::{Agent, AgentSystem, AgentSystemEvents, SubagentConfig, SubagentConfigBuilder};
 use lam_code::{CodingPack, FilesystemAccess, LocalCommandRunner};
@@ -25,11 +24,11 @@ use tokio::sync::mpsc;
 
 use crate::boot::{phase, phase_sync};
 use crate::config::{LoadedConfig, ModelChoice, ModelConfig, ProviderConfig, ProviderProtocol};
+use crate::session::Session;
 use crate::xai::{
     CLI_PROXY_BASE_URL, ProxyAffinityHeaders, XaiCredentialStore, device_login, ensure_fresh,
     proxy_default_headers, xai_auth_source,
 };
-use crate::session::Session;
 
 /// How long a quit or session switch waits for in-flight command tasks before
 /// abandoning them and dropping the command runtime. Commands are normally
@@ -1176,9 +1175,7 @@ fn agent_history(
             .rfind('/')
             .filter(|separator| *separator > 0)
             .map(|separator| address[..separator].to_owned()),
-        model: state
-            .selected_model()
-            .map(selected_model_label),
+        model: state.selected_model().map(selected_model_label),
         status: if active && restored_child {
             "Interrupted".to_owned()
         } else if active {

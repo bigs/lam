@@ -37,7 +37,11 @@ pub(crate) fn proxy_default_headers(client_mode: &str) -> Result<HeaderMap, Prov
     try_insert_header(&mut headers, "x-grok-client-version", version)?;
     try_insert_header(&mut headers, "x-grok-client-mode", client_mode)?;
     try_insert_header(&mut headers, "X-XAI-Token-Auth", "xai-grok-cli")?;
-    try_insert_header(&mut headers, "x-authenticateresponse", "authenticate-response")?;
+    try_insert_header(
+        &mut headers,
+        "x-authenticateresponse",
+        "authenticate-response",
+    )?;
     try_insert_header(&mut headers, USER_AGENT.as_str(), &user_agent)?;
     Ok(headers)
 }

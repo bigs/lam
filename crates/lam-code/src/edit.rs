@@ -8,10 +8,13 @@ use crate::path::{CodingWorkspace, PathFailure};
 
 /// Multi-line text accepted as either one string or an array of lines.
 ///
-/// Models often embed patch bodies in TypeScript template literals. Any
-/// backtick inside that body (Markdown code spans, code samples, etc.) closes
-/// the template early and fails transpile. Passing an array of ordinary
-/// double-quoted strings avoids that entirely.
+/// A single string is the usual form and may be authored with a normal
+/// TypeScript template literal when the body has no nested backtick
+/// characters. When the body must contain backticks (Markdown code spans,
+/// code samples, etc.), pass an array of lines instead: double-quoted
+/// strings accept bare backticks, so the eval program does not need nested
+/// template delimiters. Lines are joined with `\n` (no trailing newline is
+/// added).
 #[derive(Clone, Debug, JsonSchema, Deserialize)]
 #[serde(untagged)]
 pub(crate) enum TextBody {
@@ -33,9 +36,13 @@ impl TextBody {
 /// Input accepted by `lam.edit.apply`.
 #[derive(Clone, Debug, JsonSchema, Deserialize)]
 pub(crate) struct ApplyPatchRequest {
-    /// Complete `*** Begin Patch` file-oriented patch as a string, or as an
-    /// array of lines. Prefer the array form whenever the patch body contains
-    /// backticks or other characters that break TypeScript template literals.
+    /// Complete file-oriented patch as a string or an array of lines.
+    ///
+    /// The first line must be exactly `*** Begin Patch` and the last exactly
+    /// `*** End Patch` (no extra trailing `***` on those marker lines). Prefer
+    /// the string form for ordinary patches; prefer the line-array form when
+    /// the body contains backtick characters so the eval program can use
+    /// double-quoted strings instead of nested template literals.
     pub patch: TextBody,
 }
 
@@ -80,7 +87,7 @@ pub(crate) struct WriteRequest {
     /// Relative workspace path or an allowed absolute path.
     pub path: String,
     /// Complete UTF-8 file contents as a string, or as an array of lines.
-    /// Prefer the array form when contents contain backticks.
+    /// Prefer the line-array form when contents contain backtick characters.
     pub content: TextBody,
 }
 
@@ -107,7 +114,7 @@ pub(crate) fn edit_namespace(workspace: CodingWorkspace) -> Namespace {
     )
     .function(
         "apply",
-        "Apply a file-oriented patch enclosed by *** Begin Patch and *** End Patch. Use explicit Add File, Delete File, or Update File sections; updates may include *** Move to, and hunks begin with @@ and space, -, or + prefixes. Context and removal lines match whole lines exactly: a substring within a line does not match. Paths must be relative. Every path and hunk is validated before the first mutation. Pass patch as a string or, when the body contains backticks, as an array of lines so TypeScript template literals are not required.",
+        "Apply a file-oriented patch. The patch text must start with the exact line *** Begin Patch and end with the exact line *** End Patch (no extra *** on those markers). Use explicit Add File, Delete File, or Update File sections; updates may include *** Move to, and hunks begin with @@ and space, -, or + prefixes. Context and removal lines match whole lines exactly: a substring within a line does not match. Paths must be relative. Every path and hunk is validated before the first mutation. patch is string | string[] (lines joined with newline): use a normal string or template literal when the body has no nested backticks; use a line array when the body must contain backtick characters.",
         move |_context, request: ApplyPatchRequest| {
             let workspace = apply_workspace.clone();
             async move {
@@ -121,7 +128,7 @@ pub(crate) fn edit_namespace(workspace: CodingWorkspace) -> Namespace {
     )
     .function(
         "write",
-        "Create or completely rewrite one UTF-8 text file, creating missing parent directories. Prefer lam.edit.apply for targeted changes to an existing file. content may be a string or an array of lines; prefer the array form when contents contain backticks.",
+        "Create or completely rewrite one UTF-8 text file, creating missing parent directories. Prefer lam.edit.apply for targeted changes to an existing file. content is string | string[] (lines joined with newline): use a normal string or template literal when the body has no nested backticks; use a line array when the body must contain backtick characters.",
         move |_context, request: WriteRequest| {
             let workspace = write_workspace.clone();
             async move { write_file(&workspace, request).await }

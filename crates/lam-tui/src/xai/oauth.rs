@@ -14,8 +14,7 @@ use super::proxy::proxy_client_version;
 
 /// Shared Grok CLI / third-party agent OAuth client used by Grok Build.
 const CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
-const SCOPE: &str =
-    "openid profile email offline_access grok-cli:access api:access conversations:read conversations:write";
+const SCOPE: &str = "openid profile email offline_access grok-cli:access api:access conversations:read conversations:write";
 const DEVICE_URL: &str = "https://auth.x.ai/oauth2/device/code";
 const TOKEN_URL: &str = "https://auth.x.ai/oauth2/token";
 const DEVICE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
@@ -139,8 +138,8 @@ async fn poll_for_token(
     if interval < DEFAULT_POLL_INTERVAL {
         interval = DEFAULT_POLL_INTERVAL.min(interval.max(Duration::from_secs(1)));
     }
-    let deadline = started
-        + Duration::from_secs(device.expires_in.max(30)).min(MAX_DEVICE_DURATION);
+    let deadline =
+        started + Duration::from_secs(device.expires_in.max(30)).min(MAX_DEVICE_DURATION);
 
     loop {
         if Instant::now() >= deadline {
@@ -186,12 +185,7 @@ async fn poll_for_token(
                 other => {
                     return Err(OAuthError::Status {
                         status: status.as_u16(),
-                        body: truncate(
-                            token
-                                .error_description
-                                .as_deref()
-                                .unwrap_or(other),
-                        ),
+                        body: truncate(token.error_description.as_deref().unwrap_or(other)),
                         stage: "device token poll",
                     });
                 }
@@ -235,20 +229,14 @@ async fn refresh_token(
             stage: "token refresh",
         });
     }
-    let token: TokenResponse =
-        serde_json::from_str(&body).map_err(|source| OAuthError::Json {
-            stage: "token refresh",
-            source,
-        })?;
+    let token: TokenResponse = serde_json::from_str(&body).map_err(|source| OAuthError::Json {
+        stage: "token refresh",
+        source,
+    })?;
     if let Some(error) = token.error.as_deref() {
         return Err(OAuthError::Status {
             status: status.as_u16(),
-            body: truncate(
-                token
-                    .error_description
-                    .as_deref()
-                    .unwrap_or(error),
-            ),
+            body: truncate(token.error_description.as_deref().unwrap_or(error)),
             stage: "token refresh",
         });
     }
@@ -318,9 +306,7 @@ fn open_url_in_browser(url: &str) -> io::Result<()> {
     }
     #[cfg(target_os = "windows")]
     {
-        Command::new("cmd")
-            .args(["/C", "start", "", url])
-            .spawn()?;
+        Command::new("cmd").args(["/C", "start", "", url]).spawn()?;
         return Ok(());
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]

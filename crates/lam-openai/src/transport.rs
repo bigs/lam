@@ -128,10 +128,10 @@ impl HttpTransport {
                     }
                 }
             }
-            if let Some(authorization) = &self.authorization {
-                if let Some(header) = authorization.authorization().await? {
-                    request = request.header(AUTHORIZATION, header);
-                }
+            if let Some(authorization) = &self.authorization
+                && let Some(header) = authorization.authorization().await?
+            {
+                request = request.header(AUTHORIZATION, header);
             }
             let response = match request.send().await {
                 Ok(response) => response,

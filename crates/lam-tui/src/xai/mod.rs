@@ -7,7 +7,7 @@ mod auth;
 mod oauth;
 mod proxy;
 
-pub(crate) use auth::{AuthError, XaiCredentials, XaiCredentialStore};
+pub(crate) use auth::{AuthError, XaiCredentialStore, XaiCredentials};
 pub(crate) use oauth::{OAuthError, device_login, ensure_fresh};
 pub(crate) use proxy::{
     CLI_PROXY_BASE_URL, ProxyAffinityHeaders, proxy_default_headers, xai_auth_source,

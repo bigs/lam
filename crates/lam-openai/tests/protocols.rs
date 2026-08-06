@@ -1340,7 +1340,10 @@ async fn responses_provider_streams_reasoning_summary_deltas() {
         ]
     );
     assert_eq!(
-        codec.project_response(&response).expect("valid projection").display,
+        codec
+            .project_response(&response)
+            .expect("valid projection")
+            .display,
         [
             ModelDelta::Reasoning("Inspect then edit.".to_owned()),
             ModelDelta::Text("done".to_owned()),

@@ -15,8 +15,26 @@ pub(crate) fn transpile(source: &str, cell_id: u64) -> Result<String, EvalError>
     let specifier = deno_ast::ModuleSpecifier::parse(&format!("file:///lam/cell-{cell_id}.ts"))
         .map_err(EvalError::internal)?;
     let source_url = format!("lam://cell/{cell_id}");
-    transpile_source(source, specifier, "'use strict'; void 0;", &source_url)
-        .map_err(|message| EvalError::Transpile { message })
+    transpile_source(source, specifier, "'use strict'; void 0;", &source_url).map_err(|message| {
+        EvalError::Transpile {
+            message: annotate_transpile_message(source, message),
+        }
+    })
+}
+
+/// When transpile fails and the source contains backticks, remind the model of
+/// the usual cause: an unescaped backtick inside a template literal.
+fn annotate_transpile_message(source: &str, message: String) -> String {
+    if source.contains('`')
+        && !message.contains("template literal")
+        && !message.contains("backtick")
+    {
+        format!(
+            "{message}\nnote: a bare backtick inside a template literal is invalid TypeScript; escape it as \\` or, for multi-line text that must contain backticks, use double-quoted strings or a string[] of lines (lam.edit.apply patch / lam.edit.write content accept string | string[])."
+        )
+    } else {
+        message
+    }
 }
 
 pub(crate) fn extension(

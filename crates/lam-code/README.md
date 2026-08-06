@@ -59,14 +59,19 @@ path normalization are checked to prevent API-level escape from that root.
 ## Editing
 
 `lam.edit.apply` accepts the `*** Begin Patch` / `*** End Patch` grammar used by
-leading coding agents. It supports add, update, move, and delete operations.
-Every path and hunk is parsed and validated against the original filesystem
-before the first mutation; overlapping parent/child targets are rejected.
+leading coding agents. Marker lines must be exact: the first line is
+`*** Begin Patch` and the last is `*** End Patch` (no extra trailing `***` on
+those lines). It supports add, update, move, and delete operations. Every path
+and hunk is parsed and validated against the original filesystem before the
+first mutation; overlapping parent/child targets are rejected.
 
-Both `patch` and `lam.edit.write`'s `content` accept either a single string or
-an array of lines (joined with `\n`). Prefer the array form whenever the text
-contains backticks: models often put multi-line bodies in TypeScript template
-literals, and a nested `` ` `` closes the string early and fails transpile.
+Both `patch` and `lam.edit.write`'s `content` are typed as **string | string[]**
+(line arrays are joined with `\n`). A normal string—including a TypeScript
+template literal with `${interpolation}`—is fine when the body does not need
+nested backtick characters. When the body must contain backticks (Markdown
+code spans, samples, etc.), pass a line array of double-quoted strings instead:
+bare backticks are legal inside double-quoted strings but illegal unescaped inside a template
+literal, and would abort eval transpile.
 
 If the underlying filesystem changes or fails during commit, the result reports
 a partial commit explicitly rather than claiming rollback. The filesystem is

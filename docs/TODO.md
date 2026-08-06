@@ -55,6 +55,7 @@
 
 ## Tooling / eval harness
 
-- [x] The eval harness rejects source whose template-literal patch strings contain backtick characters (e.g. Markdown code spans in doc comments): the transpiler parses the closing backtick as the end of the string and chokes on the remainder.
- - Fixed: `lam.edit.apply` / `lam.edit.write` accept `patch` / `content` as either a string or an array of lines. Models should pass line arrays when bodies contain backticks so TypeScript template literals are unnecessary.
- - Historical failure: any backtick inside a template-literal patch aborted eval with SyntaxError pointing into generated `lam/cell-<n>.ts`.
+- [x] Nested bare backticks inside TypeScript template literals abort eval transpile (vanilla TS). Common for patch/markdown bodies with code spans.
+ - Fixed (API): `lam.edit.apply` `patch` and `lam.edit.write` `content` accept **string | string[]**. Use a normal string/template when the body has no nested backticks; use a line array when it must contain backticks.
+ - Guidance: eval tool description + edit namespace docs spell out the rule; patch markers are exactly `*** Begin Patch` / `*** End Patch`.
+ - Historical failure: unescaped nested backticks inside a template-literal patch aborted eval with SyntaxError pointing into generated `lam/cell-<n>.ts`.
