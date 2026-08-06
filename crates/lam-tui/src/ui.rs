@@ -450,13 +450,9 @@ fn entry_lines(
 ) {
     let (marker, color) = entry_style(entry.kind);
     let selection = if selected { "│" } else { " " };
+    let selection_span = Span::styled(selection.to_owned(), Style::default().fg(ACCENT));
     let disclosure = if entry.expanded { "▾" } else { "▸" };
     let dimmed = is_dimmed(entry, selected);
-    let style = if selected {
-        Style::default().bg(PANEL)
-    } else {
-        Style::default()
-    };
     let title_width = UnicodeWidthStr::width(entry.title.as_str());
     let fixed = 10 + title_width;
     let preview = if entry.expanded || entry.kind == EntryKind::ToolCall {
@@ -472,48 +468,44 @@ fn entry_lines(
     // The header's leading furniture: selection marker, disclosure and
     // kind marker, the title, and the preview spacer when one follows.
     let header_pad = 1 + 6 + title_width + if preview.is_empty() { 0 } else { 2 };
-    lines.push(
-        Line::from(vec![
-            Span::styled(selection.to_owned(), Style::default().fg(ACCENT)),
-            Span::styled(
-                format!("{disclosure} {marker} "),
-                dim_ambient(style_fg(color), dimmed),
-            ),
-            Span::styled(
-                entry.title.clone(),
-                if dimmed {
-                    style_fg(color).add_modifier(Modifier::DIM)
-                } else {
-                    style_fg(color).add_modifier(Modifier::BOLD)
-                },
-            ),
-            Span::raw(if preview.is_empty() { "" } else { "  " }),
-            Span::styled(preview, dim_ambient(style_fg(Color::Gray), dimmed)),
-        ])
-        .style(style),
-    );
+    lines.push(Line::from(vec![
+        selection_span.clone(),
+        Span::styled(
+            format!("{disclosure} {marker} "),
+            dim_ambient(style_fg(color), dimmed),
+        ),
+        Span::styled(
+            entry.title.clone(),
+            if dimmed {
+                style_fg(color).add_modifier(Modifier::DIM)
+            } else {
+                style_fg(color).add_modifier(Modifier::BOLD)
+            },
+        ),
+        Span::raw(if preview.is_empty() { "" } else { "  " }),
+        Span::styled(preview, dim_ambient(style_fg(Color::Gray), dimmed)),
+    ]));
     pads.push(header_pad);
     if entry.expanded {
-        let body_width = width.saturating_sub(5).max(1);
+        let body_width = width.saturating_sub(6).max(1);
         if renders_markdown(entry.kind) {
             let base = dim_ambient(style_fg(Color::Gray), dimmed);
             for body_line in markdown_lines(&entry.body, body_width, base) {
-                let mut spans = Vec::with_capacity(body_line.spans.len() + 1);
+                let mut spans = Vec::with_capacity(body_line.spans.len() + 2);
+                spans.push(selection_span.clone());
                 spans.push(Span::raw("    "));
                 spans.extend(body_line.spans);
-                lines.push(Line::from(spans).style(style));
-                pads.push(4);
+                lines.push(Line::from(spans));
+                pads.push(5);
             }
         } else {
             for body_line in wrap_text(&entry.body, body_width) {
-                lines.push(
-                    Line::from(vec![
-                        Span::raw("    "),
-                        Span::styled(body_line, dim_ambient(style_fg(Color::Gray), dimmed)),
-                    ])
-                    .style(style),
-                );
-                pads.push(4);
+                lines.push(Line::from(vec![
+                    selection_span.clone(),
+                    Span::raw("    "),
+                    Span::styled(body_line, dim_ambient(style_fg(Color::Gray), dimmed)),
+                ]));
+                pads.push(5);
             }
         }
     }
@@ -1255,7 +1247,7 @@ mod tests {
     use ratatui::style::{Color, Modifier, Style};
 
     use super::{
-        PANEL, elide_end, markdown_lines, markdown_preview, needs_message_spacing, render,
+        ACCENT, PANEL, elide_end, markdown_lines, markdown_preview, needs_message_spacing, render,
         renders_markdown, viewport_offset, wrap_text,
     };
     use crate::app::{
@@ -1467,15 +1459,15 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let area = app.conversation_area.unwrap();
         // Viewport row 0 is the leading message-spacing blank; row 1 is the
-        // header and row 2 is the first body row ("    abc"). Select its
-        // text cells and leave the rest untouched.
+        // header and row 2 is the first body row ("     abc", marker column
+        // plus indent). Select its text cells and leave the rest untouched.
         app.text_selection = Some(TextSelection {
-            anchor: CellPos { row: 2, col: 4 },
-            head: CellPos { row: 2, col: 6 },
+            anchor: CellPos { row: 2, col: 5 },
+            head: CellPos { row: 2, col: 7 },
         });
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let buffer = terminal.backend().buffer();
-        for col in 4..=6 {
+        for col in 5..=7 {
             let cell = &buffer[(area.x + col as u16, area.y + 2)];
             assert!(
                 cell.modifier.contains(Modifier::REVERSED),
@@ -1486,7 +1478,7 @@ mod tests {
             );
         }
         assert!(
-            !buffer[(area.x + 7, area.y + 2)]
+            !buffer[(area.x + 8, area.y + 2)]
                 .modifier
                 .contains(Modifier::REVERSED)
         );
@@ -1495,6 +1487,35 @@ mod tests {
                 .modifier
                 .contains(Modifier::REVERSED)
         );
+    }
+
+    #[test]
+    fn selected_entry_extends_the_selection_bar_across_every_line() {
+        let mut app = test_app(vec![HistoryEntry {
+            kind: HistoryKind::User,
+            title: "you".to_owned(),
+            body: "abc\ndef".to_owned(),
+        }]);
+        app.entries[0].expanded = true;
+        app.focus = Focus::Conversation;
+        app.selected_entry = Some(0);
+        let backend = TestBackend::new(60, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let area = app.conversation_area.unwrap();
+        let buffer = terminal.backend().buffer();
+        // Row 0 is the leading spacing blank; rows 1..3 are the entry's
+        // header and two body rows. Each starts with the accent bar.
+        for row in 1..=3 {
+            let cell = &buffer[(area.x, area.y + row)];
+            assert_eq!(cell.symbol(), "│", "row {row} should start with the bar");
+            assert_eq!(cell.fg, ACCENT);
+            assert_eq!(
+                cell.bg,
+                Color::Reset,
+                "row {row} should have no body highlight"
+            );
+        }
     }
 
     #[test]
@@ -1509,7 +1530,8 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         // Viewport row 0 is the leading spacing blank; row 1 is the header
-        // (furniture only) and rows 2..3 are body rows with a 4-cell indent.
+        // (furniture only) and rows 2..3 are body rows with the selection
+        // marker column plus a 4-cell indent.
         assert_eq!(
             app.conversation_rows[1],
             CopyRow {
@@ -1520,15 +1542,15 @@ mod tests {
         assert_eq!(
             app.conversation_rows[2],
             CopyRow {
-                pad: 4,
-                text: "    abc".to_owned()
+                pad: 5,
+                text: "     abc".to_owned()
             }
         );
         assert_eq!(
             app.conversation_rows[3],
             CopyRow {
-                pad: 4,
-                text: "    def".to_owned()
+                pad: 5,
+                text: "     def".to_owned()
             }
         );
     }
