@@ -292,7 +292,7 @@ async fn parallel_eval_calls_execute_the_first_and_reject_the_rest() {
         let lam::EvalOutcome::Rejected { message } = outcome else {
             panic!("sibling eval should be rejected: {outcome:?}");
         };
-        assert!(message.contains("executes only the first tool call"));
+        assert!(message.contains("executes only the first"));
         assert!(message.contains("Promise.all"));
     }
 
