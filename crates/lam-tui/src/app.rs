@@ -307,6 +307,9 @@ pub(crate) struct App {
     pub(crate) conversation_offset: usize,
     pub(crate) follow_conversation_tail: bool,
     pub(crate) selection_drives_viewport: bool,
+    /// One-shot: next paint aligns this entry near the top of the viewport
+    /// (keyboard expand only). Cleared after use.
+    pub(crate) reveal_entry_top: Option<usize>,
     pub(crate) conversation_ranges: Vec<(usize, usize)>,
     pub(crate) conversation_viewport_height: usize,
     pub(crate) conversation_total_lines: usize,
@@ -376,6 +379,7 @@ struct AgentConversation {
     conversation_offset: usize,
     follow_conversation_tail: bool,
     selection_drives_viewport: bool,
+    reveal_entry_top: Option<usize>,
     status: String,
     context_tokens: Option<u64>,
     parent: Option<String>,
@@ -476,6 +480,7 @@ impl App {
             conversation_offset: 0,
             follow_conversation_tail: true,
             selection_drives_viewport: true,
+            reveal_entry_top: None,
             conversation_ranges: Vec::new(),
             conversation_viewport_height: 1,
             conversation_total_lines: 0,
@@ -1018,7 +1023,7 @@ impl App {
                 self.follow_conversation_tail = true;
                 self.selection_drives_viewport = true;
             }
-            KeyCode::Enter | KeyCode::Char(' ') => self.toggle_selected(),
+            KeyCode::Enter | KeyCode::Char(' ') => self.toggle_selected_from_keyboard(),
             _ => {}
         }
     }
@@ -2073,6 +2078,25 @@ impl App {
         }
     }
 
+    /// Keyboard expand/collapse. Expanding reveals the entry for reading:
+    /// the whole entry if it fits, otherwise the header near the top of the
+    /// viewport. Mouse expand leaves scroll alone.
+    fn toggle_selected_from_keyboard(&mut self) {
+        self.follow_conversation_tail = false;
+        self.selection_drives_viewport = false;
+        let Some(index) = self.selected_entry else {
+            return;
+        };
+        let Some(entry) = self.entries.get_mut(index) else {
+            return;
+        };
+        let expanding = !entry.expanded;
+        entry.expanded = !entry.expanded;
+        if expanding {
+            self.reveal_entry_top = Some(index);
+        }
+    }
+
     /// Hierarchical agent list for the drawer: DFS from `/root`, with siblings
     /// ordered newest-created first (session create order, not last activity).
     fn agent_addresses(&self) -> Vec<String> {
@@ -2319,6 +2343,7 @@ impl App {
             conversation_offset: self.conversation_offset,
             follow_conversation_tail: self.follow_conversation_tail,
             selection_drives_viewport: self.selection_drives_viewport,
+            reveal_entry_top: self.reveal_entry_top.take(),
             status: std::mem::take(&mut self.status),
             context_tokens: self.context_tokens,
             parent: self.current_parent.take(),
@@ -2336,6 +2361,7 @@ impl App {
         self.conversation_offset = next.conversation_offset;
         self.follow_conversation_tail = next.follow_conversation_tail;
         self.selection_drives_viewport = next.selection_drives_viewport;
+        self.reveal_entry_top = next.reveal_entry_top;
         self.status = next.status;
         self.context_tokens = next.context_tokens;
         self.current_parent = next.parent;
@@ -2396,6 +2422,7 @@ impl AgentConversation {
             conversation_offset: 0,
             follow_conversation_tail: true,
             selection_drives_viewport: true,
+            reveal_entry_top: None,
             status: status.to_owned(),
             context_tokens: None,
             parent,
@@ -2417,6 +2444,7 @@ impl AgentConversation {
             conversation_offset: 0,
             follow_conversation_tail: true,
             selection_drives_viewport: true,
+            reveal_entry_top: None,
             status: history.status,
             context_tokens: history.context_tokens,
             parent: history.parent,
@@ -5222,6 +5250,54 @@ mod tests {
         assert!(!app.follow_conversation_tail);
         assert!(!app.selection_drives_viewport);
         assert_eq!(app.conversation_offset, 12);
+    }
+
+    #[test]
+    fn keyboard_expand_requests_reveal_near_top() {
+        let mut app = app();
+        app.push_entry(
+            EntryKind::Assistant,
+            "Long",
+            "body line
+"
+            .repeat(20),
+        );
+        let entry = app.entries.len() - 1;
+        app.selected_entry = Some(entry);
+        app.focus = Focus::Conversation;
+        app.follow_conversation_tail = true;
+        app.entries[entry].expanded = false;
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(app.entries[entry].expanded);
+        assert_eq!(app.reveal_entry_top, Some(entry));
+        assert!(!app.follow_conversation_tail);
+        assert!(!app.selection_drives_viewport);
+    }
+
+    #[test]
+    fn header_click_expand_does_not_request_reveal() {
+        let mut app = app();
+        app.push_entry(EntryKind::Assistant, "Long", "body");
+        let entry = app.entries.len() - 1;
+        app.entries[entry].expanded = false;
+        app.hitboxes = vec![Hitbox {
+            top: 2,
+            bottom: 2,
+            header: Some(2),
+            entry,
+        }];
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        assert!(app.entries[entry].expanded);
+        assert_eq!(app.reveal_entry_top, None);
     }
 
     #[test]

@@ -171,6 +171,15 @@ fn render_conversation(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     app.conversation_ranges.clone_from(&ranges);
     app.conversation_viewport_height = viewport;
     app.conversation_total_lines = total;
+    // Keyboard expand: bottom-align short entries (1 blank above the shelf);
+    // pin tall ones so the header sits ~2 lines from the top.
+    if let Some(entry) = app.reveal_entry_top.take()
+        && let Some((start, end)) = ranges.get(entry)
+    {
+        app.conversation_offset = reveal_expanded_offset(*start, *end, viewport, total);
+        app.follow_conversation_tail = false;
+        app.selection_drives_viewport = false;
+    }
     let selected_start = app.selection_drives_viewport.then(|| {
         app.selected_entry
             .and_then(|selected| ranges.get(selected))
@@ -378,6 +387,34 @@ fn needs_message_spacing(previous: Option<EntryKind>, next: Option<EntryKind>) -
 
 fn is_text_message(kind: EntryKind) -> bool {
     matches!(kind, EntryKind::User | EntryKind::Assistant)
+}
+
+/// Offset after keyboard-expanding an entry.
+///
+/// - If the expanded entry fits in the viewport, bottom-align it with one
+///   blank line of buffer above the input/shelf edge so short expands do not
+///   jump toward the top of the pane.
+/// - If it is taller than the viewport, pin the header `REVEAL_TOP_BUFFER`
+///   lines from the top of the pane.
+fn reveal_expanded_offset(start: usize, end: usize, viewport: usize, total: usize) -> usize {
+    const REVEAL_TOP_BUFFER: usize = 2;
+    const REVEAL_BOTTOM_BUFFER: usize = 1;
+    let viewport = viewport.max(1);
+    let maximum = total.saturating_sub(viewport);
+    let height = end.saturating_sub(start).saturating_add(1);
+    if height > viewport {
+        return start.saturating_sub(REVEAL_TOP_BUFFER).min(maximum);
+    }
+    // Bottom-align: last entry line sits one row above the pane bottom.
+    let mut offset = end
+        .saturating_add(1)
+        .saturating_add(REVEAL_BOTTOM_BUFFER)
+        .saturating_sub(viewport);
+    // Keep the header on screen if bottom-alignment would scroll past it.
+    if start < offset {
+        offset = start;
+    }
+    offset.min(maximum)
 }
 
 fn viewport_offset(
@@ -1305,6 +1342,25 @@ mod tests {
             rows.iter().all(|row| !row.contains("Test Again")),
             "soft breaks must not be collapsed into spaces: {rows:?}"
         );
+    }
+
+    #[test]
+    fn reveal_expanded_offset_bottom_aligns_short_entries() {
+        // entry 10..=14 (height 5), viewport 20 → offset = 14+1+1-20 = 0
+        assert_eq!(super::reveal_expanded_offset(10, 14, 20, 100), 0);
+        // entry 50..=54, viewport 20 → offset = 54+1+1-20 = 36
+        assert_eq!(super::reveal_expanded_offset(50, 54, 20, 100), 36);
+    }
+
+    #[test]
+    fn reveal_expanded_offset_keeps_header_on_screen_when_bottom_aligning() {
+        assert_eq!(super::reveal_expanded_offset(0, 8, 10, 50), 0);
+    }
+
+    #[test]
+    fn reveal_expanded_offset_pins_tall_entries_near_top() {
+        // height 40 > viewport 15 → pin start with top buffer
+        assert_eq!(super::reveal_expanded_offset(20, 59, 15, 200), 18);
     }
 
     #[test]
