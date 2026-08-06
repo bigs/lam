@@ -1434,28 +1434,16 @@ fn default_worker_threads() -> usize {
 }
 
 fn coding_instruction(cwd: &Path, models: &[ModelChoice], default_model: usize) -> String {
-    let configured_models = models
-        .iter()
-        .enumerate()
-        .map(|(index, model)| {
-            let default = if index == default_model {
-                " (default)"
-            } else {
-                ""
-            };
-            format!(
-                "- provider: `{}`; model: `{}`; selector: `{}`{default}; efforts: [{}]",
-                model.provider,
-                model.model,
-                model.registry_id,
-                model.efforts.join(", ")
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let default = models.get(default_model).map_or_else(
+        || "the host default".to_owned(),
+        |model| format!("`{}/{}`", model.provider, model.model),
+    );
     format!(
-        "You are a coding agent operating in `{}`. Work within this directory unless the user explicitly directs you otherwise. Use the installed coding and multi-agent namespaces when they help complete the task.\n\nConfigured inference providers and models:\n{configured_models}\n\nFor `lam.agents.spawn` and `lam.agents.call`, pass the exact raw values shown above as `model: {{ provider: \"<provider>\", model: \"<model>\" }}`. The selector is for model selection elsewhere; do not pass the selector in the `model` field. Omit `model` to use the configured default.",
-        cwd.display()
+        "You are a coding agent operating in `{cwd}`. Work within this directory unless the user explicitly directs you otherwise. Use the installed coding and multi-agent namespaces when they help complete the task.
+
+Subagent models: call `lam.agents.models()` to list allowed models grouped by provider (and the default). For `lam.agents.spawn` / `lam.agents.call`, pass `model` as `{{ provider, model }}` taken from that catalog when you need a non-default model. Do not pass the TUI selector string. Omit `model` to use {default}.",
+        cwd = cwd.display(),
+        default = default,
     )
 }
 
@@ -2165,7 +2153,7 @@ mod tests {
     }
 
     #[test]
-    fn coding_instruction_exposes_exact_subagent_model_coordinates() {
+    fn coding_instruction_points_at_agents_models_catalog() {
         let models = vec![
             ModelChoice {
                 registry_id: "openai/gpt-5.6-luna".to_owned(),
@@ -2188,13 +2176,10 @@ mod tests {
 
         let instruction = coding_instruction(Path::new("/work/project"), &models, 0);
 
-        assert!(instruction.contains("provider: `openai`; model: `gpt-5.6-luna`"));
-        assert!(instruction.contains("selector: `openai/gpt-5.6-luna` (default)"));
-        assert!(instruction.contains("efforts: [none, high, max]"));
-        assert!(instruction.contains(
-            "provider: `fireworks`; model: `accounts/fireworks/models/deepseek-v4-flash-0731`"
-        ));
-        assert!(instruction.contains("do not pass the selector in the `model` field"));
+        assert!(instruction.contains("`lam.agents.models()`"));
+        assert!(instruction.contains("`openai/gpt-5.6-luna`"));
+        assert!(!instruction.contains("Configured inference providers and models:"));
+        assert!(!instruction.contains("accounts/fireworks/models/deepseek-v4-flash-0731"));
     }
 
     #[test]
