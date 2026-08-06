@@ -67,7 +67,8 @@ ambient `Deno` object. Those capabilities must be registered by the embedding.
 
 ## Timeouts and replacement
 
-`eval_with` can select a timeout within the builder's configured maximum. When
+`eval_with` can select a timeout independently of the builder's default.
+Hosts can optionally configure a maximum. When
 the watchdog fires, lam interrupts V8, treats the isolate as poisoned, drops
 pending Rust op futures, and constructs a fresh generation before returning.
 

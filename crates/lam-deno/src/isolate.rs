@@ -25,7 +25,6 @@ mod parked;
 use parked::Kernel;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
-const DEFAULT_MAX_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The JSON-only value returned by a successful evaluation.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -54,7 +53,7 @@ pub struct EvalOptions {
 }
 
 impl EvalOptions {
-    /// Uses a cell-specific timeout, still bounded by the host maximum.
+    /// Uses a cell-specific timeout, still bounded by an optional host maximum.
     #[must_use]
     pub const fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
@@ -66,7 +65,7 @@ impl EvalOptions {
 pub struct IsolateBuilder {
     namespaces: Vec<Namespace>,
     default_timeout: Duration,
-    max_timeout: Duration,
+    max_timeout: Option<Duration>,
     capture_console: bool,
 }
 
@@ -75,7 +74,7 @@ impl Default for IsolateBuilder {
         Self {
             namespaces: Vec::new(),
             default_timeout: DEFAULT_TIMEOUT,
-            max_timeout: DEFAULT_MAX_TIMEOUT,
+            max_timeout: None,
             capture_console: true,
         }
     }
@@ -103,10 +102,10 @@ impl IsolateBuilder {
         self
     }
 
-    /// Sets the hard upper bound for all cell timeouts.
+    /// Sets an optional hard upper bound for all cell timeouts.
     #[must_use]
     pub const fn max_timeout(mut self, timeout: Duration) -> Self {
-        self.max_timeout = timeout;
+        self.max_timeout = Some(timeout);
         self
     }
 
@@ -122,9 +121,17 @@ impl IsolateBuilder {
 
     /// Validates the registry and starts the first isolate generation.
     pub async fn build(self) -> Result<Isolate, IsolateBuildError> {
-        if self.default_timeout.is_zero() || self.max_timeout.is_zero() {
+        if self.default_timeout.is_zero()
+            || self.max_timeout.is_some_and(|timeout| timeout.is_zero())
+        {
             return Err(IsolateBuildError::InvalidTimeout);
         }
+
+        let default_timeout = self
+            .max_timeout
+            .map_or(self.default_timeout, |max_timeout| {
+                self.default_timeout.min(max_timeout)
+            });
 
         let registry = Arc::new(Registry::build(self.namespaces)?);
         let console = ConsoleBuffer::new(self.capture_console);
@@ -138,7 +145,7 @@ impl IsolateBuilder {
             console,
             generation,
             next_cell_id: 1,
-            default_timeout: self.default_timeout.min(self.max_timeout),
+            default_timeout,
             max_timeout: self.max_timeout,
             interrupt,
         })
@@ -216,7 +223,7 @@ pub struct Isolate {
     generation: u64,
     next_cell_id: u64,
     default_timeout: Duration,
-    max_timeout: Duration,
+    max_timeout: Option<Duration>,
     interrupt: IsolateInterrupt,
 }
 
@@ -266,10 +273,10 @@ impl Isolate {
         source: &str,
         options: EvalOptions,
     ) -> Result<EvalOutput, EvalError> {
-        let timeout = options
-            .timeout
-            .unwrap_or(self.default_timeout)
-            .min(self.max_timeout);
+        let requested_timeout = options.timeout.unwrap_or(self.default_timeout);
+        let timeout = self.max_timeout.map_or(requested_timeout, |max_timeout| {
+            requested_timeout.min(max_timeout)
+        });
         let timeout_ms = duration_millis(timeout);
         let cell_id = self.next_cell_id;
         self.next_cell_id = self.next_cell_id.saturating_add(1);
