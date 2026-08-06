@@ -706,6 +706,15 @@ impl App {
                 self.suggestion_index = (self.suggestion_index + 1) % suggestions.len();
                 None
             }
+            // Ctrl+J is \n (0x0A): in raw mode crossterm reports it as
+            // Char('j') + CONTROL, so it can insert a literal newline while
+            // Enter keeps submitting.
+            KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.input_history = None;
+                self.input.insert('\n');
+                self.suggestion_index = 0;
+                None
+            }
             KeyCode::Enter if !suggestions.is_empty() => {
                 let selected = &suggestions[self.suggestion_index];
                 if self.input.text.trim_end() != selected.replacement.trim_end()
@@ -2665,6 +2674,39 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
         assert_eq!(app.input.text, "inspect the ");
         assert_eq!(app.input.cursor, 12);
+    }
+
+    #[test]
+    fn control_j_inserts_a_newline_instead_of_submitting() {
+        let mut app = app();
+        app.input = InputBuffer::at_end("first".to_owned());
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
+        assert_eq!(app.input.text, "first\n");
+        assert_eq!(app.input.cursor, 6);
+        assert!(app.pending_steers.is_empty(), "Ctrl+J must not submit");
+
+        // The draft stays editable across the newline, and Enter still submits.
+        app.input.insert('s');
+        let command = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(command, Some(Command::Message(_))));
+        assert_eq!(app.pending_steers[0].text, "first\ns");
+    }
+
+    #[test]
+    fn control_j_splits_the_line_at_the_cursor() {
+        let mut app = app();
+        app.input = InputBuffer::at_end("aλb".to_owned());
+        app.input.cursor = 2;
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
+        assert_eq!(app.input.text, "aλ\nb");
+        assert_eq!(app.input.cursor, 3, "cursor lands at the start of the new line");
+
+        // The new logical line is navigable: Ctrl-A and Ctrl-E stay within it.
+        app.input.cursor = 4;
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert_eq!(app.input.cursor, 3);
+        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        assert_eq!(app.input.cursor, 4);
     }
 
     #[test]

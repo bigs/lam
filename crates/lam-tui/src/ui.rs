@@ -367,11 +367,11 @@ fn dim_ambient(style: Style, dimmed: bool) -> Style {
     }
 }
 
+/// Whether an entry's body is rendered as Markdown. User prompts are plain
+/// text: they render verbatim so explicit newlines (Ctrl+J) survive, while
+/// assistant prose and reasoning keep Markdown styling.
 fn renders_markdown(kind: EntryKind) -> bool {
-    matches!(
-        kind,
-        EntryKind::User | EntryKind::Assistant | EntryKind::Reasoning
-    )
+    matches!(kind, EntryKind::Assistant | EntryKind::Reasoning)
 }
 
 fn markdown_lines(markdown: &str, width: usize, base: Style) -> Vec<Line<'static>> {
@@ -1032,6 +1032,46 @@ mod tests {
     }
 
     #[test]
+    fn expanded_user_rows_preserve_explicit_newlines() {
+        let mut app = test_app(vec![HistoryEntry {
+            kind: HistoryKind::User,
+            title: "you".to_owned(),
+            body: "Test\nAgain\nHere we go".to_owned(),
+        }]);
+        app.entries[0].expanded = true;
+        let backend = TestBackend::new(60, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let rows = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>()
+            .chars()
+            .collect::<Vec<_>>()
+            .chunks(60)
+            .map(|row| row.iter().collect::<String>())
+            .filter(|row| !row.trim().is_empty())
+            .collect::<Vec<_>>();
+        let test_row = rows.iter().position(|row| row.contains("Test")).unwrap();
+        let again_row = rows.iter().position(|row| row.contains("Again")).unwrap();
+        let here_row = rows
+            .iter()
+            .position(|row| row.contains("Here we go"))
+            .unwrap();
+        assert!(
+            test_row < again_row && again_row < here_row,
+            "each Ctrl+J line should render on its own row: {rows:?}"
+        );
+        assert!(
+            rows.iter().all(|row| !row.contains("Test Again")),
+            "soft breaks must not be collapsed into spaces: {rows:?}"
+        );
+    }
+
+    #[test]
     fn elides_to_the_requested_width() {
         assert_eq!(elide_end("abcdefgh", 5), "abcd…");
     }
@@ -1112,8 +1152,8 @@ mod tests {
     }
 
     #[test]
-    fn markdown_is_scoped_to_conversational_text_and_reasoning() {
-        assert!(renders_markdown(EntryKind::User));
+    fn markdown_is_scoped_to_assistant_and_reasoning() {
+        assert!(!renders_markdown(EntryKind::User));
         assert!(renders_markdown(EntryKind::Assistant));
         assert!(renders_markdown(EntryKind::Reasoning));
         assert!(!renders_markdown(EntryKind::ToolCall));
