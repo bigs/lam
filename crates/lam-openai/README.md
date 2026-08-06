@@ -46,6 +46,22 @@ The adapter always sends `store: false`, requests encrypted reasoning content,
 declares only the `eval` function, and manually replays complete native output
 items. Runtime-owned fields cannot be overridden through `extra_body`.
 
+To request provider-visible reasoning summaries, pass them through `extra_body`
+as a sibling of effort:
+
+```rust,ignore
+let model = Responses::builder("gpt-5.6-luna")
+    .api_key(std::env::var("OPENAI_API_KEY")?)
+    .extra_body(serde_json::json!({
+        "reasoning": { "effort": "high", "summary": "auto" }
+    }))
+    .build()?;
+```
+
+The codec preserves unknown `reasoning` fields and projects both reasoning
+`content` and `summary` text as `ModelDelta::Reasoning`. Summary support is
+model/provider-dependent; leave it unset for endpoints that reject the field.
+
 ## Compatible Chat Completions
 
 ```rust,ignore

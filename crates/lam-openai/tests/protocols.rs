@@ -33,7 +33,7 @@ fn responses_request_is_stateless_and_replays_encrypted_reasoning_unchanged() {
             "parallel_tool_calls": true,
             "instructions": "ignored",
             "include": ["message.output_text.logprobs"],
-            "reasoning": { "effort": "high" }
+            "reasoning": { "effort": "high", "summary": "auto" }
         }))
         .build_parts()
         .expect("valid adapter");
@@ -117,6 +117,7 @@ fn responses_request_is_stateless_and_replays_encrypted_reasoning_unchanged() {
         120
     );
     assert_eq!(body["reasoning"]["effort"], "high");
+    assert_eq!(body["reasoning"]["summary"], "auto");
     assert!(
         body["include"]
             .as_array()
@@ -1256,6 +1257,93 @@ async fn responses_provider_sends_store_false_and_returns_completed_native_respo
                 arguments: "{\"source\":\"1 + 1\"}".to_owned(),
             }),
             ModelDelta::Text("hello".to_owned()),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn responses_provider_streams_reasoning_summary_deltas() {
+    let completed = json!({
+        "id": "resp_summary",
+        "object": "response",
+        "status": "completed",
+        "model": "gpt-test",
+        "output": [{
+            "type": "reasoning",
+            "id": "rs_1",
+            "summary": [{ "type": "summary_text", "text": "Inspect then edit." }],
+            "encrypted_content": "opaque"
+        }, {
+            "type": "message",
+            "role": "assistant",
+            "content": [{ "type": "output_text", "text": "done" }]
+        }]
+    });
+    let stream = format!(
+        "event: response.reasoning_summary_part.added\ndata: {}\n\nevent: response.reasoning_summary_text.delta\ndata: {}\n\nevent: response.reasoning_summary_text.delta\ndata: {}\n\nevent: response.reasoning_summary_text.done\ndata: {}\n\nevent: response.completed\ndata: {}\n\n",
+        json!({
+            "type": "response.reasoning_summary_part.added",
+            "item_id": "rs_1",
+            "summary_index": 0
+        }),
+        json!({
+            "type": "response.reasoning_summary_text.delta",
+            "item_id": "rs_1",
+            "summary_index": 0,
+            "delta": "Inspect "
+        }),
+        json!({
+            "type": "response.reasoning_summary_text.delta",
+            "item_id": "rs_1",
+            "summary_index": 0,
+            "delta": "then edit."
+        }),
+        json!({
+            "type": "response.reasoning_summary_text.done",
+            "item_id": "rs_1",
+            "summary_index": 0,
+            "text": "Inspect then edit."
+        }),
+        json!({ "type": "response.completed", "response": completed })
+    );
+    let server = MockServer::start("text/event-stream", stream);
+    let (provider, codec) = Responses::builder("gpt-test")
+        .api_key("test-key")
+        .base_url(format!("{}/v1", server.origin))
+        .extra_body(json!({ "reasoning": { "effort": "low", "summary": "auto" } }))
+        .build_parts()
+        .expect("valid adapter");
+    let request = codec
+        .encode_request(
+            &[user_message("hello")],
+            &ModelRequestConfig::agent(&OutputContract::Text, "runtime instructions"),
+        )
+        .expect("valid request");
+    assert_eq!(request.value["body"]["reasoning"]["summary"], "auto");
+    let deltas = Arc::new(Mutex::new(Vec::new()));
+    let captured_deltas = Arc::clone(&deltas);
+    let response = provider
+        .invoke(
+            request,
+            ModelEventSink::new(move |delta| captured_deltas.lock().unwrap().push(delta)),
+        )
+        .await
+        .expect("successful response");
+    let captured = server.finish();
+    assert_eq!(captured.body["reasoning"]["summary"], "auto");
+    assert_eq!(response.value["response"], completed);
+    assert_eq!(
+        *deltas.lock().unwrap(),
+        vec![
+            ModelDelta::Reasoning("Inspect ".to_owned()),
+            ModelDelta::Reasoning("then edit.".to_owned()),
+        ]
+    );
+    assert_eq!(
+        codec.project_response(&response).expect("valid projection").display,
+        [
+            ModelDelta::Reasoning("Inspect then edit.".to_owned()),
+            ModelDelta::Text("done".to_owned()),
         ]
     );
 }

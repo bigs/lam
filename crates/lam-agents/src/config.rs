@@ -313,6 +313,11 @@ where
     P: ModelProvider,
     C: ModelCodec,
 {
+    // Match the root actor convention (`provider/model`) so the TUI and
+    // journals can resolve a child to a configured ModelChoice. The Lam
+    // builder default id is the opaque string "default", which is useless
+    // once more than one model exists in a session.
+    let model_id = target.to_string();
     ModelRegistration {
         target,
         factory: Arc::new(move |spec| {
@@ -327,6 +332,7 @@ where
                 capture_console,
             } = spec;
             let mut builder = Lam::builder(model.clone())
+                .initial_model_id(model_id.clone())
                 .state_store(store)
                 .capture_console(capture_console);
             for namespace in namespaces {

@@ -90,7 +90,16 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .current_agent_model()
         .and_then(|id| app.models.iter().find(|model| model.registry_id == id))
         .map_or_else(
-            || app.selected_model().display_name.as_str(),
+            || {
+                // Prefer the viewed agent's raw model id when it is not in
+                // the local picker list. Never show root's selection while
+                // looking at another agent.
+                app.current_agent_model().unwrap_or(if app.current_agent == "/root" {
+                    app.selected_model().display_name.as_str()
+                } else {
+                    "—"
+                })
+            },
             |model| model.display_name.as_str(),
         );
     let effort = app.current_agent_effort().unwrap_or("—");
@@ -1104,7 +1113,7 @@ mod tests {
         App, CellPos, CopyRow, EntryKind, Focus, SessionChoice, SessionView, TextSelection,
     };
     use crate::config::ModelChoice;
-    use crate::runtime::{AgentHistory, CommittedRow, HistoryEntry, HistoryKind};
+    use crate::runtime::{AgentHistory, CommittedRow, FoldOutcome, HistoryEntry, HistoryKind};
 
     fn test_app(history: Vec<HistoryEntry>) -> App {
         let history = history
@@ -1482,6 +1491,13 @@ mod tests {
             address: ActorAddress::new("/root/worker").unwrap(),
             parent: Some(ActorAddress::new("/root").unwrap()),
         });
+        app.apply_fold(
+            "/root/worker",
+            FoldOutcome {
+                selected_model: Some("fireworks/deepseek-v4-flash".to_owned()),
+                ..FoldOutcome::default()
+            },
+        );
         app.input.text = "/agents /root/worker".to_owned();
         app.input.cursor = app.input.char_count();
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -1497,6 +1513,9 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("/root/worker"));
+        // Child model must not fall back to root's GPT-5 display name.
+        assert!(rendered.contains("fireworks/deepseek-v4-flash"));
+        assert!(!rendered.contains("GPT-5"));
     }
 
     #[test]

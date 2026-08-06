@@ -380,6 +380,24 @@ efforts = ["low", "medium", "high"]
         assert!(model_ids.contains(&("synthetic", "syn:small:vision")));
         assert!(model_ids.contains(&("xai", "grok-4.5")));
         assert!(model_ids.contains(&("xai", "grok-build-0.1")));
+        let openai = config
+            .providers
+            .iter()
+            .find(|provider| provider.name == "openai")
+            .expect("example configures openai");
+        for model in &openai.models {
+            let summary = model
+                .extra_body
+                .get("reasoning")
+                .and_then(|value| value.get("summary"))
+                .and_then(|value| value.as_str());
+            assert_eq!(
+                summary,
+                Some("auto"),
+                "openai model {} should opt into reasoning summaries",
+                model.id
+            );
+        }
         assert_eq!(
             config
                 .providers

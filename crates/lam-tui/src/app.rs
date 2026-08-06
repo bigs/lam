@@ -1521,6 +1521,9 @@ impl App {
             if let Some(context_tokens) = context_tokens {
                 app.context_tokens = Some(context_tokens);
             }
+            if let Some(model) = outcome.selected_model {
+                app.current_model = Some(model);
+            }
             let committed_runs = outcome
                 .rows
                 .iter()
@@ -4753,6 +4756,58 @@ mod tests {
         assert!(command.is_none());
         assert_eq!(app.current_agent, "/root/worker");
         assert!(app.busy);
+    }
+
+    #[test]
+    fn switching_agents_tracks_the_child_model_in_the_header() {
+        let mut app = app();
+        app.models.push(ModelChoice {
+            registry_id: "fireworks/deepseek-v4-flash".to_owned(),
+            provider: "fireworks".to_owned(),
+            model: "deepseek-v4-flash".to_owned(),
+            display_name: "DeepSeek V4 Flash".to_owned(),
+            context_window: 128_000,
+            efforts: vec!["none".to_owned(), "high".to_owned()],
+        });
+        app.selected_efforts.push(1);
+
+        app.apply_agent_event(AgentSystemEvent::Hosted {
+            address: ActorAddress::new("/root/worker").unwrap(),
+            parent: Some(ActorAddress::new("/root").unwrap()),
+        });
+        app.apply_fold(
+            "/root/worker",
+            FoldOutcome {
+                selected_model: Some("fireworks/deepseek-v4-flash".to_owned()),
+                ..FoldOutcome::default()
+            },
+        );
+
+        app.input.text = "/agents /root/worker".to_owned();
+        app.input.cursor = app.input.char_count();
+        assert!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .is_none()
+        );
+
+        assert_eq!(app.current_agent, "/root/worker");
+        assert_eq!(
+            app.current_agent_model(),
+            Some("fireworks/deepseek-v4-flash")
+        );
+        assert!(
+            app.agent_detail("/root/worker")
+                .contains("fireworks/deepseek-v4-flash")
+        );
+
+        // Root keeps its own selected model.
+        app.input.text = "/agents /root".to_owned();
+        app.input.cursor = app.input.char_count();
+        assert!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .is_none()
+        );
+        assert_eq!(app.current_agent_model(), Some("openai/gpt-5"));
     }
 
     #[test]

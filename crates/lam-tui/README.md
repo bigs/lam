@@ -92,6 +92,27 @@ listed value. By default, Responses providers receive it at
 `effort_path = "reasoning.effort"`, when an OpenAI-compatible provider uses a
 different request shape. Do not also put the effort field in `extra_body`.
 
+For OpenAI Responses models that support it, request provider-visible reasoning
+summaries with a sibling `extra_body` field. Lam's `/effort` control still owns
+`reasoning.effort` and injects the selected value beside this setting:
+
+```toml
+[[providers.models]]
+id = "gpt-5.6-luna"
+name = "GPT-5.6 Luna"
+context_window = 1050000
+efforts = ["none", "low", "medium", "high", "xhigh", "max"]
+
+[providers.models.extra_body.reasoning]
+summary = "auto"
+```
+
+`summary` may also be `concise` or `detailed` when the endpoint accepts those
+modes. Leave the field unset for providers/models that reject it (including
+most custom Responses proxies). Completed summaries are durable in the native
+response payload and reappear after restart; partial streamed summary text is
+ephemeral like other token deltas.
+
 ## Sessions
 
 Lam keeps durable, directory-scoped sessions under `~/.lam/sessions`. The

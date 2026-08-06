@@ -30,7 +30,7 @@ async fn openai_responses_smoke() {
         .api_key(required_env("OPENAI_API_KEY"))
         .extra_body(json!({
             "max_output_tokens": 512,
-            "reasoning": { "effort": "low" }
+            "reasoning": { "effort": "low", "summary": "auto" }
         }))
         .build()
         .expect("valid OpenAI model configuration");

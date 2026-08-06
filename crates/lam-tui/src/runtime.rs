@@ -9,7 +9,8 @@ use lam::{
     ContextTransition, DeliveryMode, EncodedPayload, InterruptedEvalOutcome, IsolateState,
     JournalStore, Lam, LamBuilder, MemStore, MessageId, MessageSource, Model, ModelCodec,
     ModelDelta, ModelDescriptor, ModelDirective, ModelRequestConfig, ModelResponseMetadata,
-    ModelResponseProjection, ProjectedContextEntry, Revision, RunProgress, SYSTEM_NOTICE_CODEC_ID,
+    ModelResponseProjection, ModelSelection, ProjectedContextEntry, Revision, RunProgress,
+    SYSTEM_NOTICE_CODEC_ID,
     SystemNotice,
 };
 use lam_agents::{Agent, AgentSystem, AgentSystemEvents, SubagentConfig, SubagentConfigBuilder};
@@ -198,6 +199,9 @@ pub(crate) struct FoldOutcome {
     pub(crate) dead_runs: Vec<String>,
     /// Whether the fold ended on an interruption boundary.
     pub(crate) interrupted: bool,
+    /// Registry-style model id selected by this actor after the fold, when
+    /// the projector has established one.
+    pub(crate) selected_model: Option<String>,
 }
 
 struct Projector {
@@ -1053,6 +1057,7 @@ async fn fold_projector(
             ContextTransition::Interrupted { .. }
         )
     });
+    outcome.selected_model = state.selected_model().map(selected_model_label);
     projector.state = Some(state);
     Ok(outcome)
 }
@@ -1173,7 +1178,7 @@ fn agent_history(
             .map(|separator| address[..separator].to_owned()),
         model: state
             .selected_model()
-            .map(|selection| selection.model_id.as_str().to_owned()),
+            .map(selected_model_label),
         status: if active && restored_child {
             "Interrupted".to_owned()
         } else if active {
@@ -1188,6 +1193,24 @@ fn agent_history(
         run_completed: !active,
         context_tokens,
         history,
+    }
+}
+
+/// Stable label for the model an actor has selected.
+
+/// Child actors historically journaled the Lam builder default id `default`.
+/// Prefer the durable descriptor's `provider/model` in that case so the TUI
+/// can match a configured ModelChoice and show the right header label.
+fn selected_model_label(selection: &ModelSelection) -> String {
+    let id = selection.model_id.as_str();
+    if id == "default" {
+        format!(
+            "{}/{}",
+            selection.descriptor.provider(),
+            selection.descriptor.model()
+        )
+    } else {
+        id.to_owned()
     }
 }
 
