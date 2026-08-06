@@ -6,11 +6,37 @@ use crate::error::EditError;
 use crate::patch::PatchPlan;
 use crate::path::{CodingWorkspace, PathFailure};
 
+/// Multi-line text accepted as either one string or an array of lines.
+///
+/// Models often embed patch bodies in TypeScript template literals. Any
+/// backtick inside that body (Markdown code spans, code samples, etc.) closes
+/// the template early and fails transpile. Passing an array of ordinary
+/// double-quoted strings avoids that entirely.
+#[derive(Clone, Debug, JsonSchema, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum TextBody {
+    /// Complete text, including embedded newlines.
+    Text(String),
+    /// Individual lines joined with `\n` (no trailing newline is added).
+    Lines(Vec<String>),
+}
+
+impl TextBody {
+    fn into_string(self) -> String {
+        match self {
+            Self::Text(text) => text,
+            Self::Lines(lines) => lines.join("\n"),
+        }
+    }
+}
+
 /// Input accepted by `lam.edit.apply`.
 #[derive(Clone, Debug, JsonSchema, Deserialize)]
 pub(crate) struct ApplyPatchRequest {
-    /// Complete `*** Begin Patch` file-oriented patch.
-    pub patch: String,
+    /// Complete `*** Begin Patch` file-oriented patch as a string, or as an
+    /// array of lines. Prefer the array form whenever the patch body contains
+    /// backticks or other characters that break TypeScript template literals.
+    pub patch: TextBody,
 }
 
 /// One committed file operation.
@@ -53,8 +79,9 @@ pub(crate) struct ApplyPatchOutput {
 pub(crate) struct WriteRequest {
     /// Relative workspace path or an allowed absolute path.
     pub path: String,
-    /// Complete UTF-8 file contents.
-    pub content: String,
+    /// Complete UTF-8 file contents as a string, or as an array of lines.
+    /// Prefer the array form when contents contain backticks.
+    pub content: TextBody,
 }
 
 /// Successful result from `lam.edit.write`.
@@ -80,12 +107,13 @@ pub(crate) fn edit_namespace(workspace: CodingWorkspace) -> Namespace {
     )
     .function(
         "apply",
-        "Apply a file-oriented patch enclosed by `*** Begin Patch` and `*** End Patch`. Use explicit Add File, Delete File, or Update File sections; updates may include `*** Move to`, and hunks begin with `@@` and space, `-`, or `+` prefixes. Context and removal lines match whole lines exactly: a substring within a line does not match. Paths must be relative. Every path and hunk is validated before the first mutation.",
+        "Apply a file-oriented patch enclosed by *** Begin Patch and *** End Patch. Use explicit Add File, Delete File, or Update File sections; updates may include *** Move to, and hunks begin with @@ and space, -, or + prefixes. Context and removal lines match whole lines exactly: a substring within a line does not match. Paths must be relative. Every path and hunk is validated before the first mutation. Pass patch as a string or, when the body contains backticks, as an array of lines so TypeScript template literals are not required.",
         move |_context, request: ApplyPatchRequest| {
             let workspace = apply_workspace.clone();
             async move {
                 let _mutation = workspace.mutation().await;
-                let plan = PatchPlan::prepare(&workspace, &request.patch).await?;
+                let patch = request.patch.into_string();
+                let plan = PatchPlan::prepare(&workspace, &patch).await?;
                 let changes = plan.commit().await?;
                 Ok::<_, EditError>(ApplyPatchOutput { changes })
             }
@@ -93,7 +121,7 @@ pub(crate) fn edit_namespace(workspace: CodingWorkspace) -> Namespace {
     )
     .function(
         "write",
-        "Create or completely rewrite one UTF-8 text file, creating missing parent directories. Prefer lam.edit.apply for targeted changes to an existing file.",
+        "Create or completely rewrite one UTF-8 text file, creating missing parent directories. Prefer lam.edit.apply for targeted changes to an existing file. content may be a string or an array of lines; prefer the array form when contents contain backticks.",
         move |_context, request: WriteRequest| {
             let workspace = write_workspace.clone();
             async move { write_file(&workspace, request).await }
@@ -118,12 +146,13 @@ async fn write_file(
             .await
             .map_err(|error| edit_io("create parent directories for", &request.path, error))?;
     }
-    tokio::fs::write(&path, request.content.as_bytes())
+    let content = request.content.into_string();
+    tokio::fs::write(&path, content.as_bytes())
         .await
         .map_err(|error| edit_io("write", &request.path, error))?;
     Ok(WriteOutput {
         path: request.path,
-        bytes_written: request.content.len(),
+        bytes_written: content.len(),
         created,
     })
 }

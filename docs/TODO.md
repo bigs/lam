@@ -55,7 +55,6 @@
 
 ## Tooling / eval harness
 
-- [ ] The eval harness rejects source whose template-literal patch strings contain backtick characters (e.g. Markdown code spans in doc comments): the transpiler parses the closing backtick as the end of the string and chokes on the remainder.
-  - Fresh failure mode (hit repeatedly while adding bincode checkpoints): any backtick inside a lam.edit.apply patch source, even in a plain doc comment, aborts the whole eval with SyntaxError: Expected ',', got '<token after the backtick>' pointing into the generated lam/cell-<n>.ts. Doc comments using code spans are the usual culprit; reword without backticks.
-  - Workaround in use: keep patch and heredoc content backtick-free (plain doc wording, escaped backticks, or single-line strings with \n escapes).
-  - Consider a follow-up where the harness accepts backticks inside template literals, or a helper that writes patch text to a file instead of embedding it in source.
+- [x] The eval harness rejects source whose template-literal patch strings contain backtick characters (e.g. Markdown code spans in doc comments): the transpiler parses the closing backtick as the end of the string and chokes on the remainder.
+ - Fixed: `lam.edit.apply` / `lam.edit.write` accept `patch` / `content` as either a string or an array of lines. Models should pass line arrays when bodies contain backticks so TypeScript template literals are unnecessary.
+ - Historical failure: any backtick inside a template-literal patch aborted eval with SyntaxError pointing into generated `lam/cell-<n>.ts`.

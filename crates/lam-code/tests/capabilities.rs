@@ -344,6 +344,68 @@ async fn write_creates_parents_and_complete_rewrites() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn edit_accepts_line_arrays_so_backticks_do_not_break_eval_source() {
+    let root = tempfile::tempdir().expect("temporary workspace");
+    std::fs::write(
+        root.path().join("doc.rs"),
+        "/// before\n/// uses lam.edit.apply.\n/// after\n",
+    )
+    .expect("write fixture");
+    let pack = CodingPack::builder(root.path())
+        .build()
+        .expect("coding pack");
+    let mut isolate = isolate(&pack).await;
+
+    // Line arrays let models embed backticks without TypeScript template literals.
+    // Double-quoted strings accept unescaped backticks, which is the whole point.
+    let source = r#"
+await lam.edit.apply({
+  patch: [
+    "*** Begin Patch",
+    "*** Update File: doc.rs",
+    "@@",
+    " /// before",
+    "-/// uses lam.edit.apply.",
+    "+/// uses `lam.edit.apply`.",
+    " /// after",
+    "*** End Patch",
+  ],
+});
+"#;
+    let applied = isolate
+        .eval(source)
+        .await
+        .expect("apply patch with backticks via line array");
+    assert_eq!(
+        json_result(applied.result),
+        json!({ "changes": [{ "kind": "updated", "path": "doc.rs" }] })
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("doc.rs")).expect("patched file"),
+        "/// before\n/// uses `lam.edit.apply`.\n/// after\n"
+    );
+
+    let written = isolate
+        .eval(
+            r##"await lam.edit.write({
+  path: "notes.md",
+  content: [
+    "# Title",
+    "See `lam.edit.apply` for patches.",
+    "",
+  ],
+})"##,
+        )
+        .await
+        .expect("write content with backticks via line array");
+    assert_eq!(json_result(written.result)["created"], true);
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("notes.md")).expect("written notes"),
+        "# Title\nSee `lam.edit.apply` for patches.\n"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn shell_returns_normal_failures_and_spilled_output_is_numbered_by_fs_read() {
     let root = tempfile::tempdir().expect("temporary workspace");
     let pack = CodingPack::builder(root.path())

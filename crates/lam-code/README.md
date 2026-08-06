@@ -63,6 +63,11 @@ leading coding agents. It supports add, update, move, and delete operations.
 Every path and hunk is parsed and validated against the original filesystem
 before the first mutation; overlapping parent/child targets are rejected.
 
+Both `patch` and `lam.edit.write`'s `content` accept either a single string or
+an array of lines (joined with `\n`). Prefer the array form whenever the text
+contains backticks: models often put multi-line bodies in TypeScript template
+literals, and a nested `` ` `` closes the string early and fails transpile.
+
 If the underlying filesystem changes or fails during commit, the result reports
 a partial commit explicitly rather than claiming rollback. The filesystem is
 not transactional.
