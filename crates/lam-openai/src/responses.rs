@@ -52,6 +52,7 @@ impl Responses {
     #[must_use]
     pub fn builder(model: impl Into<String>) -> ResponsesBuilder {
         ResponsesBuilder {
+            supports_max_output_tokens: true,
             shared: SharedBuilder::new(model),
         }
     }
@@ -59,6 +60,10 @@ impl Responses {
 
 /// Configures an OpenAI Responses provider and its lossless context codec.
 pub struct ResponsesBuilder {
+    /// When false, omit `max_output_tokens` from request bodies. The ChatGPT
+    /// Codex backend rejects that Platform Responses field with HTTP 400.
+    supports_max_output_tokens: bool,
+
     shared: SharedBuilder,
 }
 
@@ -111,6 +116,17 @@ impl ResponsesBuilder {
     #[must_use]
     pub fn extra_body(mut self, extra_body: Value) -> Self {
         self.shared = self.shared.extra_body(extra_body);
+        self
+    }
+
+    /// Controls whether Lam may emit `max_output_tokens`.
+    ///
+    /// Platform Responses accepts the field. The ChatGPT Codex backend does
+    /// not; compaction summaries and any `extra_body` override must omit it
+    /// there or the endpoint returns HTTP 400.
+    #[must_use]
+    pub fn supports_max_output_tokens(mut self, supported: bool) -> Self {
+        self.supports_max_output_tokens = supported;
         self
     }
 
@@ -172,6 +188,7 @@ impl ResponsesBuilder {
                 model,
                 extra_body,
                 pricing,
+                supports_max_output_tokens: self.supports_max_output_tokens,
             },
         ))
     }
@@ -378,6 +395,7 @@ pub struct ResponsesCodec {
     model: String,
     extra_body: Map<String, Value>,
     pricing: Option<ModelPricing>,
+    supports_max_output_tokens: bool,
 }
 
 impl ResponsesCodec {
@@ -527,11 +545,17 @@ impl ModelCodec for ResponsesCodec {
             body.insert("tools".to_owned(), Value::Array(vec![eval_tool()]));
             body.insert("tool_choice".to_owned(), Value::String("auto".to_owned()));
         }
-        if let Some(max_output_tokens) = config.max_output_tokens {
-            body.insert(
-                "max_output_tokens".to_owned(),
-                Value::Number(max_output_tokens.into()),
-            );
+        if self.supports_max_output_tokens {
+            if let Some(max_output_tokens) = config.max_output_tokens {
+                body.insert(
+                    "max_output_tokens".to_owned(),
+                    Value::Number(max_output_tokens.into()),
+                );
+            }
+        } else {
+            // Codex and other strict backends reject the Platform field, even
+            // when it arrives only via extra_body.
+            body.remove("max_output_tokens");
         }
         if let OutputContract::Structured { schema } = config.output {
             let mut text = body

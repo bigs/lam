@@ -1476,6 +1476,10 @@ async fn build_model(
                 .auth_source(auth)
                 .default_headers(headers)
                 .extra_body(extra_body)
+                // ChatGPT Codex rejects Platform Responses `max_output_tokens`
+                // (HTTP 400 Unsupported parameter), including during summary
+                // compaction. Official codex-cli never sends the field.
+                .supports_max_output_tokens(false)
                 .build_parts()
                 .map_err(|error| RuntimeError::Model(error.to_string()))?;
             let model = Model::new(

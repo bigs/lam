@@ -418,6 +418,43 @@ fn responses_compaction_replays_only_the_durable_materialized_view() {
     assert_eq!(summary_request.value["body"]["max_output_tokens"], 512);
 }
 
+#[test]
+fn responses_can_omit_max_output_tokens_for_codex_backends() {
+    let (_, codec) = Responses::builder("gpt-test")
+        .api_key("test-key")
+        .extra_body(json!({ "max_output_tokens": 99 }))
+        .supports_max_output_tokens(false)
+        .build_parts()
+        .expect("valid adapter");
+
+    let summary_request = codec
+        .encode_request(
+            &[user_message("history")],
+            &ModelRequestConfig::compaction("summarize", 512),
+        )
+        .unwrap();
+    assert!(summary_request.value["body"].get("tools").is_none());
+    assert!(
+        summary_request.value["body"]
+            .get("max_output_tokens")
+            .is_none(),
+        "Codex-compatible Responses backends reject max_output_tokens"
+    );
+
+    let agent_request = codec
+        .encode_request(
+            &[user_message("hello")],
+            &ModelRequestConfig::agent(&OutputContract::Text, "runtime"),
+        )
+        .unwrap();
+    assert!(
+        agent_request.value["body"]
+            .get("max_output_tokens")
+            .is_none(),
+        "extra_body max_output_tokens must also be stripped"
+    );
+}
+
 #[tokio::test]
 async fn responses_native_compactor_preserves_the_canonical_checkpoint() {
     let native = json!({
