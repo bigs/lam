@@ -62,7 +62,7 @@ protocol invariants still override conflicting keys.
 ### Codex subscription (`openai-codex`)
 
 Use a Codex-enabled ChatGPT subscription without an OpenAI Platform API key.
-Sign in once through the official Codex CLI, then start Lam:
+Sign in once, then start Lam:
 
 ```bash
 lam-agent login openai
@@ -78,9 +78,19 @@ are stored in the durable session and return when that session resumes.
 Lam reads the shared Codex login cache from `$CODEX_HOME/auth.json`, or
 `~/.codex/auth.json` when `CODEX_HOME` is not set. It refreshes an expiring
 access token and writes the updated tokens back with user-only permissions.
-The official `codex` executable must be available. Lam reads `codex --version`
-for the client compatibility header required by subscription models. Upgrade
-that executable when a model requires a newer Codex version. `lam-agent logout
+
+`lam-agent login openai` runs the OAuth2 authorization-code + PKCE flow directly
+against OpenAI — no `codex` executable is required. It prints an authorization
+URL, opens your browser unless `--no-browser` is given, and waits for the
+redirect on a local loopback listener before exchanging the code for tokens.
+If a valid login already exists in the shared cache, the command refuses to
+overwrite it and tells you to run `lam-agent logout openai` first; pass
+`--force` to replace it anyway.
+
+Subscription model routing is gated on the compatibility identity of the
+official Codex CLI, so Lam sends the hardcoded `CODEX_CLIENT_VERSION`
+(crates/lam-tui/src/codex.rs) in the `version` and `User-Agent` headers; bump
+that constant when a model requires a newer Codex version. `lam-agent logout
 openai` removes the shared login, so it also signs the official Codex CLI out.
 
 Do not set `api_key` or `api_key_env` on an `openai-codex` provider. Available

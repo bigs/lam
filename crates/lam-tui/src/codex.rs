@@ -1,28 +1,48 @@
 //! ChatGPT subscription authentication through the official Codex login cache.
 
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::future::Future;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::process::Command;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use lam_openai::{AuthSource, SharedAuthSource, bearer_header};
+#[cfg(unix)]
+use nix::fcntl::{Flock, FlockArg};
 use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
+use ring::digest::{SHA256, digest};
+use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use thiserror::Error;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
 use lam_openai::ProviderError;
 
 pub(crate) const CODEX_BACKEND_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
-const REFRESH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+/// Hardcoded mirror of the official codex-cli version whose compatibility
+/// identity the ChatGPT backend gates subscription model routing on.
+/// lam-agent no longer shells out to an installed `codex` binary, so this
+/// constant must be bumped manually whenever the endpoint starts rejecting it
+/// (see docs/TODO.md).
+pub(crate) const CODEX_CLIENT_VERSION: &str = "0.146.0";
+/// OAuth2 authorization-code + PKCE login endpoints, mirroring the official
+/// Codex CLI's flow. The loopback redirect port is ephemeral.
+const OAUTH_AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
+const OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+const OAUTH_SCOPE: &str = "openid profile email offline_access";
+/// Audience the official Codex CLI requests on the authorize URL. It may be
+/// required by the auth server; kept here so a live check can adjust it.
+const OAUTH_AUDIENCE: &str = "https://api.openai.com/v1";
+/// How long `lam-agent login openai` waits for the browser redirect.
+const LOGIN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const REFRESH_SKEW: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -87,6 +107,36 @@ struct RefreshResponse {
     refresh_token: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct TokenExchangeRequest<'a> {
+    grant_type: &'static str,
+    client_id: &'a str,
+    code: &'a str,
+    redirect_uri: &'a str,
+    code_verifier: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+struct TokenExchangeResponse {
+    access_token: Option<String>,
+    refresh_token: Option<String>,
+    id_token: Option<String>,
+    error: Option<String>,
+    error_description: Option<String>,
+}
+
+/// Authorization code extracted from the browser redirect.
+struct OAuthCode {
+    code: String,
+}
+
+/// Injectable OAuth endpoints so the login flow can be tested against local
+/// listeners.
+struct OAuthEndpoints {
+    authorize_base: String,
+    token_url: String,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct CodexCredentials {
     access_token: String,
@@ -97,6 +147,21 @@ pub(crate) struct CodexCredentials {
 #[derive(Clone, Debug)]
 pub(crate) struct CodexCredentialStore {
     path: PathBuf,
+}
+
+/// Exclusive inter-process lock for Codex credential read/refresh/write.
+///
+/// Held while reloading from disk and optionally refreshing so concurrent
+/// `lam-agent` processes do not race the rotating refresh token. The sidecar
+/// lock file lives next to the credential cache; the official Codex CLI does
+/// not take part in this protocol, but it rewrites the cache atomically, so
+/// cross-tool corruption is not possible either.
+#[derive(Debug)]
+pub(crate) struct CredentialLock {
+    #[cfg(unix)]
+    _guard: Flock<fs::File>,
+    #[cfg(not(unix))]
+    _file: fs::File,
 }
 
 impl CodexCredentialStore {
@@ -118,6 +183,51 @@ impl CodexCredentialStore {
 
     pub(crate) fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Path of the sidecar lock file used for cross-process refresh
+    /// coordination.
+    fn lock_path(&self) -> PathBuf {
+        self.path.with_extension("lock")
+    }
+
+    /// Acquire an exclusive lock for credential reload/refresh, mirroring the
+    /// SuperGrok credential store.
+    ///
+    /// On Unix this uses `flock(2)`. On other platforms the lock is
+    /// best-effort (open-only) so single-process use still works.
+    pub(crate) fn lock(&self) -> Result<CredentialLock, CodexAuthError> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent).map_err(|source| CodexAuthError::Write {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+        let path = self.lock_path();
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|source| CodexAuthError::Write {
+                path: path.clone(),
+                source,
+            })?;
+        #[cfg(unix)]
+        {
+            let guard = Flock::lock(file, FlockArg::LockExclusive).map_err(|(_, source)| {
+                CodexAuthError::Write {
+                    path,
+                    source: source.into(),
+                }
+            })?;
+            Ok(CredentialLock { _guard: guard })
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(CredentialLock { _file: file })
+        }
     }
 
     /// Whether the official Codex CLI has a credential cache that Lam can use.
@@ -144,37 +254,62 @@ impl CodexCredentialStore {
             path: self.path.clone(),
             source,
         })?;
+        // The exclusive lock serializes Lam refreshes, but the official Codex
+        // CLI (or a crashed earlier write) may race or litter this name.
         let temp = self
             .path
             .with_extension(format!("json.lam.{}.tmp", std::process::id()));
-        {
-            let mut output = fs::File::create(&temp).map_err(|source| CodexAuthError::Write {
-                path: temp.clone(),
-                source,
-            })?;
-            output
-                .write_all(&body)
-                .and_then(|()| output.sync_all())
-                .map_err(|source| CodexAuthError::Write {
-                    path: temp.clone(),
-                    source,
-                })?;
-            #[cfg(unix)]
+        let result = (|| {
             {
-                use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(&temp, fs::Permissions::from_mode(0o600)).map_err(
-                    |source| CodexAuthError::Write {
+                let mut output =
+                    fs::File::create(&temp).map_err(|source| CodexAuthError::Write {
                         path: temp.clone(),
                         source,
-                    },
-                )?;
+                    })?;
+                output
+                    .write_all(&body)
+                    .and_then(|()| output.sync_all())
+                    .map_err(|source| CodexAuthError::Write {
+                        path: temp.clone(),
+                        source,
+                    })?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(&temp, fs::Permissions::from_mode(0o600)).map_err(
+                        |source| CodexAuthError::Write {
+                            path: temp.clone(),
+                            source,
+                        },
+                    )?;
+                }
             }
+            fs::rename(&temp, &self.path).map_err(|source| CodexAuthError::Write {
+                path: self.path.clone(),
+                source,
+            })
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temp);
         }
-        fs::rename(&temp, &self.path).map_err(|source| CodexAuthError::Write {
-            path: self.path.clone(),
-            source,
-        })?;
-        Ok(())
+        result
+    }
+
+    /// Deletes the credential cache and the sidecar lock file.
+    ///
+    /// Because the cache is shared with the official Codex CLI, this also signs
+    /// that tool out. The lock file is disposable coordination state (recreated
+    /// on demand), so its removal is best-effort.
+    pub(crate) fn remove(&self) -> Result<(), CodexAuthError> {
+        let _ = fs::remove_file(self.lock_path());
+        match fs::remove_file(&self.path) {
+            Ok(()) => Ok(()),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(source) => Err(CodexAuthError::Write {
+                path: self.path.clone(),
+                source,
+            }),
+        }
     }
 }
 
@@ -188,12 +323,14 @@ pub(crate) struct CodexAuthSession {
 
 impl CodexAuthSession {
     pub(crate) fn new(store: CodexCredentialStore) -> Self {
-        Self::with_refresh_url(store, REFRESH_TOKEN_URL)
+        Self::with_refresh_url(store, OAUTH_TOKEN_URL)
     }
 
     fn with_refresh_url(store: CodexCredentialStore, refresh_url: impl Into<String>) -> Self {
         let mut client_headers = HeaderMap::new();
-        client_headers.insert("originator", HeaderValue::from_static("lam-agent"));
+        // Token refresh goes to the same account service the official CLI
+        // uses, so mirror its originator here as well as on model requests.
+        client_headers.insert("originator", HeaderValue::from_static("codex_cli_rs"));
         Self {
             store,
             client: reqwest::Client::builder()
@@ -211,8 +348,17 @@ impl CodexAuthSession {
         let _guard = self.request_lock.lock().await;
         let mut file = self.store.load()?;
         if needs_refresh(&file)? {
-            self.refresh(&mut file).await?;
-            self.store.save(&file)?;
+            // Serialize refresh across lam-agent processes; the rotating
+            // refresh token is single-use. The official Codex CLI does not
+            // take this lock, but it rewrites the cache atomically, so either
+            // writer leaves a consistent file.
+            let _lock = self.store.lock()?;
+            // Another process may have refreshed while we waited.
+            file = self.store.load()?;
+            if needs_refresh(&file)? {
+                self.refresh(&mut file).await?;
+                self.store.save(&file)?;
+            }
         }
         let credentials = credentials_from_file(&file, self.store.path())?;
         let mut expected = self.expected_account_id.lock().await;
@@ -304,60 +450,20 @@ pub(crate) async fn load_codex_auth(
     Ok((session, credentials))
 }
 
-pub(crate) fn installed_client_version() -> Result<&'static str, CodexAuthError> {
-    static VERSION: OnceLock<Result<String, String>> = OnceLock::new();
-    VERSION
-        .get_or_init(detect_installed_client_version)
-        .as_deref()
-        .map_err(|message| CodexAuthError::ClientVersion(message.clone()))
-}
-
-fn detect_installed_client_version() -> Result<String, String> {
-    let output = Command::new("codex")
-        .arg("--version")
-        .output()
-        .map_err(|error| format!("could not run `codex --version`: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "`codex --version` exited with status {:?}",
-            output.status.code()
-        ));
-    }
-    parse_client_version(&String::from_utf8_lossy(&output.stdout))
-        .map(str::to_owned)
-        .ok_or_else(|| "`codex --version` did not return `codex-cli VERSION`".to_owned())
-}
-
-fn parse_client_version(output: &str) -> Option<&str> {
-    let mut fields = output.split_whitespace();
-    if fields.next()? != "codex-cli" {
-        return None;
-    }
-    let version = fields.next()?;
-    (version.starts_with(|character: char| character.is_ascii_digit())
-        && version.matches('.').count() >= 2
-        && version.chars().all(|character| {
-            character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '+')
-        }))
-    .then_some(version)
-}
-
-pub(crate) fn default_headers(
-    credentials: &CodexCredentials,
-    client_version: &str,
-) -> Result<HeaderMap, CodexAuthError> {
+pub(crate) fn default_headers(credentials: &CodexCredentials) -> Result<HeaderMap, CodexAuthError> {
     let mut headers = HeaderMap::new();
     // The ChatGPT Codex backend gates model routing on the compatibility
     // identity of the official client that owns the shared login. Use the
-    // installed CLI version instead of Lam's unrelated package version.
+    // hardcoded mirror of the official codex-cli version (CODEX_CLIENT_VERSION)
+    // instead of Lam's unrelated package version; see docs/TODO.md.
     headers.insert("originator", HeaderValue::from_static("codex_cli_rs"));
     headers.insert(
         "version",
-        HeaderValue::from_str(client_version).map_err(CodexAuthError::InvalidHeader)?,
+        HeaderValue::from_str(CODEX_CLIENT_VERSION).map_err(CodexAuthError::InvalidHeader)?,
     );
     headers.insert(
         USER_AGENT,
-        HeaderValue::from_str(&format!("codex_cli_rs/{client_version} (lam-agent)"))
+        HeaderValue::from_str(&format!("codex_cli_rs/{CODEX_CLIENT_VERSION} (lam-agent)"))
             .map_err(CodexAuthError::InvalidHeader)?,
     );
     headers.insert(
@@ -370,31 +476,409 @@ pub(crate) fn default_headers(
     Ok(headers)
 }
 
-pub(crate) fn login(no_browser: bool) -> Result<CodexCredentialStore, CodexAuthError> {
-    let mut command = Command::new("codex");
-    command.args(["login", "--config", "cli_auth_credentials_store=\"file\""]);
-    if no_browser {
-        command.arg("--device-auth");
-    }
-    let status = command.status().map_err(CodexAuthError::CodexCommand)?;
-    if !status.success() {
-        return Err(CodexAuthError::CodexCommandStatus(status.code()));
-    }
+/// Runs the OAuth2 authorization-code + PKCE login against OpenAI and writes
+/// the shared Codex credential cache so the official Codex CLI can use it too.
+pub(crate) async fn login(
+    no_browser: bool,
+    force: bool,
+) -> Result<CodexCredentialStore, CodexAuthError> {
     let store = CodexCredentialStore::default_store()?;
-    store.load()?;
+    let verifier = pkce_verifier()?;
+    let state = oauth_state()?;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .map_err(CodexAuthError::OAuthListener)?;
+    let endpoints = OAuthEndpoints {
+        authorize_base: OAUTH_AUTHORIZE_URL.to_owned(),
+        token_url: OAUTH_TOKEN_URL.to_owned(),
+    };
+    login_with(
+        store.clone(),
+        listener,
+        &endpoints,
+        no_browser,
+        force,
+        &verifier,
+        &state,
+    )
+    .await?;
     Ok(store)
 }
 
+/// Removes the shared Codex credential cache (and our sidecar lock file).
+///
+/// This also signs the official Codex CLI out because the cache is shared.
 pub(crate) fn logout() -> Result<(), CodexAuthError> {
-    let status = Command::new("codex")
-        .args(["logout", "--config", "cli_auth_credentials_store=\"file\""])
-        .status()
-        .map_err(CodexAuthError::CodexCommand)?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(CodexAuthError::CodexCommandStatus(status.code()))
+    let store = CodexCredentialStore::default_store()?;
+    store.remove()
+}
+
+/// Core login flow with injectable endpoints, listener, and OAuth secrets so
+/// tests can run it entirely against local listeners.
+async fn login_with(
+    store: CodexCredentialStore,
+    listener: tokio::net::TcpListener,
+    endpoints: &OAuthEndpoints,
+    no_browser: bool,
+    force: bool,
+    verifier: &str,
+    state: &str,
+) -> Result<(), CodexAuthError> {
+    ensure_overwrite_allowed(&store, force)?;
+    let challenge = pkce_challenge(verifier);
+    let port = listener
+        .local_addr()
+        .map_err(CodexAuthError::OAuthListener)?
+        .port();
+    let redirect_uri = format!("http://localhost:{port}/auth/callback");
+    let authorize_url = format!(
+        "{authorize_base}?client_id={client_id}&redirect_uri={redirect_uri}&response_type=code&scope={scope}&audience={audience}&code_challenge={challenge}&code_challenge_method=S256&state={state}",
+        authorize_base = endpoints.authorize_base,
+        client_id = url_encode(OAUTH_CLIENT_ID),
+        redirect_uri = url_encode(&redirect_uri),
+        scope = url_encode(OAUTH_SCOPE),
+        audience = url_encode(OAUTH_AUDIENCE),
+        challenge = url_encode(&challenge),
+        state = url_encode(state),
+    );
+
+    println!("OpenAI / Codex login");
+    println!();
+    println!("  1. Open:  {authorize_url}");
+    println!();
+    println!("Waiting for authorization…");
+
+    if !no_browser {
+        let _ = crate::xai::open_url_in_browser(&authorize_url);
     }
+
+    let code = receive_authorization_code(listener, state).await?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(CodexAuthError::OAuthHttp)?;
+    let token = exchange_code(
+        &client,
+        &endpoints.token_url,
+        &code,
+        verifier,
+        &redirect_uri,
+    )
+    .await?;
+    let file = auth_file_from_token_response(token, store.path())?;
+    store.save(&file)?;
+    println!(
+        "Signed in. Credentials saved to {}.",
+        store.path().display()
+    );
+    Ok(())
+}
+
+/// Safety valve: refuse to overwrite valid existing credentials unless forced.
+///
+/// The cache is shared with the official Codex CLI, so silently replacing a
+/// working login would strand that tool (and the account the user chose).
+fn ensure_overwrite_allowed(
+    store: &CodexCredentialStore,
+    force: bool,
+) -> Result<(), CodexAuthError> {
+    if !force && store.load().is_ok() {
+        return Err(CodexAuthError::CredentialsExist {
+            path: store.path().to_path_buf(),
+        });
+    }
+    Ok(())
+}
+
+/// Waits for the browser redirect on the loopback listener and returns the
+/// authorization code, validating the OAuth state parameter.
+async fn receive_authorization_code(
+    listener: tokio::net::TcpListener,
+    expected_state: &str,
+) -> Result<String, CodexAuthError> {
+    let accept = async {
+        let (mut stream, _peer) = listener
+            .accept()
+            .await
+            .map_err(CodexAuthError::OAuthListener)?;
+        let request_line = read_request_line(&mut stream).await?;
+        let mut parts = request_line.split_whitespace();
+        let method = parts.next().unwrap_or_default();
+        let target = parts.next().unwrap_or_default();
+        if method != "GET" {
+            return Err(CodexAuthError::OAuthRedirect(format!(
+                "expected a GET redirect, got {method}"
+            )));
+        }
+        let code = parse_redirect(target, expected_state)?.code;
+        let body = "You are signed in. You can close this window and return to lam-agent.";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
+        let _ = stream.shutdown().await;
+        Ok(code)
+    };
+    tokio::time::timeout(LOGIN_TIMEOUT, accept)
+        .await
+        .map_err(|_| CodexAuthError::OAuthTimedOut)?
+}
+
+/// Reads the first HTTP request line from the loopback redirect connection.
+async fn read_request_line(stream: &mut tokio::net::TcpStream) -> Result<String, CodexAuthError> {
+    let mut buffer = [0_u8; 8192];
+    let mut used = 0;
+    loop {
+        let read = stream
+            .read(&mut buffer[used..])
+            .await
+            .map_err(CodexAuthError::OAuthListener)?;
+        if read == 0 {
+            break;
+        }
+        used += read;
+        if let Some(end) = buffer[..used].iter().position(|byte| *byte == b'\n') {
+            let line = &buffer[..end];
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            return Ok(String::from_utf8_lossy(line).into_owned());
+        }
+        if used == buffer.len() {
+            break;
+        }
+    }
+    Err(CodexAuthError::OAuthRedirect(
+        "no HTTP request received on the callback listener".to_owned(),
+    ))
+}
+
+/// Parses the OAuth redirect request target and validates the state param.
+fn parse_redirect(target: &str, expected_state: &str) -> Result<OAuthCode, CodexAuthError> {
+    let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    if path != "/auth/callback" {
+        return Err(CodexAuthError::OAuthRedirect(format!(
+            "unexpected redirect path {path}"
+        )));
+    }
+    let params = parse_query(query);
+    if let Some(error) = params.get("error") {
+        let description = params
+            .get("error_description")
+            .filter(|value| !value.trim().is_empty())
+            .map(String::as_str)
+            .unwrap_or(error);
+        return Err(CodexAuthError::OAuthDenied(description.to_owned()));
+    }
+    if params.get("state").map(String::as_str) != Some(expected_state) {
+        return Err(CodexAuthError::OAuthStateMismatch);
+    }
+    let code = params
+        .get("code")
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            CodexAuthError::OAuthRedirect("redirect is missing the authorization code".to_owned())
+        })?;
+    Ok(OAuthCode { code: code.clone() })
+}
+
+/// Parses an application/x-www-form-urlencoded query string.
+fn parse_query(query: &str) -> HashMap<String, String> {
+    let mut params = HashMap::new();
+    for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+        match pair.split_once('=') {
+            Some((key, value)) => {
+                params.insert(percent_decode(key), percent_decode(value));
+            }
+            None => {
+                params.insert(percent_decode(pair), String::new());
+            }
+        }
+    }
+    params
+}
+
+/// Decodes one percent-encoded query component (%XX and + for space).
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                output.push(b' ');
+                index += 1;
+            }
+            b'%' if index + 2 < bytes.len() => {
+                match (hex_value(bytes[index + 1]), hex_value(bytes[index + 2])) {
+                    (Some(high), Some(low)) => {
+                        output.push(high * 16 + low);
+                        index += 3;
+                    }
+                    _ => {
+                        output.push(bytes[index]);
+                        index += 1;
+                    }
+                }
+            }
+            byte => {
+                output.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&output).into_owned()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Percent-encodes a value for use inside a URL query string.
+fn url_encode(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    for byte in input.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                output.push(char::from(byte));
+            }
+            _ => output.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    output
+}
+
+fn truncate(body: &str) -> String {
+    const MAX: usize = 512;
+    let mut out = body.chars().take(MAX).collect::<String>();
+    if body.chars().count() > MAX {
+        out.push('…');
+    }
+    out
+}
+
+/// RFC 7636 PKCE verifier: 32 random bytes, base64url-encoded (43 chars).
+fn pkce_verifier() -> Result<String, CodexAuthError> {
+    random_token(32)
+}
+
+/// Opaque OAuth state value for redirect CSRF protection.
+fn oauth_state() -> Result<String, CodexAuthError> {
+    random_token(16)
+}
+
+/// RFC 7636 S256 challenge for a PKCE verifier.
+fn pkce_challenge(verifier: &str) -> String {
+    let hash = digest(&SHA256, verifier.as_bytes());
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash)
+}
+
+fn random_token(byte_count: usize) -> Result<String, CodexAuthError> {
+    let mut bytes = vec![0_u8; byte_count];
+    SystemRandom::new()
+        .fill(&mut bytes)
+        .map_err(|_| CodexAuthError::OAuthRandom)?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+}
+
+/// Exchanges an authorization code for tokens at the OAuth token endpoint.
+async fn exchange_code(
+    client: &reqwest::Client,
+    token_url: &str,
+    code: &str,
+    verifier: &str,
+    redirect_uri: &str,
+) -> Result<TokenExchangeResponse, CodexAuthError> {
+    let response = client
+        .post(token_url)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .form(&TokenExchangeRequest {
+            grant_type: "authorization_code",
+            client_id: OAUTH_CLIENT_ID,
+            code,
+            redirect_uri,
+            code_verifier: verifier,
+        })
+        .send()
+        .await
+        .map_err(CodexAuthError::OAuthHttp)?;
+    let status = response.status();
+    let body = response.text().await.map_err(CodexAuthError::OAuthHttp)?;
+    if !status.is_success() {
+        return Err(CodexAuthError::OAuthTokenStatus {
+            status: status.as_u16(),
+            body: truncate(&body),
+        });
+    }
+    let token: TokenExchangeResponse =
+        serde_json::from_str(&body).map_err(|source| CodexAuthError::OAuthJson { source })?;
+    if let Some(error) = token.error.as_deref() {
+        let description = token
+            .error_description
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| error.to_owned());
+        return Err(CodexAuthError::OAuthDenied(description));
+    }
+    Ok(token)
+}
+
+/// Builds a shared Codex auth file from an authorization-code token response.
+fn auth_file_from_token_response(
+    token: TokenExchangeResponse,
+    path: &Path,
+) -> Result<CodexAuthFile, CodexAuthError> {
+    let id_token = token
+        .id_token
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| CodexAuthError::InvalidCredentials {
+            path: path.to_path_buf(),
+            message: "the OAuth token response is missing id_token".to_owned(),
+        })?;
+    let access_token = token
+        .access_token
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| CodexAuthError::InvalidCredentials {
+            path: path.to_path_buf(),
+            message: "the OAuth token response is missing access_token".to_owned(),
+        })?;
+    let refresh_token = token
+        .refresh_token
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| CodexAuthError::InvalidCredentials {
+            path: path.to_path_buf(),
+            message: "the OAuth token response is missing refresh_token".to_owned(),
+        })?;
+    let claims: IdTokenClaims = decode_jwt(&id_token)?;
+    let account_id = claims
+        .auth
+        .as_ref()
+        .and_then(|auth| auth.chatgpt_account_id.clone())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| CodexAuthError::InvalidCredentials {
+            path: path.to_path_buf(),
+            message: "id_token is missing the ChatGPT account id".to_owned(),
+        })?;
+    let file = CodexAuthFile {
+        auth_mode: Some("chatgpt".to_owned()),
+        openai_api_key: None,
+        tokens: Some(CodexTokens {
+            id_token,
+            access_token,
+            refresh_token,
+            account_id: Some(account_id),
+            extra: Map::new(),
+        }),
+        last_refresh: None,
+        extra: Map::new(),
+    };
+    validate_auth_file(&file, path)?;
+    Ok(file)
 }
 
 fn validate_auth_file(file: &CodexAuthFile, path: &Path) -> Result<(), CodexAuthError> {
@@ -456,6 +940,9 @@ fn needs_refresh(file: &CodexAuthFile) -> Result<bool, CodexAuthError> {
 }
 
 fn decode_jwt<T: for<'de> Deserialize<'de>>(token: &str) -> Result<T, CodexAuthError> {
+    // Claims are consumed unsigned: the token arrives over TLS from OpenAI's
+    // token endpoint or from the local credential cache we already trust for
+    // the bearer token itself. This is not a security boundary.
     let payload = token
         .split('.')
         .nth(1)
@@ -506,6 +993,10 @@ pub(crate) enum CodexAuthError {
     InvalidJwt,
     #[error("the Codex login changed to another ChatGPT workspace; restart Lam")]
     AccountChanged,
+    #[error(
+        "Codex credentials already exist at `{path}`; run `lam-agent logout openai` first, or pass --force to replace them"
+    )]
+    CredentialsExist { path: PathBuf },
     #[error("could not serialize Codex credentials at `{path}`: {source}")]
     Serialize {
         path: PathBuf,
@@ -522,12 +1013,24 @@ pub(crate) enum CodexAuthError {
     RefreshStatus { status: u16, message: String },
     #[error("invalid Codex request header: {0}")]
     InvalidHeader(reqwest::header::InvalidHeaderValue),
-    #[error("could not determine the installed Codex client version: {0}")]
-    ClientVersion(String),
-    #[error("could not run the official `codex` CLI: {0}")]
-    CodexCommand(std::io::Error),
-    #[error("the official `codex` CLI exited unsuccessfully (status {0:?})")]
-    CodexCommandStatus(Option<i32>),
+    #[error("OpenAI OAuth request failed: {0}")]
+    OAuthHttp(reqwest::Error),
+    #[error("could not start the local OAuth callback listener: {0}")]
+    OAuthListener(std::io::Error),
+    #[error("OpenAI authorization timed out; no browser redirect was received")]
+    OAuthTimedOut,
+    #[error("OpenAI OAuth redirect state did not match; refusing the redirect")]
+    OAuthStateMismatch,
+    #[error("OpenAI authorization was denied: {0}")]
+    OAuthDenied(String),
+    #[error("invalid OpenAI OAuth redirect: {0}")]
+    OAuthRedirect(String),
+    #[error("OpenAI token exchange returned HTTP {status}: {body}")]
+    OAuthTokenStatus { status: u16, body: String },
+    #[error("OpenAI token exchange returned invalid JSON: {source}")]
+    OAuthJson { source: serde_json::Error },
+    #[error("could not generate a secure random PKCE verifier")]
+    OAuthRandom,
 }
 
 #[cfg(test)]
@@ -568,22 +1071,268 @@ mod tests {
         let credentials = credentials_from_file(&file, Path::new("auth.json")).unwrap();
         assert_eq!(credentials.account_id, "account-123");
         assert!(!needs_refresh(&file).unwrap());
-        let headers = default_headers(&credentials, "0.146.0").unwrap();
+        let headers = default_headers(&credentials).unwrap();
         assert_eq!(headers["ChatGPT-Account-ID"], "account-123");
         assert_eq!(headers["originator"], "codex_cli_rs");
-        assert_eq!(headers["version"], "0.146.0");
-        assert_eq!(headers[USER_AGENT], "codex_cli_rs/0.146.0 (lam-agent)");
+        assert_eq!(headers["version"], CODEX_CLIENT_VERSION);
+        assert_eq!(
+            headers[USER_AGENT],
+            format!("codex_cli_rs/{CODEX_CLIENT_VERSION} (lam-agent)")
+        );
     }
 
     #[test]
-    fn parses_official_codex_client_versions() {
-        assert_eq!(parse_client_version("codex-cli 0.146.0\n"), Some("0.146.0"));
-        assert_eq!(
-            parse_client_version("codex-cli 0.147.0-alpha.3\n"),
-            Some("0.147.0-alpha.3")
+    fn pkce_verifier_is_base64url_and_in_range() {
+        let verifier = pkce_verifier().unwrap();
+        assert!((43..=128).contains(&verifier.len()));
+        assert!(
+            verifier
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
         );
-        assert_eq!(parse_client_version("lam-agent 0.1.0\n"), None);
-        assert_eq!(parse_client_version("codex-cli invalid\n"), None);
+        let state = oauth_state().unwrap();
+        assert_eq!(state.len(), 22);
+    }
+
+    #[test]
+    fn pkce_challenge_matches_sha256_test_vector() {
+        // SHA-256("hello") base64url without padding.
+        assert_eq!(
+            pkce_challenge("hello"),
+            "LPJNul-wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ"
+        );
+    }
+
+    #[test]
+    fn parses_redirect_query_with_percent_decoding() {
+        let params = parse_query("code=abc123&state=xyz");
+        assert_eq!(params.get("code").map(String::as_str), Some("abc123"));
+        assert_eq!(params.get("state").map(String::as_str), Some("xyz"));
+        let params = parse_query("code=a%2Bb%20c&state=s%2Ft");
+        assert_eq!(params.get("code").map(String::as_str), Some("a+b c"));
+        assert_eq!(params.get("state").map(String::as_str), Some("s/t"));
+        assert_eq!(params.get("missing"), None);
+    }
+
+    #[test]
+    fn parses_redirect_target_and_validates_state() {
+        let code = parse_redirect("/auth/callback?code=abc&state=xyz", "xyz").unwrap();
+        assert_eq!(code.code, "abc");
+        assert!(matches!(
+            parse_redirect("/auth/callback?code=abc&state=wrong", "xyz"),
+            Err(CodexAuthError::OAuthStateMismatch)
+        ));
+        assert!(matches!(
+            parse_redirect(
+                "/auth/callback?error=access_denied&error_description=declined",
+                "xyz"
+            ),
+            Err(CodexAuthError::OAuthDenied(message)) if message == "declined"
+        ));
+        assert!(matches!(
+            parse_redirect("/auth/callback?state=xyz", "xyz"),
+            Err(CodexAuthError::OAuthRedirect(_))
+        ));
+        assert!(matches!(
+            parse_redirect("/other?code=abc&state=xyz", "xyz"),
+            Err(CodexAuthError::OAuthRedirect(_))
+        ));
+    }
+
+    #[test]
+    fn auth_file_from_token_response_round_trips_through_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let store = CodexCredentialStore::new(&path);
+        let id_token = jwt(serde_json::json!({
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "account-oauth",
+                "chatgpt_account_is_fedramp": true
+            }
+        }));
+        let token = TokenExchangeResponse {
+            access_token: Some(jwt(serde_json::json!({ "exp": now_unix() + 3_600 }))),
+            refresh_token: Some("refresh-oauth".to_owned()),
+            id_token: Some(id_token),
+            error: None,
+            error_description: None,
+        };
+        let file = auth_file_from_token_response(token, &path).unwrap();
+        assert_eq!(
+            file.tokens.as_ref().unwrap().account_id.as_deref(),
+            Some("account-oauth")
+        );
+        store.save(&file).unwrap();
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded.auth_mode.as_deref(), Some("chatgpt"));
+        let credentials = credentials_from_file(&loaded, &path).unwrap();
+        assert_eq!(credentials.account_id, "account-oauth");
+        assert!(credentials.is_fedramp);
+    }
+
+    #[test]
+    fn login_refuses_to_overwrite_valid_credentials_without_force() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CodexCredentialStore::new(dir.path().join("auth.json"));
+        store.save(&auth_file(now_unix() + 3_600)).unwrap();
+        assert!(matches!(
+            ensure_overwrite_allowed(&store, false),
+            Err(CodexAuthError::CredentialsExist { .. })
+        ));
+        assert!(ensure_overwrite_allowed(&store, true).is_ok());
+        // A corrupt file is not valid credentials, so overwriting is allowed.
+        fs::write(store.path(), "not json").unwrap();
+        assert!(ensure_overwrite_allowed(&store, false).is_ok());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn exchanges_authorization_code_with_mocked_token_endpoint() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let id_token = jwt(serde_json::json!({
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "account-exchange",
+                "chatgpt_account_is_fedramp": false
+            }
+        }));
+        let response_id_token = id_token.clone();
+        let access_token = jwt(serde_json::json!({ "exp": now_unix() + 3_600 }));
+        let response_access = access_token.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut request = vec![0_u8; 8 * 1024];
+            let read = stream.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(request.contains("POST /token HTTP/1.1"));
+            assert!(request.contains("grant_type=authorization_code"));
+            assert!(request.contains("code=the-code"));
+            assert!(request.contains("code_verifier=the-verifier"));
+            assert!(request.contains("client_id=app_EMoamEEZ73f0CkXaXp7hrann"));
+            assert!(
+                request.contains("redirect_uri=http%3A%2F%2Flocalhost%3A9999%2Fauth%2Fcallback")
+            );
+            let body = serde_json::json!({
+                "access_token": response_access,
+                "refresh_token": "refresh-exchange",
+                "id_token": response_id_token,
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let token = exchange_code(
+            &client,
+            &format!("http://{address}/token"),
+            "the-code",
+            "the-verifier",
+            "http://localhost:9999/auth/callback",
+        )
+        .await
+        .unwrap();
+        assert_eq!(token.access_token.as_deref(), Some(access_token.as_str()));
+        assert_eq!(token.refresh_token.as_deref(), Some("refresh-exchange"));
+        assert_eq!(token.id_token.as_deref(), Some(id_token.as_str()));
+        server.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn login_runs_the_oauth_flow_against_local_listeners() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CodexCredentialStore::new(dir.path().join("auth.json"));
+
+        let redirect_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let redirect_address = redirect_listener.local_addr().unwrap();
+        let token_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let token_address = token_listener.local_addr().unwrap();
+
+        let verifier = pkce_verifier().unwrap();
+        let state = oauth_state().unwrap();
+        let redirect_uri = format!("http://localhost:{}/auth/callback", redirect_address.port());
+        let expected_verifier_param = format!("code_verifier={verifier}");
+        let expected_redirect_param = format!("redirect_uri={}", url_encode(&redirect_uri));
+
+        let id_token = jwt(serde_json::json!({
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "account-e2e",
+                "chatgpt_account_is_fedramp": false
+            }
+        }));
+        let response_id_token = id_token.clone();
+        let access_token = jwt(serde_json::json!({ "exp": now_unix() + 3_600 }));
+        let response_access = access_token.clone();
+
+        let redirect_request = format!(
+            "GET /auth/callback?code=e2e-code&state={state} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+        );
+        let browser = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(redirect_address)
+                .await
+                .unwrap();
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            stream.write_all(redirect_request.as_bytes()).await.unwrap();
+            let mut response = vec![0_u8; 4096];
+            let _ = stream.read(&mut response).await;
+        });
+
+        let token_server = tokio::spawn(async move {
+            let (mut stream, _) = token_listener.accept().await.unwrap();
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut request = vec![0_u8; 8 * 1024];
+            let read = stream.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(request.contains("POST /token HTTP/1.1"));
+            assert!(request.contains("grant_type=authorization_code"));
+            assert!(request.contains("code=e2e-code"));
+            assert!(request.contains(&expected_verifier_param));
+            assert!(request.contains(&expected_redirect_param));
+            let body = serde_json::json!({
+                "access_token": response_access,
+                "refresh_token": "refresh-e2e",
+                "id_token": response_id_token,
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let endpoints = OAuthEndpoints {
+            authorize_base: "https://auth.example.test/oauth/authorize".to_owned(),
+            token_url: format!("http://{token_address}/token"),
+        };
+        login_with(
+            store.clone(),
+            redirect_listener,
+            &endpoints,
+            true,
+            false,
+            &verifier,
+            &state,
+        )
+        .await
+        .unwrap();
+
+        let loaded = store.load().unwrap();
+        assert_eq!(
+            loaded.tokens.as_ref().unwrap().account_id.as_deref(),
+            Some("account-e2e")
+        );
+        let credentials = credentials_from_file(&loaded, store.path()).unwrap();
+        assert_eq!(credentials.access_token, access_token);
+        assert_eq!(credentials.account_id, "account-e2e");
+
+        browser.await.unwrap();
+        token_server.await.unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]

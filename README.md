@@ -262,8 +262,9 @@ See [`crates/lam-tui/README.md`](crates/lam-tui/README.md) for configuration and
 key bindings.
 
 Codex-enabled ChatGPT subscription access is available via the `openai-codex`
-provider type (`lam-agent login openai`). Lam uses the official Codex login
-cache and the subscription Responses endpoint; no OpenAI Platform API key is
+provider type (`lam-agent login openai` — a native OAuth flow, no `codex`
+binary required). Lam uses the shared Codex login cache and the subscription
+Responses endpoint; no OpenAI Platform API key is
 needed. With the default configuration path, Lam adds the signed-in Codex
 provider automatically. Press `Alt+M` or use `/model` to select its model.
 

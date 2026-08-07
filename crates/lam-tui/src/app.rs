@@ -744,6 +744,13 @@ impl App {
         input == "/model" || input.starts_with("/model ")
     }
 
+    /// Whether the `/effort` palette is currently open (the suggestion list
+    /// driven by an `/effort` or `/effort ` input).
+    fn effort_palette_open(&self) -> bool {
+        let input = self.input.text.trim_start();
+        input == "/effort" || input.starts_with("/effort ")
+    }
+
     /// Sessions offered by the `/session` palette, newest first, or `None`
     /// when that palette is not open. Shared by the suggestion list and the
     /// deletion binding so both agree on which row is highlighted.
@@ -819,10 +826,17 @@ impl App {
             self.open_agents_drawer();
             return None;
         }
-        // Alt+M opens the provider/model picker from either focus target.
+        // Alt+M opens the provider/model picker, but only when no other
+        // palette or panel is open: an open session picker, agents drawer,
+        // or effort picker must not be clobbered by the rewrite. Re-triggering
+        // while the model palette itself is open is allowed — it rewrites the
+        // same `/model ` text.
         if key.kind == KeyEventKind::Press
             && key.modifiers.contains(KeyModifiers::ALT)
             && matches!(key.code, KeyCode::Char('m') | KeyCode::Char('M'))
+            && !self.session_palette_open()
+            && !self.agents_palette_open()
+            && !self.effort_palette_open()
         {
             self.input = InputBuffer::at_end("/model ".to_owned());
             self.input_history = None;
@@ -3394,6 +3408,36 @@ mod tests {
 
         assert!(app.input.text.is_empty());
         assert!(app.notice().is_none());
+    }
+
+    #[test]
+    fn alt_m_is_a_noop_while_the_session_palette_is_open() {
+        let mut app = app();
+        app.input = InputBuffer::at_end("/session 4".to_owned());
+        app.focus = Focus::Conversation;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT));
+
+        assert_eq!(app.input.text, "/session 4");
+        assert_eq!(app.focus, Focus::Conversation);
+        assert_eq!(
+            app.notice().map(|notice| notice.text),
+            Some(SESSION_PICKER_HINT)
+        );
+    }
+
+    #[test]
+    fn alt_m_is_a_noop_while_the_agents_or_effort_panel_is_open() {
+        for draft in ["/agents ", "/effort high"] {
+            let mut app = app();
+            app.input = InputBuffer::at_end(draft.to_owned());
+            app.focus = Focus::Conversation;
+
+            app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT));
+
+            assert_eq!(app.input.text, draft);
+            assert_eq!(app.focus, Focus::Conversation);
+        }
     }
 
     #[test]

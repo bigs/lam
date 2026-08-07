@@ -1667,6 +1667,7 @@ dependencies = [
  "ratatui",
  "redb",
  "reqwest",
+ "ring",
  "serde",
  "serde_json",
  "tempfile",

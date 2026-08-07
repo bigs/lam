@@ -738,6 +738,7 @@ enum CliCommand {
     Login {
         provider: LoginProvider,
         no_browser: bool,
+        force: bool,
     },
     Logout {
         provider: LoginProvider,
@@ -779,9 +780,11 @@ impl Args {
                             )
                         })?;
                     let mut no_browser = false;
+                    let mut force = false;
                     for flag in arguments.by_ref() {
                         match flag.to_str() {
                             Some("--no-browser") => no_browser = true,
+                            Some("--force") => force = true,
                             Some(value) => {
                                 return Err(AppError::Arguments(format!(
                                     "unknown login flag `{value}`; try --help"
@@ -797,6 +800,7 @@ impl Args {
                     command = Some(CliCommand::Login {
                         provider: parse_login_provider(&provider)?,
                         no_browser,
+                        force,
                     });
                 }
                 Some("logout") => {
@@ -849,17 +853,17 @@ async fn run_command(command: CliCommand) -> Result<(), AppError> {
         CliCommand::Login {
             provider: LoginProvider::OpenAi,
             no_browser,
+            force,
         } => {
-            let store = codex::login(no_browser).map_err(AppError::CodexAuth)?;
-            println!(
-                "Codex subscription credentials are ready at {}.",
-                store.path().display()
-            );
+            codex::login(no_browser, force)
+                .await
+                .map_err(AppError::CodexAuth)?;
             Ok(())
         }
         CliCommand::Login {
             provider: LoginProvider::Xai,
             no_browser,
+            force: _,
         } => {
             let store = xai::XaiCredentialStore::default_store().map_err(AppError::Auth)?;
             xai::device_login(&store, !no_browser)
@@ -871,7 +875,9 @@ async fn run_command(command: CliCommand) -> Result<(), AppError> {
             provider: LoginProvider::OpenAi,
         } => {
             codex::logout().map_err(AppError::CodexAuth)?;
-            println!("Removed shared Codex login credentials.");
+            println!(
+                "Removed shared Codex login credentials; the official Codex CLI is signed out too (the cache is shared)."
+            );
             Ok(())
         }
         CliCommand::Logout {
@@ -947,7 +953,7 @@ impl Drop for TerminalSession {
 
 fn print_help() {
     println!(
-        "lam-agent — a minimal TypeScript coding agent\n\nUSAGE:\n    lam-agent [--config PATH] [--debug-log]\n    lam-agent login openai [--no-browser]\n    lam-agent login xai [--no-browser]\n    lam-agent logout openai\n    lam-agent logout xai\n\nOPTIONS:\n    --config PATH  Read providers from PATH instead of ~/.lam/providers.toml\n    --debug-log    Append metadata-only diagnostics beside the session journal\n    -h, --help     Show this help\n    -V, --version  Show the version\n\nCOMMANDS:\n    login openai   Sign in with a Codex-enabled ChatGPT subscription\n    login xai      Sign in with SuperGrok / X Premium via device-code OAuth\n    logout openai  Remove shared Codex login credentials\n    logout xai     Remove stored SuperGrok credentials from ~/.lam/auth/xai.json\n\nLam resumes the latest durable session for the current directory. Inside the TUI,\ntype / for commands, including /new for a fresh session and /session to restore\nan earlier one; in that picker, Ctrl+D twice deletes the highlighted session.\nPress Alt+M to select a provider and model. Tab switches focus between the input\nshelf and conversation; arrows select transcript rows; Enter expands the selected\nrow. While the root is working, a submitted message is queued above the input as\na pending steer and is delivered at the next model boundary. Press Escape twice\nwithin 1.5 seconds to stop its complete agent tree."
+        "lam-agent — a minimal TypeScript coding agent\n\nUSAGE:\n    lam-agent [--config PATH] [--debug-log]\n    lam-agent login openai [--no-browser] [--force]\n    lam-agent login xai [--no-browser]\n    lam-agent logout openai\n    lam-agent logout xai\n\nOPTIONS:\n    --config PATH  Read providers from PATH instead of ~/.lam/providers.toml\n    --debug-log    Append metadata-only diagnostics beside the session journal\n    -h, --help     Show this help\n    -V, --version  Show the version\n\nCOMMANDS:\n    login openai   Sign in with ChatGPT via Codex OAuth; --force replaces an existing login\n    login xai      Sign in with SuperGrok / X Premium via device-code OAuth\n    logout openai  Remove the shared Codex login (also signs out the official Codex CLI)\n    logout xai     Remove stored SuperGrok credentials from ~/.lam/auth/xai.json\n\nLam resumes the latest durable session for the current directory. Inside the TUI,\ntype / for commands, including /new for a fresh session and /session to restore\nan earlier one; in that picker, Ctrl+D twice deletes the highlighted session.\nPress Alt+M to select a provider and model. Tab switches focus between the input\nshelf and conversation; arrows select transcript rows; Enter expands the selected\nrow. While the root is working, a submitted message is queued above the input as\na pending steer and is delivered at the next model boundary. Press Escape twice\nwithin 1.5 seconds to stop its complete agent tree."
     );
 }
 

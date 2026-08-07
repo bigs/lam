@@ -25,7 +25,7 @@ use tokio::sync::mpsc;
 use crate::boot::{phase, phase_sync};
 use crate::codex::{
     CODEX_BACKEND_BASE_URL, CodexCredentialStore, default_headers as codex_default_headers,
-    installed_client_version as installed_codex_client_version, load_codex_auth,
+    load_codex_auth,
 };
 use crate::config::{LoadedConfig, ModelChoice, ModelConfig, ProviderConfig, ProviderProtocol};
 use crate::session::Session;
@@ -1265,7 +1265,7 @@ fn agent_history(
 }
 
 /// Stable label for the model an actor has selected.
-
+///
 /// Child actors historically journaled the Lam builder default id `default`.
 /// Prefer the durable descriptor's `provider/model` in that case so the TUI
 /// can match a configured ModelChoice and show the right header label.
@@ -1446,9 +1446,7 @@ async fn build_model(
             let (auth, credentials) = load_codex_auth(store)
                 .await
                 .map_err(|error| RuntimeError::Model(error.to_string()))?;
-            let client_version = installed_codex_client_version()
-                .map_err(|error| RuntimeError::Model(error.to_string()))?;
-            let headers = codex_default_headers(&credentials, client_version)
+            let headers = codex_default_headers(&credentials)
                 .map_err(|error| RuntimeError::Model(error.to_string()))?;
             let (transport, codec) = Responses::builder(&choice.model)
                 .base_url(CODEX_BACKEND_BASE_URL)
