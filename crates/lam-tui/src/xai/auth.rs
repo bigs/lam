@@ -173,6 +173,7 @@ impl XaiCredentialStore {
         let path = self.lock_path();
         let file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&path)
@@ -189,7 +190,7 @@ impl XaiCredentialStore {
                     message: source.to_string(),
                 }
             })?;
-            return Ok(CredentialLock { _guard: guard });
+            Ok(CredentialLock { _guard: guard })
         }
         #[cfg(not(unix))]
         {
@@ -334,7 +335,7 @@ fn httpdate_to_unix(value: &str) -> Option<u64> {
     let mp = if month > 2 { month - 3 } else { month + 9 };
     let doy = (153 * mp as u64 + 2) / 5 + day as u64 - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = (era * 146_097 + doe as i64 - 719_468) as i64;
+    let days = era * 146_097 + doe as i64 - 719_468;
     let secs = days
         .checked_mul(86_400)?
         .checked_add(i64::from(hour) * 3_600)?

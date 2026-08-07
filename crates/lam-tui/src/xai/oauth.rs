@@ -337,21 +337,21 @@ fn oauth_form_headers() -> HeaderMap {
     headers
 }
 
-fn open_url_in_browser(url: &str) -> io::Result<()> {
+pub(crate) fn open_url_in_browser(url: &str) -> io::Result<()> {
     #[cfg(target_os = "macos")]
     {
         Command::new("open").arg(url).spawn()?;
-        return Ok(());
+        Ok(())
     }
     #[cfg(target_os = "linux")]
     {
         Command::new("xdg-open").arg(url).spawn()?;
-        return Ok(());
+        Ok(())
     }
     #[cfg(target_os = "windows")]
     {
         Command::new("cmd").args(["/C", "start", "", url]).spawn()?;
-        return Ok(());
+        Ok(())
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
