@@ -174,6 +174,7 @@ fn builtin_codex_provider(name: &str) -> ProviderConfig {
         api_key_env: None,
         effort_path: None,
         models: [
+            ("gpt-5.6-luna", "GPT-5.6 Luna"),
             ("gpt-5.6-sol", "GPT-5.6 Sol"),
             ("gpt-5.6-terra", "GPT-5.6 Terra"),
         ]
@@ -532,7 +533,7 @@ efforts = ["low", "medium", "high"]
         let loaded = LoadedConfig::load_path(path, true).unwrap();
 
         assert_eq!(loaded.config.providers.len(), 1);
-        assert_eq!(loaded.models.len(), 2);
+        assert_eq!(loaded.models.len(), 3);
         assert_eq!(
             loaded.models[loaded.default_index].registry_id,
             "codex/gpt-5.6-terra"
