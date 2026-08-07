@@ -165,6 +165,14 @@ fn unique_provider_name(config: &ProvidersConfig, preferred: &str) -> String {
         .expect("the provider suffix space is not bounded")
 }
 
+/// Codex subscription catalog context window for GPT-5.6 family models.
+///
+/// Matches `context_window` / `max_context_window` in the official Codex CLI
+/// model catalog (`openai/codex` `codex-rs/models-manager/models.json`) and
+/// OpenAI's documented standard Codex window (272K). This is lower than the
+/// Platform API model page (~1.05M) used for `openai-responses` entries.
+const CODEX_SUBSCRIPTION_CONTEXT_WINDOW: u64 = 272_000;
+
 fn builtin_codex_provider(name: &str) -> ProviderConfig {
     ProviderConfig {
         name: name.to_owned(),
@@ -182,7 +190,7 @@ fn builtin_codex_provider(name: &str) -> ProviderConfig {
         .map(|(id, name)| ModelConfig {
             id: id.to_owned(),
             name: name.to_owned(),
-            context_window: 1_050_000,
+            context_window: CODEX_SUBSCRIPTION_CONTEXT_WINDOW,
             efforts: ["none", "low", "medium", "high", "xhigh", "max"]
                 .into_iter()
                 .map(str::to_owned)
@@ -466,7 +474,10 @@ pub(crate) enum ConfigError {
 mod tests {
     use std::fs;
 
-    use super::{LoadedConfig, ProvidersConfig, add_builtin_codex_provider, validate};
+    use super::{
+        CODEX_SUBSCRIPTION_CONTEXT_WINDOW, LoadedConfig, ProviderProtocol, ProvidersConfig,
+        add_builtin_codex_provider, builtin_codex_provider, validate,
+    };
 
     const VALID: &str = r#"
 default_model = "openai/gpt-5"
@@ -611,6 +622,39 @@ efforts = ["low", "medium", "high"]
                 .map(|provider| provider.protocol),
             Some(super::ProviderProtocol::OpenaiCodex)
         );
+        let codex = config
+            .providers
+            .iter()
+            .find(|provider| provider.name == "codex")
+            .expect("example configures codex");
+        for model in &codex.models {
+            assert_eq!(
+                model.context_window, CODEX_SUBSCRIPTION_CONTEXT_WINDOW,
+                "codex subscription model {} should use the Codex catalog window, not Platform API 1.05M",
+                model.id
+            );
+        }
+        for model in &openai.models {
+            assert_eq!(
+                model.context_window, 1_050_000,
+                "platform openai model {} should keep the full API context window",
+                model.id
+            );
+        }
+    }
+
+    #[test]
+    fn builtin_codex_models_use_subscription_context_window() {
+        let provider = builtin_codex_provider("codex");
+        assert_eq!(provider.protocol, ProviderProtocol::OpenaiCodex);
+        assert!(!provider.models.is_empty());
+        for model in &provider.models {
+            assert_eq!(
+                model.context_window, CODEX_SUBSCRIPTION_CONTEXT_WINDOW,
+                "builtin codex model {}",
+                model.id
+            );
+        }
     }
 
     #[test]

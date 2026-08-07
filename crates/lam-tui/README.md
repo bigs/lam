@@ -85,6 +85,10 @@ protocol invariants still override conflicting keys.
 ### Codex subscription (`openai-codex`)
 
 Use a Codex-enabled ChatGPT subscription without an OpenAI Platform API key.
+Codex subscription models use a **272,000-token** context window (the official
+Codex catalog standard), not the Platform API ~1.05M window used for
+`openai-responses` entries of the same model names.
+
 Sign in once, then start Lam:
 
 ```bash
