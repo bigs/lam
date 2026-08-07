@@ -7,7 +7,7 @@ use lam::{
     CodecId, CodecRef, CompactionArtifact, ContextTransition, EncodedPayload, Model, ModelCodec,
     ModelDelta, ModelDescriptor, ModelDirective, ModelEventSink, ModelProvider, ModelRequestConfig,
     ModelResponseMetadata, ModelResponseProjection, OutputContract, ProjectedContextEntry,
-    ToolCallDelta,
+    ServiceUnavailableRetry, ToolCallDelta,
 };
 use serde_json::{Map, Value, json};
 
@@ -123,6 +123,18 @@ impl ChatCompletionsBuilder {
     #[must_use]
     pub fn stream_idle_timeout(mut self, timeout: Duration) -> Self {
         self.shared = self.shared.stream_idle_timeout(timeout);
+        self
+    }
+
+    /// Configures automatic retries when the endpoint returns HTTP 503.
+    ///
+    /// Intermediate 503 responses never enter model-visible context. After the
+    /// configured budget is exhausted, the host receives a provider error.
+    /// Defaults to [`ServiceUnavailableRetry::default`] (12 retries, 250ms
+    /// initial backoff, 512s cap so the full budget stays exponential).
+    #[must_use]
+    pub fn service_unavailable_retry(mut self, policy: ServiceUnavailableRetry) -> Self {
+        self.shared = self.shared.service_unavailable_retry(policy);
         self
     }
 

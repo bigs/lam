@@ -2,6 +2,7 @@ use std::error::Error as _;
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
+use lam::ServiceUnavailableRetry;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde_json::Value;
 use tracing::{Instrument, field};
@@ -27,6 +28,7 @@ pub(crate) struct HttpTransport {
     default_headers: HeaderMap,
     request_headers: Option<std::sync::Arc<dyn RequestHeaderSource>>,
     stream_idle_timeout: Duration,
+    service_unavailable_retry: ServiceUnavailableRetry,
 }
 
 pub(crate) enum StreamBody {
@@ -45,6 +47,7 @@ impl HttpTransport {
         endpoint: reqwest::Url,
         authorization: Option<SharedAuthSource>,
         stream_idle_timeout: Duration,
+        service_unavailable_retry: ServiceUnavailableRetry,
     ) -> Self {
         Self {
             client,
@@ -53,6 +56,7 @@ impl HttpTransport {
             default_headers: HeaderMap::new(),
             request_headers: None,
             stream_idle_timeout,
+            service_unavailable_retry,
         }
     }
 
@@ -80,6 +84,7 @@ impl HttpTransport {
             default_headers: self.default_headers.clone(),
             request_headers: self.request_headers.clone(),
             stream_idle_timeout: self.stream_idle_timeout,
+            service_unavailable_retry: self.service_unavailable_retry,
         }
     }
 
@@ -117,6 +122,7 @@ impl HttpTransport {
                 "sending model HTTP request"
             );
             let mut retried_auth = false;
+            let mut service_unavailable_retries = 0_u32;
             let response = loop {
                 let mut request = self.client.post(self.endpoint.clone()).json(body);
                 for (name, value) in &self.default_headers {
@@ -155,6 +161,24 @@ impl HttpTransport {
                     retried_auth = true;
                     // Drop the unauthorized body without materializing it.
                     drop(response);
+                    continue;
+                }
+                // 503 is checked before any SSE/JSON body is read, so retries
+                // never emit partial model deltas and never enter context.
+                let policy = self.service_unavailable_retry;
+                if status.as_u16() == 503 && service_unavailable_retries < policy.max_retries {
+                    let attempt = service_unavailable_retries + 1;
+                    let delay = policy.backoff(service_unavailable_retries);
+                    service_unavailable_retries = attempt;
+                    tracing::warn!(
+                        event = "http.service_unavailable_retry",
+                        attempt,
+                        max_retries = policy.max_retries,
+                        delay_ms = delay.as_millis() as u64,
+                        "model endpoint returned 503; retrying after exponential backoff"
+                    );
+                    drop(response);
+                    tokio::time::sleep(delay).await;
                     continue;
                 }
                 break response;
@@ -532,7 +556,31 @@ impl SseDecoder {
 
 #[cfg(test)]
 mod tests {
-    use super::{SseDecoder, sanitized_endpoint};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use lam::ServiceUnavailableRetry;
+    use serde_json::json;
+
+    use super::{HttpTransport, SseDecoder, sanitized_endpoint};
+    use crate::error::ProviderError;
+
+    fn fast_retry(max_retries: u32) -> ServiceUnavailableRetry {
+        ServiceUnavailableRetry::new(max_retries)
+            .with_backoff(Duration::from_millis(5), Duration::from_millis(20))
+    }
+
+    fn make_transport(origin: &str, policy: ServiceUnavailableRetry) -> HttpTransport {
+        HttpTransport::new(
+            reqwest::Client::new(),
+            reqwest::Url::parse(&format!("{origin}/v1/test")).unwrap(),
+            None,
+            Duration::from_secs(2),
+            policy,
+        )
+    }
 
     #[test]
     fn decodes_split_crlf_and_multiline_events() {
@@ -556,5 +604,128 @@ mod tests {
             sanitized_endpoint(&endpoint),
             "https://example.com/v1/chat/completions"
         );
+    }
+
+    #[tokio::test]
+    async fn retries_service_unavailable_then_succeeds() {
+        let body = json!({"ok": true});
+        let hits = Arc::new(Mutex::new(0_u32));
+        let origin = spawn_status_sequence(
+            hits.clone(),
+            vec![
+                (503, r#"{"error":"overloaded"}"#.to_owned()),
+                (200, body.to_string()),
+            ],
+        );
+        let transport = make_transport(&origin, fast_retry(2));
+
+        let value = transport
+            .post_json("test", &json!({"prompt": "hi"}))
+            .await
+            .expect("503 should be retried");
+        assert_eq!(value, body);
+        assert_eq!(*hits.lock().unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn exhausts_service_unavailable_retries() {
+        let max_retries = 2_u32;
+        let hits = Arc::new(Mutex::new(0_u32));
+        let responses = (0..=max_retries)
+            .map(|_| (503_u16, r#"{"error":"still overloaded"}"#.to_owned()))
+            .collect();
+        let origin = spawn_status_sequence(hits.clone(), responses);
+        let transport = make_transport(&origin, fast_retry(max_retries));
+
+        let error = transport
+            .post_json("test", &json!({"prompt": "hi"}))
+            .await
+            .expect_err("exhausted 503 retries should surface once");
+        match error {
+            ProviderError::HttpStatus { status, body } => {
+                assert_eq!(status, 503);
+                assert!(body.contains("still overloaded"));
+            }
+            other => panic!("expected HttpStatus, got {other}"),
+        }
+        assert_eq!(
+            *hits.lock().unwrap(),
+            max_retries + 1,
+            "one initial attempt plus each configured retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn does_not_retry_non_service_unavailable_errors() {
+        let hits = Arc::new(Mutex::new(0_u32));
+        let origin = spawn_status_sequence(
+            hits.clone(),
+            vec![(429, r#"{"error":"rate limited"}"#.to_owned())],
+        );
+        let transport = make_transport(&origin, fast_retry(5));
+
+        let error = transport
+            .post_json("test", &json!({"prompt": "hi"}))
+            .await
+            .expect_err("429 must not be retried");
+        assert!(matches!(
+            error,
+            ProviderError::HttpStatus { status: 429, .. }
+        ));
+        assert_eq!(*hits.lock().unwrap(), 1);
+    }
+
+    fn spawn_status_sequence(hits: Arc<Mutex<u32>>, responses: Vec<(u16, String)>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock");
+        let address = listener.local_addr().expect("mock address");
+        std::thread::spawn(move || {
+            for (status, body) in responses {
+                let (mut stream, _) = listener.accept().expect("accept");
+                drain_http_request(&mut stream);
+                *hits.lock().unwrap() += 1;
+                let reason = match status {
+                    200 => "OK",
+                    429 => "Too Many Requests",
+                    503 => "Service Unavailable",
+                    _ => "Error",
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).expect("write");
+            }
+        });
+        format!("http://{address}")
+    }
+
+    fn drain_http_request(stream: &mut std::net::TcpStream) {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("read timeout");
+        let mut bytes = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        let header_end = loop {
+            let read = stream.read(&mut chunk).expect("read request");
+            assert!(read > 0, "request closed before headers");
+            bytes.extend_from_slice(&chunk[..read]);
+            if let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                break end + 4;
+            }
+        };
+        let headers = std::str::from_utf8(&bytes[..header_end]).expect("UTF-8 headers");
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().expect("content length"))
+            })
+            .unwrap_or(0);
+        while bytes.len() - header_end < content_length {
+            let read = stream.read(&mut chunk).expect("read request body");
+            assert!(read > 0, "request closed before body");
+            bytes.extend_from_slice(&chunk[..read]);
+        }
     }
 }
