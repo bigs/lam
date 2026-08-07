@@ -33,14 +33,16 @@ pub(crate) const CODEX_BACKEND_BASE_URL: &str = "https://chatgpt.com/backend-api
 /// (see docs/TODO.md).
 pub(crate) const CODEX_CLIENT_VERSION: &str = "0.146.0";
 /// OAuth2 authorization-code + PKCE login endpoints, mirroring the official
-/// Codex CLI's flow. The loopback redirect port is ephemeral.
+/// Codex CLI's flow. The loopback redirect port is fixed by client registration.
 const OAUTH_AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
 const OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const OAUTH_SCOPE: &str = "openid profile email offline_access";
-/// Audience the official Codex CLI requests on the authorize URL. It may be
-/// required by the auth server; kept here so a live check can adjust it.
-const OAUTH_AUDIENCE: &str = "https://api.openai.com/v1";
+/// Loopback port the Codex OAuth client registration allows. The
+/// authorization server rejects any other port for this client id
+/// (`authorize_hydra_invalid_request`), so unlike the generic xAI login we
+/// bind this fixed port instead of an ephemeral one.
+const OAUTH_REDIRECT_PORT: u16 = 1455;
 /// How long `lam-agent login openai` waits for the browser redirect.
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const REFRESH_SKEW: Duration = Duration::from_secs(5 * 60);
@@ -485,7 +487,7 @@ pub(crate) async fn login(
     let store = CodexCredentialStore::default_store()?;
     let verifier = pkce_verifier()?;
     let state = oauth_state()?;
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", OAUTH_REDIRECT_PORT))
         .await
         .map_err(CodexAuthError::OAuthListener)?;
     let endpoints = OAuthEndpoints {
@@ -513,6 +515,29 @@ pub(crate) fn logout() -> Result<(), CodexAuthError> {
     store.remove()
 }
 
+/// Builds the authorize URL for the Codex OAuth client.
+///
+/// The parameter set mirrors the official Codex CLI exactly (fixed redirect
+/// port, simplified-flow and organization flags, originator; no `audience`).
+/// The authorization server validates this contract strictly: deviations
+/// surface as `authorize_hydra_invalid_request` before any login page.
+fn build_authorize_url(
+    authorize_base: &str,
+    redirect_uri: &str,
+    challenge: &str,
+    state: &str,
+) -> String {
+    format!(
+        "{authorize_base}?response_type=code&client_id={client_id}&redirect_uri={redirect_uri}&scope={scope}&code_challenge={challenge}&code_challenge_method=S256&state={state}&id_token_add_organizations=true&codex_cli_simplified_flow=true&originator={originator}",
+        client_id = url_encode(OAUTH_CLIENT_ID),
+        redirect_uri = url_encode(redirect_uri),
+        scope = url_encode(OAUTH_SCOPE),
+        challenge = url_encode(challenge),
+        state = url_encode(state),
+        originator = url_encode("lam-agent"),
+    )
+}
+
 /// Core login flow with injectable endpoints, listener, and OAuth secrets so
 /// tests can run it entirely against local listeners.
 async fn login_with(
@@ -531,16 +556,8 @@ async fn login_with(
         .map_err(CodexAuthError::OAuthListener)?
         .port();
     let redirect_uri = format!("http://localhost:{port}/auth/callback");
-    let authorize_url = format!(
-        "{authorize_base}?client_id={client_id}&redirect_uri={redirect_uri}&response_type=code&scope={scope}&audience={audience}&code_challenge={challenge}&code_challenge_method=S256&state={state}",
-        authorize_base = endpoints.authorize_base,
-        client_id = url_encode(OAUTH_CLIENT_ID),
-        redirect_uri = url_encode(&redirect_uri),
-        scope = url_encode(OAUTH_SCOPE),
-        audience = url_encode(OAUTH_AUDIENCE),
-        challenge = url_encode(&challenge),
-        state = url_encode(state),
-    );
+    let authorize_url =
+        build_authorize_url(&endpoints.authorize_base, &redirect_uri, &challenge, state);
 
     println!("OpenAI / Codex login");
     println!();
@@ -1015,7 +1032,9 @@ pub(crate) enum CodexAuthError {
     InvalidHeader(reqwest::header::InvalidHeaderValue),
     #[error("OpenAI OAuth request failed: {0}")]
     OAuthHttp(reqwest::Error),
-    #[error("could not start the local OAuth callback listener: {0}")]
+    #[error(
+        "could not start the local OAuth callback listener (the Codex flow needs port 1455 free): {0}"
+    )]
     OAuthListener(std::io::Error),
     #[error("OpenAI authorization timed out; no browser redirect was received")]
     OAuthTimedOut,
@@ -1240,6 +1259,37 @@ mod tests {
         assert_eq!(token.refresh_token.as_deref(), Some("refresh-exchange"));
         assert_eq!(token.id_token.as_deref(), Some(id_token.as_str()));
         server.await.unwrap();
+    }
+
+    #[test]
+    fn authorize_url_matches_the_official_cli_contract() {
+        let url = build_authorize_url(
+            "https://auth.openai.com/oauth/authorize",
+            "http://localhost:1455/auth/callback",
+            "challenge",
+            "state",
+        );
+        for expected in [
+            "response_type=code",
+            "client_id=app_EMoamEEZ73f0CkXaXp7hrann",
+            "redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback",
+            "scope=openid%20profile%20email%20offline_access",
+            "code_challenge=challenge",
+            "code_challenge_method=S256",
+            "state=state",
+            "id_token_add_organizations=true",
+            "codex_cli_simplified_flow=true",
+            "originator=lam-agent",
+        ] {
+            assert!(
+                url.contains(expected),
+                "authorize URL missing {expected}: {url}"
+            );
+        }
+        assert!(
+            !url.contains("audience="),
+            "official client sends no audience: {url}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
