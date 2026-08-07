@@ -254,11 +254,19 @@ requests; they must be enabled explicitly.
 ## Interactive TUI
 
 The separate `lam-tui` package produces the `lam-agent` executable while depending
-on the library crate of the same name. It loads `~/.lam/providers.toml`, starts
-the coding and multi-agent capability packs in the current directory, and
-renders a responsive conversation with expandable eval and lifecycle rows.
+on the library crate of the same name. It loads custom providers from
+`~/.lam/providers.toml`, starts the coding and multi-agent capability packs in
+the current directory, and renders a responsive conversation with expandable
+eval and lifecycle rows.
 See [`crates/lam-tui/README.md`](crates/lam-tui/README.md) for configuration and
 key bindings.
+
+Codex-enabled ChatGPT subscription access is available via the `openai-codex`
+provider type (`lam-agent login openai` — a native OAuth flow, no `codex`
+binary required). Lam uses the shared Codex login cache and the subscription
+Responses endpoint; no OpenAI Platform API key is
+needed. With the default configuration path, Lam adds the signed-in Codex
+provider automatically. Press `Alt+M` or use `/model` to select its model.
 
 SuperGrok / X Premium subscription access is available via the `xai-supergrok`
 provider type (`lam-agent login xai`); requests go through the Grok CLI chat

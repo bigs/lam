@@ -3,6 +3,7 @@
 mod app;
 mod boot;
 mod clipboard;
+mod codex;
 mod config;
 mod diagnostics;
 mod runtime;
@@ -737,6 +738,7 @@ enum CliCommand {
     Login {
         provider: LoginProvider,
         no_browser: bool,
+        force: bool,
     },
     Logout {
         provider: LoginProvider,
@@ -745,6 +747,7 @@ enum CliCommand {
 
 #[derive(Clone, Copy)]
 enum LoginProvider {
+    OpenAi,
     Xai,
 }
 
@@ -773,13 +776,15 @@ impl Args {
                         .and_then(|value| value.to_str().map(str::to_owned))
                         .ok_or_else(|| {
                             AppError::Arguments(
-                                "login requires a provider; try `lam-agent login xai`".to_owned(),
+                                "login requires a provider; try `lam-agent login openai` or `lam-agent login xai`".to_owned(),
                             )
                         })?;
                     let mut no_browser = false;
+                    let mut force = false;
                     for flag in arguments.by_ref() {
                         match flag.to_str() {
                             Some("--no-browser") => no_browser = true,
+                            Some("--force") => force = true,
                             Some(value) => {
                                 return Err(AppError::Arguments(format!(
                                     "unknown login flag `{value}`; try --help"
@@ -795,6 +800,7 @@ impl Args {
                     command = Some(CliCommand::Login {
                         provider: parse_login_provider(&provider)?,
                         no_browser,
+                        force,
                     });
                 }
                 Some("logout") => {
@@ -803,7 +809,7 @@ impl Args {
                         .and_then(|value| value.to_str().map(str::to_owned))
                         .ok_or_else(|| {
                             AppError::Arguments(
-                                "logout requires a provider; try `lam-agent logout xai`".to_owned(),
+                                "logout requires a provider; try `lam-agent logout openai` or `lam-agent logout xai`".to_owned(),
                             )
                         })?;
                     command = Some(CliCommand::Logout {
@@ -834,9 +840,10 @@ impl Args {
 
 fn parse_login_provider(value: &str) -> Result<LoginProvider, AppError> {
     match value {
+        "openai" | "codex" | "chatgpt" => Ok(LoginProvider::OpenAi),
         "xai" | "supergrok" | "grok" => Ok(LoginProvider::Xai),
         other => Err(AppError::Arguments(format!(
-            "unknown auth provider `{other}`; supported: xai"
+            "unknown auth provider `{other}`; supported: openai, xai"
         ))),
     }
 }
@@ -844,13 +851,33 @@ fn parse_login_provider(value: &str) -> Result<LoginProvider, AppError> {
 async fn run_command(command: CliCommand) -> Result<(), AppError> {
     match command {
         CliCommand::Login {
+            provider: LoginProvider::OpenAi,
+            no_browser,
+            force,
+        } => {
+            codex::login(no_browser, force)
+                .await
+                .map_err(AppError::CodexAuth)?;
+            Ok(())
+        }
+        CliCommand::Login {
             provider: LoginProvider::Xai,
             no_browser,
+            force: _,
         } => {
             let store = xai::XaiCredentialStore::default_store().map_err(AppError::Auth)?;
             xai::device_login(&store, !no_browser)
                 .await
                 .map_err(AppError::OAuth)?;
+            Ok(())
+        }
+        CliCommand::Logout {
+            provider: LoginProvider::OpenAi,
+        } => {
+            codex::logout().map_err(AppError::CodexAuth)?;
+            println!(
+                "Removed shared Codex login credentials; the official Codex CLI is signed out too (the cache is shared)."
+            );
             Ok(())
         }
         CliCommand::Logout {
@@ -926,7 +953,7 @@ impl Drop for TerminalSession {
 
 fn print_help() {
     println!(
-        "lam-agent — a minimal TypeScript coding agent\n\nUSAGE:\n    lam-agent [--config PATH] [--debug-log]\n    lam-agent login xai [--no-browser]\n    lam-agent logout xai\n\nOPTIONS:\n    --config PATH  Read providers from PATH instead of ~/.lam/providers.toml\n    --debug-log    Append metadata-only diagnostics beside the session journal\n    -h, --help     Show this help\n    -V, --version  Show the version\n\nCOMMANDS:\n    login xai      Sign in with SuperGrok / X Premium via device-code OAuth\n    logout xai     Remove stored SuperGrok credentials from ~/.lam/auth/xai.json\n\nLam resumes the latest durable session for the current directory. Inside the TUI,\ntype / for commands, including /new for a fresh session and /session to restore\nan earlier one; in that picker, Ctrl+D twice deletes the highlighted session.\nTab switches focus between the input shelf and conversation;\narrows select transcript rows; Enter expands the selected row. While the root is\nworking, a submitted message is queued above the input as a pending steer and is delivered at the next model boundary. Press Escape twice within 1.5 seconds to stop its complete agent tree."
+        "lam-agent — a minimal TypeScript coding agent\n\nUSAGE:\n    lam-agent [--config PATH] [--debug-log]\n    lam-agent login openai [--no-browser] [--force]\n    lam-agent login xai [--no-browser]\n    lam-agent logout openai\n    lam-agent logout xai\n\nOPTIONS:\n    --config PATH  Read providers from PATH instead of ~/.lam/providers.toml\n    --debug-log    Append metadata-only diagnostics beside the session journal\n    -h, --help     Show this help\n    -V, --version  Show the version\n\nCOMMANDS:\n    login openai   Sign in with ChatGPT via Codex OAuth; --force replaces an existing login\n    login xai      Sign in with SuperGrok / X Premium via device-code OAuth\n    logout openai  Remove the shared Codex login (also signs out the official Codex CLI)\n    logout xai     Remove stored SuperGrok credentials from ~/.lam/auth/xai.json\n\nLam resumes the latest durable session for the current directory. Inside the TUI,\ntype / for commands, including /new for a fresh session and /session to restore\nan earlier one; in that picker, Ctrl+D twice deletes the highlighted session.\nPress Alt+M to select a provider and model. Tab switches focus between the input\nshelf and conversation; arrows select transcript rows; Enter expands the selected\nrow. While the root is working, a submitted message is queued above the input as\na pending steer and is delivered at the next model boundary. Press Escape twice\nwithin 1.5 seconds to stop its complete agent tree."
     );
 }
 
@@ -939,7 +966,7 @@ enum AppError {
     #[error("could not resolve the current directory: {0}")]
     CanonicalCurrentDirectory(std::io::Error),
     #[error(
-        "{0}\n\nCreate the file or pass --config PATH. See crates/lam-tui/README.md for an example."
+        "{0}\n\nRun `lam-agent login openai` to use the built-in Codex catalog, or create the file. See crates/lam-tui/README.md for details."
     )]
     Config(crate::config::ConfigError),
     #[error(transparent)]
@@ -952,6 +979,8 @@ enum AppError {
     Auth(crate::xai::AuthError),
     #[error(transparent)]
     OAuth(crate::xai::OAuthError),
+    #[error(transparent)]
+    CodexAuth(crate::codex::CodexAuthError),
     #[error("terminal operation failed: {0}")]
     Terminal(std::io::Error),
     #[error("could not start terminal event reader: {0}")]

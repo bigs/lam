@@ -6,11 +6,17 @@ Ratatui conversation interface.
 
 ## Configuration
 
-Lam reads `~/.lam/providers.toml` by default. `--config PATH` selects another
-file. Provider names and model IDs form stable selector strings such as
+Lam reads custom providers from `~/.lam/providers.toml` by default. `--config
+PATH` selects another file. A signed-in Codex subscription is added to the
+default provider catalog automatically, so it does not need a TOML entry. Lam
+can also start without `~/.lam/providers.toml` when Codex login credentials are
+available. An explicit `--config` file stays authoritative and does not receive
+automatic providers.
+
+Provider names and model IDs form stable selector strings such as
 `openai/gpt-5`. Provider-native model paths may contain `/`; the provider name
 is simply prepended to form the selector. A ready-to-copy configuration for
-OpenAI Responses, Fireworks, and Synthetic is in
+custom OpenAI Responses, Fireworks, and Synthetic providers is in
 [`providers.example.toml`](providers.example.toml).
 
 ```toml
@@ -47,11 +53,50 @@ efforts = ["low", "high"]
 ```
 
 The supported provider types are `openai-responses`,
-`openai-chat-completions`, and `xai-supergrok`. A provider can set either
-`api_key` directly or `api_key_env` to resolve it from the process environment.
+`openai-chat-completions`, `openai-codex`, and `xai-supergrok`. A provider can
+set either `api_key` directly or `api_key_env` to resolve it from the process environment.
 When storing a key in the file, restrict its filesystem permissions. An optional
 model-level `extra_body` table carries provider-specific request options; Lam's
 protocol invariants still override conflicting keys.
+
+### Codex subscription (`openai-codex`)
+
+Use a Codex-enabled ChatGPT subscription without an OpenAI Platform API key.
+Sign in once, then start Lam:
+
+```bash
+lam-agent login openai
+lam-agent
+# headless / SSH:
+lam-agent login openai --no-browser
+```
+
+Press `Alt+M`, or type `/model`, to select the Codex provider and model. The
+picker groups all usable models by provider. The selected provider and model
+are stored in the durable session and return when that session resumes.
+
+Lam reads the shared Codex login cache from `$CODEX_HOME/auth.json`, or
+`~/.codex/auth.json` when `CODEX_HOME` is not set. It refreshes an expiring
+access token and writes the updated tokens back with user-only permissions.
+
+`lam-agent login openai` runs the OAuth2 authorization-code + PKCE flow directly
+against OpenAI — no `codex` executable is required. It prints an authorization
+URL, opens your browser unless `--no-browser` is given, and waits for the
+redirect on a local loopback listener before exchanging the code for tokens.
+If a valid login already exists in the shared cache, the command refuses to
+overwrite it and tells you to run `lam-agent logout openai` first; pass
+`--force` to replace it anyway.
+
+Subscription model routing is gated on the compatibility identity of the
+official Codex CLI, so Lam sends the hardcoded `CODEX_CLIENT_VERSION`
+(crates/lam-tui/src/codex.rs) in the `version` and `User-Agent` headers; bump
+that constant when a model requires a newer Codex version. `lam-agent logout
+openai` removes the shared login, so it also signs the official Codex CLI out.
+
+Do not set `api_key` or `api_key_env` on an `openai-codex` provider. Available
+models and usage limits depend on the selected ChatGPT workspace and plan. Lam
+does not allow an `api_base` override for this provider because that could send
+the shared Codex credential to another server.
 
 ### SuperGrok subscription (`xai-supergrok`)
 
@@ -174,6 +219,8 @@ or raw SSE payloads.
   `/model`, `/effort`, `/exit`, and its `/quit` alias are available. `/model`
   opens models grouped by provider; `/effort` lists the active model's
   configured effort values.
+- Press `Alt+M` to open the provider and model picker directly. Type to filter,
+  use Up/Down to select an item, and press Enter twice to confirm the switch.
 - `/agents` opens the session's actor tree. Selecting an actor switches the
   conversation pane to that actor without interrupting a running root call.
 - Tab completes an open menu. Otherwise it switches focus between the input

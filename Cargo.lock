@@ -1656,6 +1656,7 @@ name = "lam-tui"
 version = "0.1.0"
 dependencies = [
  "arboard",
+ "base64",
  "crossterm",
  "lam",
  "lam-agents",
@@ -1666,6 +1667,7 @@ dependencies = [
  "ratatui",
  "redb",
  "reqwest",
+ "ring",
  "serde",
  "serde_json",
  "tempfile",

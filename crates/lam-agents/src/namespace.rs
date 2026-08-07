@@ -521,6 +521,21 @@ fn models_catalog_from_targets(
     }
 }
 
+fn send_system_error(error: crate::AgentSystemError) -> SendError {
+    match error {
+        crate::AgentSystemError::ActorUnavailable { address }
+        | crate::AgentSystemError::ActorTaskPanicked { address } => {
+            SendError::AddressUnavailable { address }
+        }
+        crate::AgentSystemError::ShuttingDown | crate::AgentSystemError::WorkerUnavailable => {
+            SendError::Unavailable
+        }
+        error => SendError::DeliveryFailed {
+            message: error.to_string(),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -578,20 +593,5 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["gpt-default", "gpt-other"]
         );
-    }
-}
-
-fn send_system_error(error: crate::AgentSystemError) -> SendError {
-    match error {
-        crate::AgentSystemError::ActorUnavailable { address }
-        | crate::AgentSystemError::ActorTaskPanicked { address } => {
-            SendError::AddressUnavailable { address }
-        }
-        crate::AgentSystemError::ShuttingDown | crate::AgentSystemError::WorkerUnavailable => {
-            SendError::Unavailable
-        }
-        error => SendError::DeliveryFailed {
-            message: error.to_string(),
-        },
     }
 }

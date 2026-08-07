@@ -16,6 +16,7 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace.dependencies]
+base64 = "=0.22.1"
 deno_ast = { version = "=0.53.3", features = ["transpiling"] }
 deno_core = "=0.409.0"
 deno_error = "=0.7.1"

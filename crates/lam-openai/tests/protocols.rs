@@ -2,6 +2,7 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -13,6 +14,7 @@ use lam::{
     ModelRequestConfig, ModelResponseMetadata, OutputContract, ProjectedContextEntry, Revision,
     RunEvent, RunId, RunProgress, Timestamp, ToolCallDelta,
 };
+use lam_openai::AuthSource;
 use lam_openai::chat_completions::{
     ChatCompletions, REQUEST_CODEC_ID as CHAT_REQUEST_CODEC_ID,
     RESPONSE_CODEC_ID as CHAT_RESPONSE_CODEC_ID,
@@ -22,7 +24,41 @@ use lam_openai::responses::{
     RESPONSE_CODEC_ID as RESPONSES_RESPONSE_CODEC_ID, Responses,
 };
 use lam_openai::{BuildError, ModelPricing, ProviderError};
+use reqwest::header::HeaderValue;
 use serde_json::{Value, json};
+
+/// Test auth source whose bearer token changes after each reported refresh,
+/// so tests can prove a 401 forced the provider to ask for new credentials.
+struct RefreshingAuth {
+    counter: Arc<AtomicUsize>,
+}
+
+impl AuthSource for RefreshingAuth {
+    fn authorization(
+        &self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Option<HeaderValue>, ProviderError>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            let token = format!("Bearer token-{}", self.counter.load(Ordering::Relaxed) + 1);
+            Ok(Some(HeaderValue::from_str(&token).unwrap()))
+        })
+    }
+
+    fn on_unauthorized(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, ProviderError>> + Send + '_>>
+    {
+        Box::pin(async move {
+            self.counter.fetch_add(1, Ordering::Relaxed);
+            Ok(true)
+        })
+    }
+}
 
 #[test]
 fn responses_request_is_stateless_and_replays_encrypted_reasoning_unchanged() {
@@ -1164,7 +1200,7 @@ fn durable_interruption_replays_eval_failure_and_notice_in_both_protocols() {
 }
 
 #[tokio::test]
-async fn responses_provider_sends_store_false_and_returns_completed_native_response() {
+async fn responses_provider_accepts_mislabeled_sse_and_returns_completed_native_response() {
     let completed = json!({
         "id": "resp_1",
         "object": "response",
@@ -1185,7 +1221,7 @@ async fn responses_provider_sends_store_false_and_returns_completed_native_respo
         }
     });
     let stream = format!(
-        "event: response.output_item.added\ndata: {}\n\nevent: response.function_call_arguments.delta\ndata: {}\n\nevent: response.output_text.delta\ndata: {}\n\nevent: response.completed\ndata: {}\n\n",
+        "event: ping\ndata: keep-alive\n\nevent: response.output_item.added\ndata: {}\n\nevent: response.function_call_arguments.delta\ndata: {}\n\nevent: response.output_text.delta\ndata: {}\n\nevent: response.completed\ndata: {}\n\n",
         json!({
             "type": "response.output_item.added",
             "output_index": 1,
@@ -1204,7 +1240,7 @@ async fn responses_provider_sends_store_false_and_returns_completed_native_respo
         json!({ "type": "response.output_text.delta", "delta": "hello" }),
         json!({ "type": "response.completed", "response": completed })
     );
-    let server = MockServer::start("text/event-stream", stream);
+    let server = MockServer::start("text/plain; charset=utf-8", stream);
     let (provider, codec) = Responses::builder("gpt-test")
         .api_key("test-key")
         .base_url(format!("{}/v1", server.origin))
@@ -1258,6 +1294,253 @@ async fn responses_provider_sends_store_false_and_returns_completed_native_respo
             }),
             ModelDelta::Text("hello".to_owned()),
         ]
+    );
+}
+
+#[tokio::test]
+async fn responses_provider_reconstructs_codex_output_from_done_items() {
+    let message = json!({
+        "type": "message",
+        "role": "assistant",
+        "content": [{ "type": "output_text", "text": "hello from Codex" }]
+    });
+    let completed = json!({
+        "id": "resp_codex",
+        "usage": {
+            "input_tokens": 10,
+            "output_tokens": 4,
+            "total_tokens": 14
+        }
+    });
+    let stream = format!(
+        "event: response.output_text.delta\ndata: {}\n\nevent: response.output_item.done\ndata: {}\n\nevent: response.completed\ndata: {}\n\n",
+        json!({ "type": "response.output_text.delta", "delta": "hello from Codex" }),
+        json!({ "type": "response.output_item.done", "item": message }),
+        json!({ "type": "response.completed", "response": completed })
+    );
+    let server = MockServer::start("text/event-stream", stream);
+    let (provider, codec) = Responses::builder("gpt-test")
+        .api_key("test-key")
+        .base_url(format!("{}/v1", server.origin))
+        .build_parts()
+        .expect("valid adapter");
+    let request = codec
+        .encode_request(
+            &[user_message("hello")],
+            &ModelRequestConfig::agent(&OutputContract::Text, ""),
+        )
+        .expect("valid request");
+    let deltas = Arc::new(Mutex::new(Vec::new()));
+    let captured_deltas = Arc::clone(&deltas);
+    let response = provider
+        .invoke(
+            request,
+            ModelEventSink::new(move |delta| captured_deltas.lock().unwrap().push(delta)),
+        )
+        .await
+        .expect("successful response");
+    server.finish();
+
+    assert_eq!(response.value["response"]["output"], json!([message]));
+    assert_eq!(
+        codec.project_response(&response).unwrap().directive,
+        ModelDirective::Output(Value::String("hello from Codex".to_owned()))
+    );
+    assert_eq!(
+        *deltas.lock().unwrap(),
+        vec![ModelDelta::Text("hello from Codex".to_owned())]
+    );
+}
+
+#[tokio::test]
+async fn codex_reconstruction_does_not_duplicate_displayed_text_on_recovery() {
+    // A Codex-style stream carries the assistant text as live
+    // response.output_text.delta events and then completes with an empty
+    // `output`, so the provider reconstructs the stored payload from
+    // response.output_item.done items. Both views of the same text (the live
+    // deltas and the reconstructed payload) must survive a durable resume
+    // without rendering the assistant text twice.
+    let message = json!({
+        "type": "message",
+        "role": "assistant",
+        "content": [{ "type": "output_text", "text": "hello from Codex" }]
+    });
+    let completed = json!({
+        "id": "resp_codex",
+        "usage": {
+            "input_tokens": 10,
+            "output_tokens": 4,
+            "total_tokens": 14
+        }
+    });
+    let stream = format!(
+        "event: response.output_text.delta\ndata: {}\n\nevent: response.output_text.delta\ndata: {}\n\nevent: response.output_item.done\ndata: {}\n\nevent: response.completed\ndata: {}\n\n",
+        json!({ "type": "response.output_text.delta", "delta": "hello " }),
+        json!({ "type": "response.output_text.delta", "delta": "from Codex" }),
+        json!({ "type": "response.output_item.done", "item": message }),
+        json!({ "type": "response.completed", "response": completed })
+    );
+    let server = MockServer::start("text/event-stream", stream);
+    let model = Responses::builder("gpt-test")
+        .api_key("test-key")
+        .base_url(format!("{}/v1", server.origin))
+        .build()
+        .expect("valid adapter");
+    let codec = model.shared_parts().1;
+    let store = Arc::new(lam::MemStore::new());
+
+    // 1. A complete durable runtime invocation against the Codex stream.
+    //    While streaming, the live deltas are the only place the assistant
+    //    text appears for this step.
+    let mut actor = lam::Lam::builder(model.clone())
+        .state_store(Arc::clone(&store))
+        .build()
+        .actor("codex-reconstruction")
+        .build()
+        .await
+        .expect("actor starts");
+    let mut run = actor.call("hello");
+    let mut live_text = String::new();
+    while let Some(event) = run.next().await {
+        if let lam::RunEvent::ModelDelta {
+            delta: lam::ModelDelta::Text(text),
+            ..
+        } = event
+        {
+            live_text.push_str(&text);
+        }
+    }
+    let answer: String = run.await.expect("run completes");
+    assert_eq!(answer, "hello from Codex");
+    assert_eq!(live_text, "hello from Codex");
+    assert_eq!(live_text.matches("hello from Codex").count(), 1);
+    actor.shutdown().await.expect("actor shuts down");
+    server.finish();
+
+    // 2. Durable resume against the same journal. The transcript is rebuilt
+    //    from projected display deltas, so the reconstructed payload must not
+    //    render the already-streamed text a second time.
+    let resumed = lam::Lam::builder(model)
+        .state_store(Arc::clone(&store))
+        .build()
+        .actor("codex-reconstruction")
+        .build()
+        .await
+        .expect("actor resumes");
+    let state = resumed
+        .actor_ref()
+        .state()
+        .await
+        .expect("state should project");
+    let mut recovered_text = String::new();
+    for projected in state.context() {
+        if !matches!(
+            projected.entry.transition,
+            lam::ContextTransition::Model { .. }
+        ) {
+            continue;
+        }
+        let projection = codec
+            .project_response(&projected.entry.payload)
+            .expect("stored Codex payload must re-project");
+        for delta in projection.display {
+            if let lam::ModelDelta::Text(text) = delta {
+                recovered_text.push_str(&text);
+            }
+        }
+    }
+    assert_eq!(recovered_text, "hello from Codex");
+    assert_eq!(recovered_text.matches("hello from Codex").count(), 1);
+    resumed.shutdown().await.expect("resumed actor shuts down");
+}
+
+#[tokio::test]
+async fn responses_provider_refreshes_a_rejected_access_token_and_retries() {
+    // A long-running session can hold an access token that the provider
+    // starts rejecting with 401 (e.g. rotated by another client or revoked
+    // server-side) while the refresh token is still valid. The provider must
+    // force a refresh and retry the request instead of failing the turn.
+    let completed = json!({
+        "id": "resp_retry",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "message",
+            "role": "assistant",
+            "content": [{ "type": "output_text", "text": "fresh token worked" }]
+        }]
+    });
+    let stream = format!(
+        "event: response.output_text.delta\ndata: {}\n\nevent: response.completed\ndata: {}\n\n",
+        json!({ "type": "response.output_text.delta", "delta": "fresh token worked" }),
+        json!({ "type": "response.completed", "response": completed })
+    );
+    // The first request is answered 401 with an empty body; the retry (after
+    // the auth source reports refreshed credentials) gets the SSE stream.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+    let address = listener.local_addr().expect("mock address");
+    let origin = format!("http://{address}");
+    let authorizations = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&authorizations);
+    let join = std::thread::spawn(move || {
+        let mut first = true;
+        for body in [String::new(), stream] {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let captured = read_request(&mut stream);
+            let authorization = captured
+                .raw_headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+                .map(|(_, value)| value.clone())
+                .expect("authorization header");
+            sink.lock().unwrap().push(authorization);
+            let (status, content_type) = if first {
+                first = false;
+                ("401 Unauthorized", "application/json")
+            } else {
+                ("200 OK", "text/event-stream")
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+        }
+    });
+
+    let refreshes = Arc::new(AtomicUsize::new(0));
+    let auth = RefreshingAuth {
+        counter: Arc::clone(&refreshes),
+    };
+    let (provider, codec) = Responses::builder("gpt-test")
+        .auth_source(Arc::new(auth))
+        .base_url(format!("{origin}/v1"))
+        .build_parts()
+        .expect("valid adapter");
+    let request = codec
+        .encode_request(
+            &[user_message("hello")],
+            &ModelRequestConfig::agent(&OutputContract::Text, ""),
+        )
+        .expect("valid request");
+    let response = provider
+        .invoke(request, ModelEventSink::new(|_| {}))
+        .await
+        .expect("request retried with a fresh token");
+    join.join().expect("mock server thread");
+
+    // Exactly one refresh: the 401 triggered on_unauthorized once, and the
+    // retried request then used the rotated token.
+    assert_eq!(refreshes.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        authorizations.lock().unwrap().as_slice(),
+        ["Bearer token-1".to_owned(), "Bearer token-2".to_owned()]
+    );
+    assert_eq!(
+        codec.project_response(&response).unwrap().directive,
+        ModelDirective::Output(Value::String("fresh token worked".to_owned()))
     );
 }
 
@@ -2082,6 +2365,7 @@ fn codec(id: &str) -> CodecRef {
 struct CapturedRequest {
     path: String,
     body: Value,
+    raw_headers: Vec<(String, String)>,
 }
 
 struct MockServer {
@@ -2216,6 +2500,14 @@ fn read_request(stream: &mut TcpStream) -> CapturedRequest {
         .and_then(|line| line.split_whitespace().nth(1))
         .expect("request path")
         .to_owned();
+    let raw_headers = headers
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            Some((name.trim().to_owned(), value.trim().to_owned()))
+        })
+        .collect();
     let content_length = headers
         .lines()
         .find_map(|line| {
@@ -2231,5 +2523,9 @@ fn read_request(stream: &mut TcpStream) -> CapturedRequest {
     }
     let body = serde_json::from_slice(&bytes[header_end..header_end + content_length])
         .expect("JSON request body");
-    CapturedRequest { path, body }
+    CapturedRequest {
+        path,
+        body,
+        raw_headers,
+    }
 }

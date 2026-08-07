@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use thiserror::Error;
 
+use crate::codex::CodexCredentialStore;
+
 const CONFIG_DIR: &str = ".lam";
 const CONFIG_FILE: &str = "providers.toml";
 
@@ -14,6 +16,13 @@ const CONFIG_FILE: &str = "providers.toml";
 pub(crate) enum ProviderProtocol {
     #[serde(alias = "openai_responses")]
     OpenaiResponses,
+    /// OpenAI Codex subscription through the official Codex login cache.
+    #[serde(
+        alias = "openai_codex",
+        alias = "codex",
+        alias = "chatgpt-subscription"
+    )]
+    OpenaiCodex,
     #[serde(alias = "openai_chat_completions")]
     OpenaiChatCompletions,
     /// SuperGrok / X Premium subscription via OAuth and the Grok CLI chat proxy.
@@ -76,15 +85,30 @@ impl LoadedConfig {
             Some(path) => path.to_path_buf(),
             None => default_path()?,
         };
-        let source = fs::read_to_string(&path).map_err(|source| ConfigError::Read {
-            path: path.clone(),
-            source,
-        })?;
-        let config: ProvidersConfig =
-            toml::from_str(&source).map_err(|source| ConfigError::Parse {
+        let use_builtin_codex = explicit.is_none()
+            && CodexCredentialStore::default_store().is_ok_and(|store| store.credentials_present());
+        Self::load_path(path, use_builtin_codex)
+    }
+
+    fn load_path(path: PathBuf, use_builtin_codex: bool) -> Result<Self, ConfigError> {
+        let mut config = match fs::read_to_string(&path) {
+            Ok(source) => toml::from_str(&source).map_err(|source| ConfigError::Parse {
                 path: path.clone(),
                 source,
-            })?;
+            })?,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound && use_builtin_codex => {
+                codex_only_config()
+            }
+            Err(source) => {
+                return Err(ConfigError::Read {
+                    path: path.clone(),
+                    source,
+                });
+            }
+        };
+        if use_builtin_codex {
+            add_builtin_codex_provider(&mut config);
+        }
         let (models, default_index) = validate(&config)?;
         Ok(Self {
             path,
@@ -93,6 +117,88 @@ impl LoadedConfig {
             default_index,
         })
     }
+}
+
+fn codex_only_config() -> ProvidersConfig {
+    ProvidersConfig {
+        default_model: "codex/gpt-5.6-terra".to_owned(),
+        providers: vec![builtin_codex_provider("codex")],
+    }
+}
+
+fn add_builtin_codex_provider(config: &mut ProvidersConfig) {
+    if config
+        .providers
+        .iter()
+        .any(|provider| provider.protocol == ProviderProtocol::OpenaiCodex)
+    {
+        return;
+    }
+    let name = unique_provider_name(config, "codex");
+    config.providers.push(builtin_codex_provider(&name));
+}
+
+fn unique_provider_name(config: &ProvidersConfig, preferred: &str) -> String {
+    if config
+        .providers
+        .iter()
+        .all(|provider| provider.name != preferred)
+    {
+        return preferred.to_owned();
+    }
+    let base = format!("{preferred}-subscription");
+    if config
+        .providers
+        .iter()
+        .all(|provider| provider.name != base)
+    {
+        return base;
+    }
+    (2..)
+        .map(|suffix| format!("{base}-{suffix}"))
+        .find(|candidate| {
+            config
+                .providers
+                .iter()
+                .all(|provider| provider.name != *candidate)
+        })
+        .expect("the provider suffix space is not bounded")
+}
+
+fn builtin_codex_provider(name: &str) -> ProviderConfig {
+    ProviderConfig {
+        name: name.to_owned(),
+        protocol: ProviderProtocol::OpenaiCodex,
+        api_base: None,
+        api_key: None,
+        api_key_env: None,
+        effort_path: None,
+        models: [
+            ("gpt-5.6-luna", "GPT-5.6 Luna"),
+            ("gpt-5.6-sol", "GPT-5.6 Sol"),
+            ("gpt-5.6-terra", "GPT-5.6 Terra"),
+        ]
+        .into_iter()
+        .map(|(id, name)| ModelConfig {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            context_window: 1_050_000,
+            efforts: ["none", "low", "medium", "high", "xhigh", "max"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            extra_body: reasoning_summary_body(),
+        })
+        .collect(),
+    }
+}
+
+fn reasoning_summary_body() -> toml::Table {
+    let mut reasoning = toml::Table::new();
+    reasoning.insert("summary".to_owned(), toml::Value::String("auto".to_owned()));
+    let mut body = toml::Table::new();
+    body.insert("reasoning".to_owned(), toml::Value::Table(reasoning));
+    body
 }
 
 impl ProviderConfig {
@@ -139,9 +245,9 @@ impl ProviderConfig {
 
     pub(crate) fn resolved_effort_path(&self) -> Result<Vec<String>, ConfigError> {
         let path = self.effort_path.as_deref().unwrap_or(match self.protocol {
-            ProviderProtocol::OpenaiResponses | ProviderProtocol::XaiSupergrok => {
-                "reasoning.effort"
-            }
+            ProviderProtocol::OpenaiResponses
+            | ProviderProtocol::OpenaiCodex
+            | ProviderProtocol::XaiSupergrok => "reasoning.effort",
             ProviderProtocol::OpenaiChatCompletions => "reasoning_effort",
         });
         let segments = path.split('.').map(str::to_owned).collect::<Vec<_>>();
@@ -188,8 +294,25 @@ fn validate(config: &ProvidersConfig) -> Result<(Vec<ModelChoice>, usize), Confi
                 provider.name
             )));
         }
-        if provider.protocol != ProviderProtocol::XaiSupergrok {
-            provider.validate_api_key_fields()?;
+        match provider.protocol {
+            ProviderProtocol::OpenaiCodex
+                if provider.api_key.is_some() || provider.api_key_env.is_some() =>
+            {
+                return Err(invalid(format!(
+                    "provider `{}` uses Codex subscription credentials and must not set api_key or api_key_env",
+                    provider.name
+                )));
+            }
+            ProviderProtocol::OpenaiCodex if provider.api_base.is_some() => {
+                return Err(invalid(format!(
+                    "provider `{}` must not override api_base because Codex credentials are restricted to the ChatGPT Codex endpoint",
+                    provider.name
+                )));
+            }
+            ProviderProtocol::XaiSupergrok | ProviderProtocol::OpenaiCodex => {}
+            ProviderProtocol::OpenaiResponses | ProviderProtocol::OpenaiChatCompletions => {
+                provider.validate_api_key_fields()?;
+            }
         }
         let effort_path = provider.resolved_effort_path()?;
 
@@ -341,7 +464,9 @@ pub(crate) enum ConfigError {
 
 #[cfg(test)]
 mod tests {
-    use super::{ProvidersConfig, validate};
+    use std::fs;
+
+    use super::{LoadedConfig, ProvidersConfig, add_builtin_codex_provider, validate};
 
     const VALID: &str = r#"
 default_model = "openai/gpt-5"
@@ -374,6 +499,62 @@ efforts = ["low", "medium", "high"]
     }
 
     #[test]
+    fn signed_in_codex_is_added_to_the_default_provider_catalog() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("providers.toml");
+        fs::write(&path, VALID).unwrap();
+
+        let loaded = LoadedConfig::load_path(path, true).unwrap();
+
+        assert_eq!(loaded.config.providers.len(), 2);
+        assert!(
+            loaded
+                .models
+                .iter()
+                .any(|model| model.registry_id == "codex/gpt-5.6-sol")
+        );
+        assert!(
+            loaded
+                .models
+                .iter()
+                .any(|model| model.registry_id == "codex/gpt-5.6-terra")
+        );
+        assert_eq!(
+            loaded.models[loaded.default_index].registry_id,
+            "openai/gpt-5"
+        );
+    }
+
+    #[test]
+    fn signed_in_codex_can_start_without_a_provider_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("providers.toml");
+
+        let loaded = LoadedConfig::load_path(path, true).unwrap();
+
+        assert_eq!(loaded.config.providers.len(), 1);
+        assert_eq!(loaded.models.len(), 3);
+        assert_eq!(
+            loaded.models[loaded.default_index].registry_id,
+            "codex/gpt-5.6-terra"
+        );
+    }
+
+    #[test]
+    fn configured_codex_provider_is_not_added_twice() {
+        let mut config: ProvidersConfig = toml::from_str(
+            &VALID
+                .replace("type = \"openai-responses\"", "type = \"openai-codex\"")
+                .replace("api_key = \"test-key\"\n", ""),
+        )
+        .unwrap();
+
+        add_builtin_codex_provider(&mut config);
+
+        assert_eq!(config.providers.len(), 1);
+    }
+
+    #[test]
     fn distributed_provider_example_matches_the_config_schema() {
         let config: ProvidersConfig =
             toml::from_str(include_str!("../providers.example.toml")).unwrap();
@@ -390,6 +571,8 @@ efforts = ["low", "medium", "high"]
 
         assert!(model_ids.contains(&("openai", "gpt-5.6-sol")));
         assert!(model_ids.contains(&("openai", "gpt-5.6-terra")));
+        assert!(model_ids.contains(&("codex", "gpt-5.6-sol")));
+        assert!(model_ids.contains(&("codex", "gpt-5.6-terra")));
         assert!(model_ids.contains(&("synthetic", "syn:large:text")));
         assert!(model_ids.contains(&("synthetic", "syn:small:vision")));
         assert!(model_ids.contains(&("xai", "grok-4.5")));
@@ -419,6 +602,14 @@ efforts = ["low", "medium", "high"]
                 .find(|provider| provider.name == "xai")
                 .map(|provider| provider.protocol),
             Some(super::ProviderProtocol::XaiSupergrok)
+        );
+        assert_eq!(
+            config
+                .providers
+                .iter()
+                .find(|provider| provider.name == "codex")
+                .map(|provider| provider.protocol),
+            Some(super::ProviderProtocol::OpenaiCodex)
         );
     }
 
@@ -536,5 +727,19 @@ efforts = ["high"]
             err,
             super::ConfigError::MissingEnvironmentKey { .. }
         ));
+    }
+
+    #[test]
+    fn codex_subscription_rejects_api_keys() {
+        let source = VALID
+            .replace("type = \"openai-responses\"", "type = \"openai-codex\"")
+            .replace("api_key = \"test-key\"", "api_key = \"must-not-be-here\"");
+        let config: ProvidersConfig = toml::from_str(&source).unwrap();
+        assert!(
+            validate(&config)
+                .unwrap_err()
+                .to_string()
+                .contains("must not set api_key")
+        );
     }
 }

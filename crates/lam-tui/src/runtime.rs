@@ -23,6 +23,10 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 
 use crate::boot::{phase, phase_sync};
+use crate::codex::{
+    CODEX_BACKEND_BASE_URL, CodexCredentialStore, default_headers as codex_default_headers,
+    load_codex_auth,
+};
 use crate::config::{LoadedConfig, ModelChoice, ModelConfig, ProviderConfig, ProviderProtocol};
 use crate::session::Session;
 use crate::xai::{
@@ -1261,7 +1265,7 @@ fn agent_history(
 }
 
 /// Stable label for the model an actor has selected.
-
+///
 /// Child actors historically journaled the Lam builder default id `default`.
 /// Prefer the durable descriptor's `provider/model` in that case so the TUI
 /// can match a configured ModelChoice and show the right header label.
@@ -1433,6 +1437,32 @@ async fn build_model(
                 },
             )
             .with_descriptor(descriptor("openai/responses"))
+            .with_context_window_tokens(choice.context_window);
+            Ok((AnyModel::Responses(model), effort))
+        }
+        ProviderProtocol::OpenaiCodex => {
+            let store = CodexCredentialStore::default_store()
+                .map_err(|error| RuntimeError::Model(error.to_string()))?;
+            let (auth, credentials) = load_codex_auth(store)
+                .await
+                .map_err(|error| RuntimeError::Model(error.to_string()))?;
+            let headers = codex_default_headers(&credentials)
+                .map_err(|error| RuntimeError::Model(error.to_string()))?;
+            let (transport, codec) = Responses::builder(&choice.model)
+                .base_url(CODEX_BACKEND_BASE_URL)
+                .auth_source(auth)
+                .default_headers(headers)
+                .extra_body(extra_body)
+                .build_parts()
+                .map_err(|error| RuntimeError::Model(error.to_string()))?;
+            let model = Model::new(
+                transport,
+                EffortCodec {
+                    inner: codec,
+                    control: effort.clone(),
+                },
+            )
+            .with_descriptor(descriptor("openai/codex-responses"))
             .with_context_window_tokens(choice.context_window);
             Ok((AnyModel::Responses(model), effort))
         }

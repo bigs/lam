@@ -202,16 +202,31 @@ impl ModelProvider for ResponsesProvider {
                 })?
                 .to_owned();
             let mut completed = None;
+            let mut streamed_output = Vec::new();
             let body = transport
                 .post_stream("responses", &request.body, |event| {
                     if event.data == "[DONE]" {
                         return Ok(());
                     }
-                    let value: Value = serde_json::from_str(&event.data).map_err(|error| {
-                        ProviderError::InvalidEventJson {
-                            message: error.to_string(),
+                    let value: Value = match serde_json::from_str(&event.data) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            // The ChatGPT Codex endpoint can interleave
+                            // non-JSON keepalive frames. Match the official
+                            // Codex parser: ignore them and continue until a
+                            // valid response.completed event arrives. Do not
+                            // log frame data because it can contain model text.
+                            tracing::debug!(
+                                target: "lam_openai::responses",
+                                event = "responses.non_json_event_ignored",
+                                event_type = ?event.event.as_deref(),
+                                data_bytes = event.data.len(),
+                                error = %error,
+                                "ignored non-JSON Responses SSE event"
+                            );
+                            return Ok(());
                         }
-                    })?;
+                    };
                     let kind = value
                         .get("type")
                         .and_then(Value::as_str)
@@ -224,6 +239,11 @@ impl ModelProvider for ResponsesProvider {
                             emit_delta(&events, &value, true);
                         }
                         "response.output_item.added" => emit_tool_item(&events, &value),
+                        "response.output_item.done" => {
+                            if let Some(item) = value.get("item") {
+                                streamed_output.push(item.clone());
+                            }
+                        }
                         "response.function_call_arguments.delta" => {
                             emit_tool_arguments(&events, &value);
                         }
@@ -248,7 +268,7 @@ impl ModelProvider for ResponsesProvider {
             if let StreamBody::Json(response) = body {
                 completed = Some(response);
             }
-            let response = completed.ok_or(ProviderError::MissingTerminal {
+            let mut response = completed.ok_or(ProviderError::MissingTerminal {
                 expected: "response.completed",
             })?;
             if response.get("error").is_some_and(|error| !error.is_null()) {
@@ -256,6 +276,7 @@ impl ModelProvider for ResponsesProvider {
                     message: response["error"].to_string(),
                 });
             }
+            attach_streamed_output(&mut response, streamed_output)?;
             Ok(response_payload(
                 RESPONSES_RESPONSE_CODEC_ID,
                 request.output_kind,
@@ -269,6 +290,27 @@ impl ModelProvider for ResponsesProvider {
     fn is_context_overflow(&self, error: &Self::Error) -> bool {
         error.is_context_overflow()
     }
+}
+
+fn attach_streamed_output(
+    response: &mut Value,
+    streamed_output: Vec<Value>,
+) -> Result<(), ProviderError> {
+    if streamed_output.is_empty()
+        || response
+            .get("output")
+            .and_then(Value::as_array)
+            .is_some_and(|output| !output.is_empty())
+    {
+        return Ok(());
+    }
+    let response = response
+        .as_object_mut()
+        .ok_or_else(|| ProviderError::InvalidEventJson {
+            message: "response.completed response is not an object".to_owned(),
+        })?;
+    response.insert("output".to_owned(), Value::Array(streamed_output));
+    Ok(())
 }
 
 fn emit_delta(events: &ModelEventSink, value: &Value, reasoning: bool) {
