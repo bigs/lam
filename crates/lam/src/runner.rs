@@ -14,7 +14,7 @@ use serde::Serialize;
 use tokio::sync::{mpsc, watch};
 use tracing::Instrument;
 
-use crate::actor::{Clock, MessageReceipt, RuntimeIds};
+use crate::actor::{Clock, MessageReceipt, ModelSelectionObserver, RuntimeIds};
 use crate::command::{CallRequest, RunnerCommand};
 use crate::compaction::{estimated_context_tokens, model_context};
 use crate::control::{RunControl, RunPhase};
@@ -53,6 +53,7 @@ pub(crate) struct ActorRunner<S> {
     pub(crate) run_events: mpsc::Sender<RunEvent>,
     pub(crate) runtime_events: mpsc::Sender<RuntimeEvent>,
     pub(crate) control: Arc<RunControl>,
+    pub(crate) model_selection_observer: Option<ModelSelectionObserver>,
     /// Last folded actor projection, refreshed incrementally between drives
     /// so a wake replays only journal activity since the previous drive.
     pub(crate) state: Option<ActorState>,
@@ -84,6 +85,14 @@ where
             });
         }
         Ok(model)
+    }
+
+    pub(crate) fn notify_model_selection(&self, state: &ActorState) {
+        if let Some(observer) = &self.model_selection_observer
+            && let Some(selection) = state.selected_model()
+        {
+            observer(selection);
+        }
     }
 
     pub(crate) async fn run(mut self, wake: bool) {

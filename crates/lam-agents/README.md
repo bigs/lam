@@ -19,7 +19,7 @@ let system = AgentSystem::builder(MemStore::new())
     .max_agents(16)
     .build()?;
 
-let children: SubagentConfig<MemStore> = SubagentConfig::builder(model.clone())
+let children: SubagentConfig<MemStore> = SubagentConfig::builder(model.clone(), "high")
     .namespace(read_only_files)
     .required_instructions("Stay within the configured project root.")
     .max_depth(2)
@@ -73,11 +73,16 @@ The exact installed functions are manifest-discoverable through `lam.dir()`:
 | `lam.agents.send({ to, message })` | Durably send an authenticated steering message to any resident address |
 | `lam.agents.stop({ address })` | Stop one direct child and its descendants, waiting for residency release |
 
-The child request can select an allowed `{ provider, model }`, replacement
-system prompt, appended instructions, and an exact subset of registered
-namespace paths. `SubagentConfig` establishes the allowed models, namespaces,
-host-required instructions, nesting depth, eval limits, and defaults. It is an
-explicit value, not a named-profile registry.
+Every child request must select an allowed `{ provider, model }` and `effort`,
+along with any replacement system prompt, appended instructions, and exact
+subset of registered namespace paths. `SubagentConfig` registers fixed
+model/effort combinations plus namespaces, host-required instructions, nesting
+depth, and eval limits. There is no implicit spawn/call model default.
+
+Unless the user or project instructions request another combination, agents
+should pass the selection from `lam.dir({ path: "lam" })` when the embedding
+reports one with an effort and `lam.agents.models()` lists that combination.
+Otherwise they choose a model and effort explicitly from that catalog.
 
 ## `call` and `spawn`
 

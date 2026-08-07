@@ -32,6 +32,11 @@ interface NamespaceDescriptor {
   path: string;
   docs: string;
   functions: FunctionDescriptor[];
+  currentSelection?: {
+    provider: string;
+    model: string;
+    effort?: string;
+  };
 }
 
 type ConsoleLevel = "debug" | "log" | "info" | "warn" | "error";

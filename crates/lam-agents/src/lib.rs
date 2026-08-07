@@ -19,9 +19,9 @@ pub use error::{AgentSystemBuildError, AgentSystemError, SubagentConfigError};
 pub use event::{AgentSystemEvent, AgentSystemEvents, StopReason};
 pub use interruption::{AgentInterruptionReceipt, AgentTreeInterruptionReceipt};
 pub use namespace::{
-    AgentIdentity, ListError, ListRequest, ModelInfo, ModelsCatalog, ProviderModels, SendError,
-    SendReceipt, SendRequest, SpawnError, SpawnReceipt, SpawnRequest, StopError, StopReceipt,
-    StopRequest, WaitError, WaitReceipt, WaitRequest, WaitedTask,
+    AgentIdentity, ChildRequest, ListError, ListRequest, ModelInfo, ModelsCatalog, ProviderModels,
+    SendError, SendReceipt, SendRequest, SpawnError, SpawnReceipt, SpawnRequest, StopError,
+    StopReceipt, StopRequest, WaitError, WaitReceipt, WaitRequest, WaitedTask,
 };
 pub use outcome::AgentOutcome;
 pub use system::{Agent, AgentAbortHandle, AgentSystem, AgentSystemBuilder};

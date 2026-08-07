@@ -3,7 +3,10 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
-use lam::{ActorBuilder, JournalStore, Lam, Model, ModelCodec, ModelProvider, Namespace};
+use lam::{
+    ActorBuilder, DirectorySelection, DirectorySelectionSource, JournalStore, Lam, Model,
+    ModelCodec, ModelProvider, Namespace,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -51,6 +54,7 @@ type ModelFactory<S> = dyn Fn(ChildActorSpec<S>) -> ActorBuilder<Arc<S>> + Send 
 
 pub(crate) struct ModelRegistration<S> {
     pub(crate) target: ModelTarget,
+    pub(crate) effort: String,
     factory: Arc<ModelFactory<S>>,
 }
 
@@ -58,6 +62,7 @@ impl<S> Clone for ModelRegistration<S> {
     fn clone(&self) -> Self {
         Self {
             target: self.target.clone(),
+            effort: self.effort.clone(),
             factory: Arc::clone(&self.factory),
         }
     }
@@ -71,8 +76,7 @@ impl<S> ModelRegistration<S> {
 
 /// Explicit host policy inherited by children created through one namespace.
 pub struct SubagentConfig<S> {
-    pub(crate) default_model: ModelTarget,
-    pub(crate) models: BTreeMap<ModelTarget, ModelRegistration<S>>,
+    pub(crate) models: BTreeMap<(ModelTarget, String), ModelRegistration<S>>,
     pub(crate) namespaces: BTreeMap<String, Namespace>,
     pub(crate) required_instructions: Vec<String>,
     pub(crate) max_depth: usize,
@@ -85,7 +89,6 @@ pub struct SubagentConfig<S> {
 impl<S> Clone for SubagentConfig<S> {
     fn clone(&self) -> Self {
         Self {
-            default_model: self.default_model.clone(),
             models: self.models.clone(),
             namespaces: self.namespaces.clone(),
             required_instructions: self.required_instructions.clone(),
@@ -102,25 +105,21 @@ impl<S> SubagentConfig<S>
 where
     S: JournalStore + 'static,
 {
-    /// Starts an explicit child policy with its default model.
+    /// Starts an explicit child policy with one allowed model/effort pair.
     #[must_use]
-    pub fn builder<P, C>(default_model: Model<P, C>) -> SubagentConfigBuilder<S>
+    pub fn builder<P, C>(model: Model<P, C>, effort: impl Into<String>) -> SubagentConfigBuilder<S>
     where
         P: ModelProvider,
         C: ModelCodec,
     {
-        SubagentConfigBuilder::new(default_model)
+        SubagentConfigBuilder::new(model, effort)
     }
 
-    /// Returns the model used when a spawn request omits `model`.
-    #[must_use]
-    pub const fn default_model(&self) -> &ModelTarget {
-        &self.default_model
-    }
-
-    /// Iterates over directly selectable provider/model pairs.
-    pub fn models(&self) -> impl Iterator<Item = &ModelTarget> {
-        self.models.keys()
+    /// Iterates over directly selectable provider/model/effort combinations.
+    pub fn model_efforts(&self) -> impl Iterator<Item = (&ModelTarget, &str)> {
+        self.models
+            .keys()
+            .map(|(target, effort)| (target, effort.as_str()))
     }
 
     /// Iterates over the maximum namespace set a child may request.
@@ -131,8 +130,18 @@ where
             .chain(self.allow_agent_namespace.then_some(AGENTS_NAMESPACE))
     }
 
-    pub(crate) fn registration(&self, target: &ModelTarget) -> Option<&ModelRegistration<S>> {
-        self.models.get(target)
+    pub(crate) fn registration(
+        &self,
+        target: &ModelTarget,
+        effort: &str,
+    ) -> Option<&ModelRegistration<S>> {
+        self.models.get(&(target.clone(), effort.to_owned()))
+    }
+
+    pub(crate) fn contains_model(&self, target: &ModelTarget) -> bool {
+        self.models
+            .keys()
+            .any(|(configured, _)| configured == target)
     }
 
     pub(crate) fn select_namespace_paths(
@@ -162,7 +171,6 @@ where
 
 /// Builds one explicit, reusable child policy value.
 pub struct SubagentConfigBuilder<S> {
-    default_model: ModelTarget,
     models: Vec<ModelRegistration<S>>,
     namespaces: Vec<Namespace>,
     required_instructions: Vec<String>,
@@ -177,17 +185,16 @@ impl<S> SubagentConfigBuilder<S>
 where
     S: JournalStore + 'static,
 {
-    /// Starts a policy builder whose default model is registered immediately.
+    /// Starts a policy builder with one allowed model/effort pair.
     #[must_use]
-    pub fn new<P, C>(default_model: Model<P, C>) -> Self
+    pub fn new<P, C>(model: Model<P, C>, effort: impl Into<String>) -> Self
     where
         P: ModelProvider,
         C: ModelCodec,
     {
-        let default_target = ModelTarget::for_model(&default_model);
+        let target = ModelTarget::for_model(&model);
         Self {
-            default_model: default_target.clone(),
-            models: vec![model_registration(default_target, default_model)],
+            models: vec![model_registration(target, effort.into(), model)],
             namespaces: Vec::new(),
             required_instructions: Vec::new(),
             max_depth: 4,
@@ -198,15 +205,16 @@ where
         }
     }
 
-    /// Adds another directly selectable provider/model pair.
+    /// Adds another directly selectable provider/model/effort combination.
     #[must_use]
-    pub fn model<P, C>(mut self, model: Model<P, C>) -> Self
+    pub fn model<P, C>(mut self, model: Model<P, C>, effort: impl Into<String>) -> Self
     where
         P: ModelProvider,
         C: ModelCodec,
     {
         let target = ModelTarget::for_model(&model);
-        self.models.push(model_registration(target, model));
+        self.models
+            .push(model_registration(target, effort.into(), model));
         self
     }
 
@@ -274,10 +282,18 @@ where
         let mut models = BTreeMap::new();
         for registration in self.models {
             let target = registration.target.clone();
-            if models.insert(target.clone(), registration).is_some() {
+            let effort = registration.effort.clone();
+            if effort.trim().is_empty() || effort.trim() != effort {
+                return Err(SubagentConfigError::InvalidEffort { effort });
+            }
+            if models
+                .insert((target.clone(), effort.clone()), registration)
+                .is_some()
+            {
                 return Err(SubagentConfigError::DuplicateModel {
                     provider: target.provider,
                     model: target.model,
+                    effort,
                 });
             }
         }
@@ -294,7 +310,6 @@ where
         }
 
         Ok(SubagentConfig {
-            default_model: self.default_model,
             models,
             namespaces,
             required_instructions: self.required_instructions,
@@ -307,7 +322,11 @@ where
     }
 }
 
-fn model_registration<S, P, C>(target: ModelTarget, model: Model<P, C>) -> ModelRegistration<S>
+fn model_registration<S, P, C>(
+    target: ModelTarget,
+    effort: String,
+    model: Model<P, C>,
+) -> ModelRegistration<S>
 where
     S: JournalStore + 'static,
     P: ModelProvider,
@@ -318,8 +337,11 @@ where
     // builder default id is the opaque string "default", which is useless
     // once more than one model exists in a session.
     let model_id = target.to_string();
+    let directory_target = target.clone();
+    let directory_effort = effort.clone();
     ModelRegistration {
         target,
+        effort,
         factory: Arc::new(move |spec| {
             let ChildActorSpec {
                 address,
@@ -334,6 +356,15 @@ where
             let mut builder = Lam::builder(model.clone())
                 .initial_model_id(model_id.clone())
                 .state_store(store)
+                .directory_selection(DirectorySelectionSource::new({
+                    let target = directory_target.clone();
+                    let effort = directory_effort.clone();
+                    move || DirectorySelection {
+                        provider: target.provider.clone(),
+                        model: target.model.clone(),
+                        effort: Some(effort.clone()),
+                    }
+                }))
                 .capture_console(capture_console);
             for namespace in namespaces {
                 builder = builder.namespace(namespace);

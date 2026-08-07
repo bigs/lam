@@ -3,7 +3,7 @@
 mod support;
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier, mpsc};
+use std::sync::{Arc, Barrier, Mutex, mpsc};
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
@@ -576,18 +576,30 @@ async fn neutral_recompaction_includes_an_exact_checkpoint_and_its_tail() {
 async fn model_switch_compacts_then_atomically_selects_the_target() {
     let source = ScriptedProvider::new([output("source answer"), output("portable state")]);
     let target = ScriptedProvider::new([output("target answer")]);
+    let observed = Arc::new(Mutex::new(Vec::new()));
     let mut actor = Lam::builder(Model::new(source.clone(), ScriptedCodec))
         .initial_model_id("source")
         .model("target", Model::new(target.clone(), ScriptedCodec))
+        .observe_model_selection({
+            let observed = Arc::clone(&observed);
+            move |selection| {
+                observed
+                    .lock()
+                    .unwrap()
+                    .push(selection.model_id.as_str().to_owned());
+            }
+        })
         .build()
         .actor("switching")
         .build()
         .await
         .unwrap();
     let actor_ref = actor.actor_ref();
+    assert_eq!(*observed.lock().unwrap(), ["source"]);
 
     assert_eq!(actor.call("first").await.unwrap(), "source answer");
     let receipt = actor.switch_model("target").await.unwrap();
+    assert_eq!(*observed.lock().unwrap(), ["source", "target"]);
     assert_eq!(receipt.previous_model_id.as_str(), "source");
     assert_eq!(receipt.selected_model_id.as_str(), "target");
     let compaction = receipt.compaction.expect("default switch compacts");

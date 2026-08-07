@@ -10,6 +10,38 @@ use serde_json::Value;
 
 use crate::error::IsolateBuildError;
 
+/// Model and reasoning effort currently selected by the embedding.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DirectorySelection {
+    /// Inference provider name used by model-selection APIs.
+    pub provider: String,
+    /// Provider-specific model identifier.
+    pub model: String,
+    /// Embedding-defined reasoning effort, when the embedding exposes one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+}
+
+/// Cloneable synchronous source for the selection reported by `lam.dir`.
+#[derive(Clone)]
+pub struct DirectorySelectionSource {
+    current: Arc<dyn Fn() -> DirectorySelection + Send + Sync>,
+}
+
+impl DirectorySelectionSource {
+    /// Creates a source backed by an embedding-provided synchronous callback.
+    pub fn new(current: impl Fn() -> DirectorySelection + Send + Sync + 'static) -> Self {
+        Self {
+            current: Arc::new(current),
+        }
+    }
+
+    pub(crate) fn current(&self) -> DirectorySelection {
+        (self.current)()
+    }
+}
+
 type HandlerFuture = Pin<Box<dyn Future<Output = Result<CallResult, InvocationError>> + Send>>;
 
 /// The impossible error type for builtins which cannot fail.
@@ -68,6 +100,9 @@ pub(crate) struct NamespaceDescriptor {
     docs: String,
     /// Functions registered directly beneath this namespace.
     pub(crate) functions: Vec<FunctionDescriptor>,
+    /// Current model selection. Present only on the kernel `lam` descriptor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_selection: Option<DirectorySelection>,
 }
 
 /// A typed namespace which can be installed into an isolate.
@@ -222,10 +257,14 @@ pub(crate) enum InvocationError {
 pub(crate) struct Registry {
     namespaces: Vec<NamespaceDescriptor>,
     functions: BTreeMap<(String, String), Arc<dyn ErasedBuiltin>>,
+    selection: Option<DirectorySelectionSource>,
 }
 
 impl Registry {
-    pub(crate) fn build(namespaces: Vec<Namespace>) -> Result<Self, IsolateBuildError> {
+    pub(crate) fn build(
+        namespaces: Vec<Namespace>,
+        selection: Option<DirectorySelectionSource>,
+    ) -> Result<Self, IsolateBuildError> {
         let mut descriptors = vec![lam_namespace_descriptor()];
         let mut functions = BTreeMap::new();
         let mut namespace_paths = BTreeSet::from(["lam".to_owned()]);
@@ -259,6 +298,7 @@ impl Registry {
                 path: namespace.path,
                 docs: namespace.docs,
                 functions: function_descriptors,
+                current_selection: None,
             });
         }
 
@@ -278,21 +318,22 @@ impl Registry {
         Ok(Self {
             namespaces: descriptors,
             functions,
+            selection,
         })
     }
 
     pub(crate) fn manifest(&self, query: Option<&DirQuery>) -> Vec<NamespaceDescriptor> {
-        let Some(path) = query.and_then(|query| query.path.as_deref()) else {
-            return self.namespaces.clone();
-        };
-        let path = path.trim();
-        if path.is_empty() {
-            return self.namespaces.clone();
-        }
-
-        self.namespaces
+        let path = query
+            .and_then(|query| query.path.as_deref())
+            .map(str::trim)
+            .filter(|path| !path.is_empty());
+        let mut namespaces = self
+            .namespaces
             .iter()
             .filter_map(|namespace| {
+                let Some(path) = path else {
+                    return Some(namespace.clone());
+                };
                 if namespace.path == path || namespace.path.starts_with(&format!("{path}.")) {
                     return Some(namespace.clone());
                 }
@@ -303,7 +344,18 @@ impl Registry {
                     .retain(|function| format!("{}.{}", namespace.path, function.name) == path);
                 (!matched.functions.is_empty()).then_some(matched)
             })
-            .collect()
+            .collect::<Vec<_>>();
+        if let Some(current) = self
+            .selection
+            .as_ref()
+            .map(DirectorySelectionSource::current)
+            && let Some(kernel) = namespaces
+                .iter_mut()
+                .find(|namespace| namespace.path == "lam")
+        {
+            kernel.current_selection = Some(current);
+        }
+        namespaces
     }
 
     pub(crate) fn prompt_inventory(&self) -> String {
@@ -332,10 +384,11 @@ fn lam_namespace_descriptor() -> NamespaceDescriptor {
     NamespaceDescriptor {
         path: "lam".to_owned(),
         docs: "Lam kernel utilities.".to_owned(),
+        current_selection: None,
         functions: vec![
             FunctionDescriptor {
                 name: "dir".to_owned(),
-                docs: "Discover installed namespaces, functions, and inferred schemas."
+                docs: "Discover installed namespaces, functions, and inferred schemas. When the embedding exposes a current model selection, the unfiltered result and `lam` path query include it as `currentSelection` on the `lam` namespace descriptor."
                     .to_owned(),
                 input_schema: schema_value::<Option<DirQuery>>(),
                 output_schema: schema_value::<Vec<NamespaceDescriptor>>(),

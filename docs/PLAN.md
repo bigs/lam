@@ -167,7 +167,10 @@ domain-specific capabilities without modifying Lam.
 
 **Settled and implemented.** `lam.dir()` exposes the available namespace tree. Its output
 includes function names, documentation, input schemas, output schemas, error
-schemas, and capability availability.
+schemas, and capability availability. An embedding may attach a synchronous live
+model/effort source; when present, the kernel `lam` descriptor reports it as
+`currentSelection` so model-visible delegation can remain explicit after model or
+effort switches.
 
 The default system prompt contains a compact inventory of every function
 instantiated for the actor. Each line is derived from the same immutable
@@ -1024,16 +1027,20 @@ restart behavior, and durability need a focused design before implementation.
 same public actor machinery, gets its own journal and isolate, and receives its
 initial task as an always-steering `MessageSource::Actor` message.
 `SubagentConfig` is an explicit value rather than a named-profile registry. It
-defines directly selectable provider/model pairs, the maximum extension
+defines directly selectable provider/model/effort combinations, the maximum extension
 namespace set, required prompt annotations, nesting depth, eval limits, and
 console capture. Omitting `namespaces` grants that configured set; an explicit
 array grants the exact validated subset. `lam.dir` and `lam.result` are always
 implicit, while selecting `lam.agents` grants the generated interaction
 surface. At the configured depth limit that surface retains identity, listing,
 addressed messaging, and direct-child stopping but omits recursive creation.
+Spawn and call require both `model: { provider, model }` and `effort`; neither
+selection is implicit. Model-visible guidance copies the live selection exposed
+by `lam.dir` unless the user or project instructions request another allowed
+combination, and `lam.agents.models()` enumerates the complete allowed catalog.
 
 The generated capability includes `identity`, `list`, `spawn`, `call`, `send`,
-and `stop`.
+`wait`, and `stop`.
 Actors use canonical Unix-style addresses: `spawn` accepts one required name
 segment and derives a direct child path, while `identity` returns the current
 address and its derived parent. `list()` returns direct resident children of

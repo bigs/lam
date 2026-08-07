@@ -164,6 +164,12 @@ listed value. By default, Responses providers receive it at
 `effort_path = "reasoning.effort"`, when an OpenAI-compatible provider uses a
 different request shape. Do not also put the effort field in `extra_body`.
 
+Subagent creation always names both a `{ provider, model }` pair and an effort.
+The agent reads the live selection from `lam.dir({ path: "lam" })` and uses it
+unless the user or project instructions such as `AGENTS.md` request another
+configured combination. `lam.agents.models()` lists every allowed model and its
+effort values; there is no implicit spawn/call default.
+
 For OpenAI Responses models that support it, request provider-visible reasoning
 summaries with a sibling `extra_body` field. Lam's `/effort` control still owns
 `reasoning.effort` and injects the selected value beside this setting:

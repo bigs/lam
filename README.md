@@ -41,7 +41,8 @@ and what types cross the boundary.
 The isolate exposes `lam.dir()` for complete runtime discovery. Its compact
 system-prompt synopsis is generated from the same manifest, including inferred
 input/output schemas and Rust-authored documentation. Adding a Rust builtin does
-not require a TypeScript shim.
+not require a TypeScript shim. Embeddings may also expose their live model and
+reasoning-effort selection as `currentSelection` on the `lam` descriptor.
 
 ## What is implemented
 

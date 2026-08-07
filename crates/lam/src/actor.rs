@@ -10,7 +10,7 @@ use lam_core::{
     MemStore, MessageEnvelope, MessageId, MessageSource, ModelCodec, ModelId, ModelProvider,
     ModelSelection, Revision, RunId, Timestamp,
 };
-use lam_deno::{Isolate, IsolateInterrupt, Namespace};
+use lam_deno::{DirectorySelectionSource, Isolate, IsolateInterrupt, Namespace};
 use serde::Serialize;
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -30,6 +30,7 @@ use crate::{
 
 const RUNTIME_EVENT_BUFFER: usize = 256;
 const ACTOR_EXISTENCE_PROBE: NonZeroUsize = NonZeroUsize::new(1).expect("one is nonzero");
+pub(crate) type ModelSelectionObserver = Arc<dyn Fn(&ModelSelection) + Send + Sync>;
 
 /// How an explicit model switch treats existing model-visible context.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -145,6 +146,8 @@ impl Lam {
             additional_models: Vec::new(),
             store: MemStore::new(),
             namespaces: Vec::new(),
+            directory_selection: None,
+            model_selection_observer: None,
             default_timeout: None,
             max_timeout: None,
             capture_console: true,
@@ -163,6 +166,8 @@ pub struct LamBuilder<S> {
     additional_models: Vec<PendingModel>,
     store: S,
     namespaces: Vec<Namespace>,
+    directory_selection: Option<DirectorySelectionSource>,
+    model_selection_observer: Option<ModelSelectionObserver>,
     default_timeout: Option<Duration>,
     max_timeout: Option<Duration>,
     capture_console: bool,
@@ -187,6 +192,8 @@ impl<S> LamBuilder<S> {
             additional_models: self.additional_models,
             store,
             namespaces: self.namespaces,
+            directory_selection: self.directory_selection,
+            model_selection_observer: self.model_selection_observer,
             default_timeout: self.default_timeout,
             max_timeout: self.max_timeout,
             capture_console: self.capture_console,
@@ -251,6 +258,27 @@ impl<S> LamBuilder<S> {
     #[must_use]
     pub fn namespaces(mut self, namespaces: impl IntoIterator<Item = Namespace>) -> Self {
         self.namespaces.extend(namespaces);
+        self
+    }
+
+    /// Supplies the live model selection reported by `lam.dir`.
+    #[must_use]
+    pub fn directory_selection(mut self, selection: DirectorySelectionSource) -> Self {
+        self.directory_selection = Some(selection);
+        self
+    }
+
+    /// Observes each authoritative durable model selection before actor work resumes.
+    ///
+    /// Embeddings use this to keep synchronous model-visible metadata aligned
+    /// with startup recovery and model switches, including when mailbox work
+    /// is already queued behind the transition.
+    #[must_use]
+    pub fn observe_model_selection(
+        mut self,
+        observer: impl Fn(&ModelSelection) + Send + Sync + 'static,
+    ) -> Self {
+        self.model_selection_observer = Some(Arc::new(observer));
         self
     }
 
@@ -339,6 +367,8 @@ impl<S> LamBuilder<S> {
             additional_models: self.additional_models,
             store: self.store,
             namespaces: self.namespaces,
+            directory_selection: self.directory_selection,
+            model_selection_observer: self.model_selection_observer,
             default_timeout: self.default_timeout,
             max_timeout: self.max_timeout,
             capture_console: self.capture_console,
@@ -357,6 +387,8 @@ pub struct LamRuntime<S> {
     additional_models: Vec<PendingModel>,
     store: S,
     namespaces: Vec<Namespace>,
+    directory_selection: Option<DirectorySelectionSource>,
+    model_selection_observer: Option<ModelSelectionObserver>,
     default_timeout: Option<Duration>,
     max_timeout: Option<Duration>,
     capture_console: bool,
@@ -377,6 +409,8 @@ impl<S> LamRuntime<S> {
             additional_models: self.additional_models,
             store: self.store,
             namespaces: self.namespaces,
+            directory_selection: self.directory_selection,
+            model_selection_observer: self.model_selection_observer,
             default_timeout: self.default_timeout,
             max_timeout: self.max_timeout,
             capture_console: self.capture_console,
@@ -396,6 +430,8 @@ pub struct ActorBuilder<S> {
     additional_models: Vec<PendingModel>,
     store: S,
     namespaces: Vec<Namespace>,
+    directory_selection: Option<DirectorySelectionSource>,
+    model_selection_observer: Option<ModelSelectionObserver>,
     default_timeout: Option<Duration>,
     max_timeout: Option<Duration>,
     capture_console: bool,
@@ -515,6 +551,8 @@ struct PreparedActor<S> {
     models: BTreeMap<ModelId, RegisteredModel>,
     store: S,
     namespaces: Vec<Namespace>,
+    directory_selection: Option<DirectorySelectionSource>,
+    model_selection_observer: Option<ModelSelectionObserver>,
     default_timeout: Option<Duration>,
     max_timeout: Option<Duration>,
     capture_console: bool,
@@ -558,6 +596,8 @@ where
             models,
             store: builder.store,
             namespaces: builder.namespaces,
+            directory_selection: builder.directory_selection,
+            model_selection_observer: builder.model_selection_observer,
             default_timeout: builder.default_timeout,
             max_timeout: builder.max_timeout,
             capture_console: builder.capture_console,
@@ -593,6 +633,9 @@ where
         let mut isolate_builder = Isolate::builder();
         for namespace in self.namespaces {
             isolate_builder = isolate_builder.namespace(namespace);
+        }
+        if let Some(selection) = self.directory_selection {
+            isolate_builder = isolate_builder.directory_selection(selection);
         }
         if let Some(timeout) = self.default_timeout {
             isolate_builder = isolate_builder.default_timeout(timeout);
@@ -659,6 +702,9 @@ where
                 ),
             });
         }
+        if let Some(observer) = &self.model_selection_observer {
+            observer(selection);
+        }
         let recovery_started = Instant::now();
         let (recovery, state) = recover_actor(
             &self.actor_id,
@@ -702,6 +748,7 @@ where
             run_events: run_event_sender,
             runtime_events: runtime_event_sender,
             control: Arc::clone(&control),
+            model_selection_observer: self.model_selection_observer,
             state: Some(state),
         };
         let actor_ref = ActorRef {

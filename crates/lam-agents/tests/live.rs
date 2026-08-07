@@ -56,7 +56,7 @@ async fn fireworks_child_to_parent_round_trip() {
         .max_agents(2)
         .build()
         .unwrap();
-    let children: SubagentConfig<MemStore> = SubagentConfig::builder(model.clone())
+    let children: SubagentConfig<MemStore> = SubagentConfig::builder(model.clone(), "low")
         .namespace(gate.signal_namespace())
         .max_depth(1)
         .build()
@@ -73,7 +73,7 @@ async fn fireworks_child_to_parent_round_trip() {
         .await
         .expect("root actor starts");
 
-    let task = r#"Create exactly one subagent named worker with lam.agents.spawn. Give it this task: inspect lam.agents.identity, use lam.agents.send to send {"token":"LAM_CHILD_OK"} to its parent address, then call test.roundtrip.signal. After spawning it, call lam.agents.list with no arguments and verify /root/worker is present, then call test.roundtrip.wait yourself. Do not call signal from the parent. Only after the child message is visible, reply with exactly LAM_CHILD_OK."#;
+    let task = r#"Create exactly one subagent named worker with lam.agents.spawn, explicitly selecting model { provider: "openai-compatible", model: "accounts/fireworks/models/deepseek-v4-flash-0731" } and effort "low". Give it this task: inspect lam.agents.identity, use lam.agents.send to send {"token":"LAM_CHILD_OK"} to its parent address, then call test.roundtrip.signal. After spawning it, call lam.agents.list with no arguments and verify /root/worker is present, then call test.roundtrip.wait yourself. Do not call signal from the parent. Only after the child message is visible, reply with exactly LAM_CHILD_OK."#;
     let output = match tokio::time::timeout(Duration::from_secs(120), root.call(task)).await {
         Ok(result) => result.expect("live parent call succeeds"),
         Err(_elapsed) => {

@@ -12,7 +12,9 @@ mod isolate;
 mod prompt;
 mod transpile;
 
-pub use builtin::{Namespace, Never, OperationContext};
+pub use builtin::{
+    DirectorySelection, DirectorySelectionSource, Namespace, Never, OperationContext,
+};
 pub use error::{EvalError, IsolateBuildError, RuntimeException};
 pub use isolate::{
     ConsoleEntry, ConsoleLevel, EvalOptions, EvalOutput, EvalValue, Isolate, IsolateBuilder,

@@ -4,6 +4,8 @@ use serde_json::Value;
 
 use crate::builtin::{FunctionDescriptor, NamespaceDescriptor};
 
+const MAX_INLINE_OBJECT_FIELDS: usize = 8;
+
 pub(crate) fn render_inventory(namespaces: &[NamespaceDescriptor]) -> String {
     namespaces
         .iter()
@@ -138,7 +140,7 @@ fn object_type(schema: &Value, root: &Value, depth: usize) -> String {
         .collect::<BTreeSet<_>>();
     let mut fields = properties
         .iter()
-        .take(6)
+        .take(MAX_INLINE_OBJECT_FIELDS)
         .map(|(name, value)| {
             let optional = if required.contains(name.as_str()) {
                 ""
@@ -151,7 +153,7 @@ fn object_type(schema: &Value, root: &Value, depth: usize) -> String {
             )
         })
         .collect::<Vec<_>>();
-    if properties.len() > 6 {
+    if properties.len() > MAX_INLINE_OBJECT_FIELDS {
         fields.push("…".to_owned());
     }
     format!("{{ {} }}", fields.join("; "))
@@ -219,5 +221,43 @@ mod tests {
         });
 
         assert_eq!(schema_type(&schema, 0), "{ path: string }[]");
+    }
+
+    #[test]
+    fn keeps_complete_child_request_shapes_inline() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "effort": { "type": "string" },
+                "instructions": { "type": "string" },
+                "model": {
+                    "type": "object",
+                    "properties": {
+                        "provider": { "type": "string" },
+                        "model": { "type": "string" }
+                    },
+                    "required": ["provider", "model"]
+                },
+                "name": { "type": "string" },
+                "namespaces": { "type": "array", "items": { "type": "string" } },
+                "systemPrompt": {
+                    "anyOf": [
+                        { "type": "string" },
+                        {
+                            "type": "object",
+                            "properties": { "kind": { "type": "string" } },
+                            "required": ["kind"]
+                        }
+                    ]
+                },
+                "task": { "type": "string" }
+            },
+            "required": ["name", "task", "model", "effort"]
+        });
+
+        assert_eq!(
+            schema_type(&schema, 0),
+            "{ effort: string; instructions?: string; model: { provider: string; model: string }; name: string; namespaces?: string[]; systemPrompt?: string | { kind: string }; task: string }"
+        );
     }
 }

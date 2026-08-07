@@ -6,11 +6,11 @@ use std::time::Duration;
 
 use lam::{
     ActorEventData, ActorId, ActorState, CompactionArtifact, CompactionRecord, ContextEntry,
-    ContextTransition, DeliveryMode, EncodedPayload, InterruptedEvalOutcome, IsolateState,
-    JournalStore, Lam, LamBuilder, MemStore, MessageId, MessageSource, Model, ModelCodec,
-    ModelDelta, ModelDescriptor, ModelDirective, ModelRequestConfig, ModelResponseMetadata,
-    ModelResponseProjection, ModelSelection, Namespace, ProjectedContextEntry, Revision,
-    RunProgress, SYSTEM_NOTICE_CODEC_ID, SystemNotice,
+    ContextTransition, DeliveryMode, DirectorySelection, DirectorySelectionSource, EncodedPayload,
+    InterruptedEvalOutcome, IsolateState, JournalStore, Lam, LamBuilder, MemStore, MessageId,
+    MessageSource, Model, ModelCodec, ModelDelta, ModelDescriptor, ModelDirective,
+    ModelRequestConfig, ModelResponseMetadata, ModelResponseProjection, ModelSelection, Namespace,
+    ProjectedContextEntry, Revision, RunProgress, SYSTEM_NOTICE_CODEC_ID, SystemNotice,
 };
 use lam_agents::{Agent, AgentSystem, AgentSystemEvents, SubagentConfig, SubagentConfigBuilder};
 use lam_batteries::BatteriesPack;
@@ -298,6 +298,7 @@ impl Runtime {
         let installed_namespaces = collect_namespaces(&coding, batteries.as_ref());
         let store = phase_sync("redb_open", || RedbStore::open(&session.database_path))
             .map_err(RuntimeError::Journal)?;
+        let selected_model_control = Arc::new(RwLock::new(initial_index));
         let system = phase_sync("agent_system_build", || {
             AgentSystem::builder(store)
                 .worker_threads(default_worker_threads())
@@ -312,12 +313,7 @@ impl Runtime {
             .iter()
             .map(|configured| configured.choice.clone())
             .collect::<Vec<_>>();
-        let instruction = coding_instruction(
-            &cwd,
-            &active_choices,
-            initial_index,
-            agent_config.has_search(),
-        );
+        let instruction = coding_instruction(&cwd, agent_config.has_search());
         let project_instructions = phase_sync("project_instructions", || {
             let entries = load_project_instructions(&cwd);
             match format_project_instructions(&entries) {
@@ -341,11 +337,37 @@ impl Runtime {
             }
         });
 
+        let directory_choices = active_choices.clone();
+        let directory_efforts = effort_controls.clone();
+        let directory_selected = Arc::clone(&selected_model_control);
+        let directory_selection = DirectorySelectionSource::new(move || {
+            let index = *directory_selected
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let choice = &directory_choices[index];
+            DirectorySelection {
+                provider: choice.provider.clone(),
+                model: choice.model.clone(),
+                effort: Some(directory_efforts[index].selected()),
+            }
+        });
+        let observer_choices = active_choices.clone();
+        let observer_selected = Arc::clone(&selected_model_control);
         let mut root_builder = initial
             .model
             .lam_builder()
             .initial_model_id(initial.choice.registry_id.clone())
             .state_store(system.state_store())
+            .directory_selection(directory_selection)
+            .observe_model_selection(move |selection| {
+                let index = observer_choices
+                    .iter()
+                    .position(|choice| choice.registry_id == selection.model_id.as_str())
+                    .expect("the actor validates durable selections against its model registry");
+                *observer_selected
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = index;
+            })
             .namespaces(installed_namespaces.iter().cloned())
             .annotate_system_prompt(&instruction);
         if let Some(project_instructions) = &project_instructions {
@@ -359,11 +381,20 @@ impl Runtime {
             }
         }
 
-        let mut child_builder: SubagentConfigBuilder<RedbStore> = initial.model.subagent_builder();
-        for configured in &models {
-            if configured.choice.registry_id != initial.choice.registry_id {
-                child_builder = configured.model.register_subagent(child_builder);
-            }
+        let mut child_models = models.iter().flat_map(|configured| {
+            configured
+                .choice
+                .efforts
+                .iter()
+                .map(move |effort| (configured, effort.as_str()))
+        });
+        let (first_child_model, first_child_effort) = child_models
+            .next()
+            .expect("configuration validation requires at least one model and effort");
+        let mut child_builder: SubagentConfigBuilder<RedbStore> =
+            first_child_model.model.subagent_builder(first_child_effort);
+        for (configured, effort) in child_models {
+            child_builder = configured.model.register_subagent(child_builder, effort);
         }
         let children: SubagentConfig<RedbStore> = child_builder
             .namespaces(installed_namespaces.iter().cloned())
@@ -461,6 +492,9 @@ impl Runtime {
             .iter()
             .position(|model| model.choice.registry_id == selected_model_id)
             .unwrap_or(initial_index);
+        *selected_model_control
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = selected_model;
         // Built last so no error path in this function ever owns a multi-thread
         // tokio runtime: an unbuilt runtime needs no teardown, and a built one
         // is only dropped from quiesce on a blocking thread.
@@ -552,8 +586,24 @@ impl Runtime {
     }
 
     pub(crate) fn execute(&self, command: Command, output: mpsc::UnboundedSender<CommandResult>) {
+        let command = match command {
+            Command::SetEffort { index, effort } => {
+                let result = self
+                    .effort_controls
+                    .get(index)
+                    .ok_or_else(|| format!("model index {index} is not configured"))
+                    .and_then(|control| control.set(&effort))
+                    .map(|()| format!("Set reasoning effort to {effort}."));
+                let _ = output.send(CommandResult::SetEffort {
+                    index,
+                    effort,
+                    result,
+                });
+                return;
+            }
+            command => command,
+        };
         let root = self.root.clone();
-        let effort_controls = self.effort_controls.clone();
         let runtime = self
             .command_runtime
             .as_ref()
@@ -606,17 +656,8 @@ impl Runtime {
                         result: result.map_err(|error| error.to_string()),
                     }
                 }
-                Command::SetEffort { index, effort } => {
-                    let result = effort_controls
-                        .get(index)
-                        .ok_or_else(|| format!("model index {index} is not configured"))
-                        .and_then(|control| control.set(&effort))
-                        .map(|()| format!("Set reasoning effort to {effort}."));
-                    CommandResult::SetEffort {
-                        index,
-                        effort,
-                        result,
-                    }
+                Command::SetEffort { .. } => {
+                    unreachable!("effort changes are handled synchronously")
                 }
                 Command::New
                 | Command::LoadSession(_)
@@ -781,6 +822,17 @@ impl EffortControl {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
+
+    fn fixed(&self, effort: &str) -> Result<Self, String> {
+        if !self.allowed.iter().any(|allowed| allowed == effort) {
+            return Err(format!("reasoning effort `{effort}` is not supported"));
+        }
+        Ok(Self {
+            path: Arc::clone(&self.path),
+            allowed: Arc::clone(&self.allowed),
+            selected: Arc::new(RwLock::new(effort.to_owned())),
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -851,6 +903,25 @@ fn insert_json_path(value: &mut serde_json::Value, path: &[String], leaf: serde_
 }
 
 impl AnyModel {
+    fn fixed_effort(&self, effort: &str) -> Result<Self, String> {
+        match self {
+            Self::Responses(model) => {
+                let codec = model.shared_parts().1;
+                Ok(Self::Responses(model.with_codec(EffortCodec {
+                    inner: codec.inner.clone(),
+                    control: codec.control.fixed(effort)?,
+                })))
+            }
+            Self::ChatCompletions(model) => {
+                let codec = model.shared_parts().1;
+                Ok(Self::ChatCompletions(model.with_codec(EffortCodec {
+                    inner: codec.inner.clone(),
+                    control: codec.control.fixed(effort)?,
+                })))
+            }
+        }
+    }
+
     fn lam_builder(&self) -> LamBuilder<MemStore> {
         match self {
             Self::Responses(model) => Lam::builder(model.clone()),
@@ -865,23 +936,33 @@ impl AnyModel {
         }
     }
 
-    fn subagent_builder<S>(&self) -> SubagentConfigBuilder<S>
+    fn subagent_builder<S>(&self, effort: &str) -> SubagentConfigBuilder<S>
     where
         S: JournalStore + 'static,
     {
-        match self {
-            Self::Responses(model) => SubagentConfig::builder(model.clone()),
-            Self::ChatCompletions(model) => SubagentConfig::builder(model.clone()),
+        match self
+            .fixed_effort(effort)
+            .expect("configured model effort was validated")
+        {
+            Self::Responses(model) => SubagentConfig::builder(model, effort),
+            Self::ChatCompletions(model) => SubagentConfig::builder(model, effort),
         }
     }
 
-    fn register_subagent<S>(&self, builder: SubagentConfigBuilder<S>) -> SubagentConfigBuilder<S>
+    fn register_subagent<S>(
+        &self,
+        builder: SubagentConfigBuilder<S>,
+        effort: &str,
+    ) -> SubagentConfigBuilder<S>
     where
         S: JournalStore + 'static,
     {
-        match self {
-            Self::Responses(model) => builder.model(model.clone()),
-            Self::ChatCompletions(model) => builder.model(model.clone()),
+        match self
+            .fixed_effort(effort)
+            .expect("configured model effort was validated")
+        {
+            Self::Responses(model) => builder.model(model, effort),
+            Self::ChatCompletions(model) => builder.model(model, effort),
         }
     }
 
@@ -1584,16 +1665,7 @@ fn default_worker_threads() -> usize {
         .clamp(1, 4)
 }
 
-fn coding_instruction(
-    cwd: &Path,
-    models: &[ModelChoice],
-    default_model: usize,
-    has_search: bool,
-) -> String {
-    let default = models.get(default_model).map_or_else(
-        || "the host default".to_owned(),
-        |model| format!("`{}/{}`", model.provider, model.model),
-    );
+fn coding_instruction(cwd: &Path, has_search: bool) -> String {
     let search = if has_search {
         " Web search is available when installed: use `lam.exa.*` and/or `lam.parallel.*` (provider-native shapes; call `lam.dir()` for schemas)."
     } else {
@@ -1602,9 +1674,8 @@ fn coding_instruction(
     format!(
         "You are a coding agent operating in `{cwd}`. Work within this directory unless the user explicitly directs you otherwise. Use the installed coding and multi-agent namespaces when they help complete the task.{search}
 
-Subagent models: call `lam.agents.models()` to list allowed models grouped by provider (and the default). For `lam.agents.spawn` / `lam.agents.call`, pass `model` as `{{ provider, model }}` taken from that catalog when you need a non-default model. Do not pass the TUI selector string. Omit `model` to use {default}.",
+Subagent selection: `lam.agents.spawn` and `lam.agents.call` require explicit `model: {{ provider, model }}` and `effort` fields. Read the live `currentSelection` from `lam.dir({{ path: 'lam' }})`, and call `lam.agents.models()` for the allowed model/effort catalog. Unless the user or project instructions such as AGENTS.md request otherwise, copy the current model and effort into the subagent request; never rely on an implicit default.",
         cwd = cwd.display(),
-        default = default,
         search = search,
     )
 }
@@ -2433,33 +2504,14 @@ mod tests {
 
     #[test]
     fn coding_instruction_points_at_agents_models_catalog() {
-        let models = vec![
-            ModelChoice {
-                registry_id: "openai/gpt-5.6-luna".to_owned(),
-                provider: "openai".to_owned(),
-                model: "gpt-5.6-luna".to_owned(),
-                display_name: "GPT-5.6 Luna".to_owned(),
-                context_window: 400_000,
-                efforts: vec!["none".to_owned(), "high".to_owned(), "max".to_owned()],
-            },
-            ModelChoice {
-                registry_id: "fireworks/accounts/fireworks/models/deepseek-v4-flash-0731"
-                    .to_owned(),
-                provider: "fireworks".to_owned(),
-                model: "accounts/fireworks/models/deepseek-v4-flash-0731".to_owned(),
-                display_name: "DeepSeek V4 Flash".to_owned(),
-                context_window: 1_040_000,
-                efforts: vec!["none".to_owned(), "high".to_owned(), "max".to_owned()],
-            },
-        ];
-
-        let instruction = coding_instruction(Path::new("/work/project"), &models, 0, true);
+        let instruction = coding_instruction(Path::new("/work/project"), true);
 
         assert!(instruction.contains("`lam.agents.models()`"));
-        assert!(instruction.contains("`openai/gpt-5.6-luna`"));
+        assert!(instruction.contains("`currentSelection`"));
+        assert!(instruction.contains("require explicit `model: { provider, model }` and `effort`"));
+        assert!(instruction.contains("AGENTS.md"));
+        assert!(instruction.contains("never rely on an implicit default"));
         assert!(instruction.contains("lam.exa"));
-        assert!(!instruction.contains("Configured inference providers and models:"));
-        assert!(!instruction.contains("accounts/fireworks/models/deepseek-v4-flash-0731"));
     }
 
     #[test]
@@ -2595,13 +2647,17 @@ mod tests {
         assert_eq!(request["body"]["reasoning"]["summary"], "auto");
         assert!(request.get("reasoning").is_none());
 
+        let child = control.fixed("low").unwrap();
         control.set("low").unwrap();
+        control.set("high").unwrap();
+        assert_eq!(child.selected(), "low");
+        assert_eq!(control.selected(), "high");
         insert_json_path(
             &mut request["body"],
             &control.path,
             serde_json::Value::String(control.selected()),
         );
-        assert_eq!(request["body"]["reasoning"]["effort"], "low");
+        assert_eq!(request["body"]["reasoning"]["effort"], "high");
         assert!(control.set("max").is_err());
     }
 

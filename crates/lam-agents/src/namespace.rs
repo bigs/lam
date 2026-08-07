@@ -9,17 +9,18 @@ use crate::config::{AGENTS_NAMESPACE, ModelTarget};
 use crate::system::SystemInner;
 use crate::{ActorAddress, SubagentConfig};
 
-/// Input accepted by `lam.agents.spawn`.
+/// Input accepted by both `lam.agents.spawn` and `lam.agents.call`.
 #[derive(Clone, Debug, JsonSchema, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SpawnRequest {
+pub struct ChildRequest {
     /// One path segment used to derive the child address.
     pub name: String,
     /// Initial task delivered to the child as an always-steering actor message.
     pub task: String,
-    /// Provider/model pair from `lam.agents.models()`, or the host default when omitted.
-    #[serde(default)]
-    pub model: Option<ModelTarget>,
+    /// Provider/model pair from `lam.agents.models()`.
+    pub model: ModelTarget,
+    /// Explicit reasoning effort allowed for the selected model.
+    pub effort: String,
     /// Exact extension namespace subset, or the complete configured set when omitted.
     #[serde(default)]
     pub namespaces: Option<Vec<String>>,
@@ -31,6 +32,9 @@ pub struct SpawnRequest {
     pub instructions: Option<String>,
 }
 
+/// Backward-compatible name for the shared child-creation request.
+pub type SpawnRequest = ChildRequest;
+
 /// One model entry suitable for `spawn` / `call` `model` fields.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -39,15 +43,8 @@ pub struct ModelInfo {
     pub provider: String,
     /// Provider-specific model identifier (pass as `model.model`).
     pub model: String,
-}
-
-impl From<&ModelTarget> for ModelInfo {
-    fn from(target: &ModelTarget) -> Self {
-        Self {
-            provider: target.provider.clone(),
-            model: target.model.clone(),
-        }
-    }
+    /// Allowed explicit reasoning efforts.
+    pub efforts: Vec<String>,
 }
 
 /// Models available under one provider for subagent creation.
@@ -64,8 +61,6 @@ pub struct ProviderModels {
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelsCatalog {
-    /// Used when `spawn` / `call` omit `model`.
-    pub default: ModelInfo,
     /// All allowed models grouped by provider (provider name ascending).
     pub providers: Vec<ProviderModels>,
 }
@@ -95,6 +90,8 @@ pub struct SpawnReceipt {
     pub address: ActorAddress,
     /// Provider/model pair selected for the child.
     pub model: ModelTarget,
+    /// Reasoning effort selected for the child.
+    pub effort: String,
     /// Installed extension namespace paths. Kernel `lam` utilities are implicit.
     pub namespaces: Vec<String>,
     /// Child depth relative to the actor which owns this subagent policy.
@@ -136,6 +133,16 @@ pub enum SpawnError {
         provider: String,
         /// Requested model.
         model: String,
+    },
+    /// The model exists but does not allow the requested effort.
+    #[error("effort `{effort}` is not allowed for subagent model `{provider}/{model}`")]
+    EffortNotAllowed {
+        /// Requested provider.
+        provider: String,
+        /// Requested model.
+        model: String,
+        /// Requested effort.
+        effort: String,
     },
     /// The requested manifest namespace was not configured by the host.
     #[error("namespace `{path}` is not allowed for subagents")]
@@ -349,18 +356,13 @@ where
 {
     let namespace_docs = config.namespaces().collect::<Vec<_>>().join(", ");
     let docs = format!("Create and communicate with addressed actors. Current actor: {address}.");
-    let models_docs = format!(
-        "List inference models allowed for subagent spawn/call from this actor, grouped by provider. Returns the default model (used when spawn/call omit model) and every allowed {{ provider, model }} pair. Call this before spawn/call when you need a non-default model or are unsure which coordinates are configured. Default: `{}`.",
-        config.default_model(),
-    );
+    let models_docs = "List every provider/model/effort combination allowed for subagent spawn/call from this actor, grouped by provider. Both `model` and `effort` are required by the creation commands. Unless the user or project instructions request otherwise, pass the current selection from `lam.dir({ path: 'lam' })` when it includes an effort and is allowed by this catalog; otherwise choose an allowed combination explicitly.";
     let spawn_docs = format!(
-        "Create a persistent direct child at {address}/<name> and return after its task is durably queued. Its eventual AgentOutcome is delivered as a steering actor message. Child addresses are create-only and cannot be reused once durable. Omit model for `{}`. If you need another model or do not know the configured coordinates, call lam.agents.models() first and pass model as {{ provider, model }} from that catalog (not the selector string). Omit namespaces for the complete configured set; allowed namespaces: [{}]. Kernel lam.dir and lam.result are always present.",
-        config.default_model(),
+        "Create a persistent direct child at {address}/<name> and return after its task is durably queued. It uses the same child-request shape as `lam.agents.call`. Its eventual AgentOutcome is delivered as a steering actor message. Child addresses are create-only and cannot be reused once durable. `model: {{ provider, model }}` and `effort` are required. Unless the user or project instructions request otherwise, pass the current selection from `lam.dir({{ path: 'lam' }})` when it includes an effort and is allowed by `lam.agents.models()`; otherwise choose an allowed combination explicitly. Omit namespaces for the complete configured set; allowed namespaces: [{}]. Kernel lam.dir and lam.result are always present.",
         namespace_docs,
     );
     let call_docs = format!(
-        "Create a persistent direct child at {address}/<name>, wait asynchronously for its initial task, and return AgentOutcome. Cancellation stops the child subtree. Omit model for `{}`. If you need another model or do not know the configured coordinates, call lam.agents.models() first and pass model as {{ provider, model }} from that catalog (not the selector string). Omit namespaces for the complete configured set; allowed namespaces: [{}].",
-        config.default_model(),
+        "Create a persistent direct child at {address}/<name>, wait asynchronously for its initial task, and return AgentOutcome. It uses the same child-request shape as `lam.agents.spawn`. Cancellation stops the child subtree. `model: {{ provider, model }}` and `effort` are required. Unless the user or project instructions request otherwise, pass the current selection from `lam.dir({{ path: 'lam' }})` when it includes an effort and is allowed by `lam.agents.models()`; otherwise choose an allowed combination explicitly. Omit namespaces for the complete configured set; allowed namespaces: [{}].",
         namespace_docs,
     );
     let wait_docs = "Wait without steering for the initial tasks of direct children returned by `lam.agents.spawn`. Resolves only after every terminal `AgentOutcome` is durably admitted to this actor's inbox; the next model continuation receives the wait tool result and those inbox messages together. Waiting does not message, interrupt, stop, or otherwise steer the children. If the surrounding eval is cancelled or times out, the children continue running and their outcomes are still delivered.";
@@ -463,7 +465,7 @@ where
             let system = system.clone();
             let address = address.clone();
             let config = config.clone();
-            move |_context, request: SpawnRequest| {
+            move |_context, request: ChildRequest| {
                 let system = system.clone();
                 let address = address.clone();
                 let config = config.clone();
@@ -477,7 +479,7 @@ where
             let system = system.clone();
             let address = address.clone();
             let config = config.clone();
-            move |_context, request: SpawnRequest| {
+            move |_context, request: ChildRequest| {
                 let system = system.clone();
                 let address = address.clone();
                 let config = config.clone();
@@ -495,30 +497,39 @@ fn models_catalog<S>(config: &SubagentConfig<S>) -> ModelsCatalog
 where
     S: JournalStore + 'static,
 {
-    models_catalog_from_targets(config.default_model().clone(), config.models().cloned())
+    models_catalog_from_targets(
+        config
+            .model_efforts()
+            .map(|(target, effort)| (target.clone(), effort.to_owned())),
+    )
 }
 
 fn models_catalog_from_targets(
-    default: ModelTarget,
-    targets: impl IntoIterator<Item = ModelTarget>,
+    targets: impl IntoIterator<Item = (ModelTarget, String)>,
 ) -> ModelsCatalog {
     use std::collections::BTreeMap;
 
-    let mut by_provider: BTreeMap<String, Vec<ModelInfo>> = BTreeMap::new();
-    for target in targets {
-        by_provider
+    let mut by_provider: BTreeMap<String, BTreeMap<String, ModelInfo>> = BTreeMap::new();
+    for (target, effort) in targets {
+        let model = by_provider
             .entry(target.provider.clone())
             .or_default()
-            .push(ModelInfo::from(&target));
+            .entry(target.model.clone())
+            .or_insert_with(|| ModelInfo {
+                provider: target.provider.clone(),
+                model: target.model,
+                efforts: Vec::new(),
+            });
+        model.efforts.push(effort);
     }
     let providers = by_provider
         .into_iter()
-        .map(|(provider, models)| ProviderModels { provider, models })
+        .map(|(provider, models)| ProviderModels {
+            provider,
+            models: models.into_values().collect(),
+        })
         .collect();
-    ModelsCatalog {
-        default: ModelInfo::from(&default),
-        providers,
-    }
+    ModelsCatalog { providers }
 }
 
 fn send_system_error(error: crate::AgentSystemError) -> SendError {
@@ -539,36 +550,47 @@ fn send_system_error(error: crate::AgentSystemError) -> SendError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn spawn_and_call_request_schema_requires_model_and_effort() {
+        let schema = serde_json::to_value(schemars::schema_for!(ChildRequest)).unwrap();
+        assert_eq!(schema["title"], "ChildRequest");
+        let description = schema["description"].as_str().unwrap();
+        assert!(description.contains("lam.agents.spawn"));
+        assert!(description.contains("lam.agents.call"));
+        let required = schema["required"].as_array().unwrap();
+        for field in ["name", "task", "model", "effort"] {
+            assert!(required.iter().any(|value| value == field), "{field}");
+        }
+
+        assert!(
+            serde_json::from_value::<ChildRequest>(json!({
+                "name": "worker",
+                "task": "work",
+                "effort": "high"
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ChildRequest>(json!({
+                "name": "worker",
+                "task": "work",
+                "model": { "provider": "openai", "model": "gpt" }
+            }))
+            .is_err()
+        );
+    }
 
     #[test]
     fn models_catalog_groups_by_provider_in_name_order() {
-        let default = ModelTarget {
-            provider: "openai".to_owned(),
-            model: "gpt-default".to_owned(),
-        };
-        let catalog = models_catalog_from_targets(
-            default.clone(),
-            [
-                ModelTarget {
-                    provider: "fireworks".to_owned(),
-                    model: "deepseek-a".to_owned(),
-                },
-                ModelTarget {
-                    provider: "openai".to_owned(),
-                    model: "gpt-default".to_owned(),
-                },
-                ModelTarget {
-                    provider: "fireworks".to_owned(),
-                    model: "deepseek-b".to_owned(),
-                },
-                ModelTarget {
-                    provider: "openai".to_owned(),
-                    model: "gpt-other".to_owned(),
-                },
-            ],
-        );
-        assert_eq!(catalog.default.provider, "openai");
-        assert_eq!(catalog.default.model, "gpt-default");
+        let catalog = models_catalog_from_targets([
+            (target("fireworks", "deepseek-a"), "high".to_owned()),
+            (target("openai", "gpt-default"), "low".to_owned()),
+            (target("fireworks", "deepseek-b"), "max".to_owned()),
+            (target("openai", "gpt-default"), "high".to_owned()),
+            (target("openai", "gpt-other"), "xhigh".to_owned()),
+        ]);
         assert_eq!(
             catalog
                 .providers
@@ -593,5 +615,13 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["gpt-default", "gpt-other"]
         );
+        assert_eq!(catalog.providers[1].models[0].efforts, ["low", "high"]);
+    }
+
+    fn target(provider: &str, model: &str) -> ModelTarget {
+        ModelTarget {
+            provider: provider.to_owned(),
+            model: model.to_owned(),
+        }
     }
 }

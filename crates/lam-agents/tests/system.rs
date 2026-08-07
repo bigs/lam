@@ -195,6 +195,33 @@ impl ModelProvider for RoutingProvider {
         if let Some(response) = scenario_response(self.scenario, &request.value) {
             return Ok(native(response));
         }
+        if has_message(&request.value, "invalid effort task", Some("user")) {
+            if has_transition(&request.value, "eval") {
+                let value =
+                    if transition_payload_contains(&request.value, "eval", "effortNotAllowed") {
+                        "EFFORT_REJECTED"
+                    } else {
+                        "EFFORT_BAD"
+                    };
+                return Ok(native(json!({ "kind": "output", "value": value })));
+            }
+            return Ok(native(json!({
+                "kind": "eval",
+                "source": r#"let rejected;
+try {
+  await lam.agents.spawn({
+    name: "invalid-effort",
+    task: "must not run",
+    model: { provider: "test", model: "model-a" },
+    effort: "max",
+    namespaces: []
+  });
+} catch (error) {
+  rejected = error;
+}
+lam.result(rejected)"#
+            })));
+        }
         let rendered = request.value.to_string();
         if has_message(&request.value, "cancel spawn task", Some("user")) {
             if has_transition(&request.value, "eval") {
@@ -207,6 +234,8 @@ impl ModelProvider for RoutingProvider {
                 "source": r#"await lam.agents.spawn({
   name: "cancelled",
   task: "must not run",
+  model: { provider: "test", model: "model-a" },
+  effort: "high",
   namespaces: []
 });
 lam.result("unexpected")"#
@@ -223,11 +252,13 @@ lam.result("unexpected")"#
                 "source": r#"const first = await lam.agents.spawn({
   name: "same",
   task: "duplicate leaf task",
+  model: { provider: "test", model: "model-a" },
+  effort: "high",
   namespaces: []
 });
 let duplicate;
 try {
-  await lam.agents.spawn({ name: "same", task: "must not run", namespaces: [] });
+  await lam.agents.spawn({ name: "same", task: "must not run", model: { provider: "test", model: "model-a" }, effort: "high", namespaces: [] });
 } catch (error) {
   duplicate = error;
 }
@@ -255,6 +286,8 @@ lam.result({ first, duplicate })"#
                 "source": r#"const child = await lam.agents.spawn({
   name: "child",
   task: "roundtrip child task",
+  model: { provider: "test", model: "model-a" },
+  effort: "high",
   namespaces: ["lam.agents", "test.roundtrip"]
 });
 const children = await lam.agents.list();
@@ -280,6 +313,9 @@ lam.result("sent")"#
         }
         if rendered.contains("root task") {
             if let Some(address) = find_string_field(&request.value, "address") {
+                if find_string_field(&request.value, "effort").as_deref() != Some("high") {
+                    return Ok(native(json!({ "kind": "output", "value": "EFFORT_BAD" })));
+                }
                 return Ok(native(json!({ "kind": "output", "value": address })));
             }
             return Ok(native(json!({
@@ -288,6 +324,7 @@ lam.result("sent")"#
   name: "worker",
   task: "child task",
   model: { provider: "test", model: "model-a" },
+  effort: "high",
   namespaces: [],
   systemPrompt: "child base",
   instructions: "child instruction"
@@ -296,6 +333,20 @@ lam.result(child)"#
             })));
         }
         if rendered.contains("child task") {
+            if !has_transition(&request.value, "eval") {
+                return Ok(native(json!({
+                    "kind": "eval",
+                    "source": "lam.result(lam.dir({ path: 'lam' })[0].currentSelection)"
+                })));
+            }
+            if find_string_field(&request.value, "provider").as_deref() != Some("test")
+                || find_string_field(&request.value, "model").as_deref() != Some("model-a")
+                || find_string_field(&request.value, "effort").as_deref() != Some("high")
+            {
+                return Ok(native(
+                    json!({ "kind": "output", "value": "SELECTION_BAD" }),
+                ));
+            }
             self.shared.child_seen.store(true, Ordering::Release);
             self.shared.child_notify.notify_waiters();
             return Ok(native(
@@ -335,6 +386,8 @@ fn child_call_response(request: &Value) -> Value {
             "source": r#"const outcome = await lam.agents.call({
   name: "sync",
   task: "sync child task",
+  model: { provider: "test", model: "model-a" },
+  effort: "high",
   namespaces: []
 });
 lam.result(outcome)"#
@@ -359,6 +412,8 @@ fn background_outcome_response(request: &Value) -> Value {
             "source": r#"await lam.agents.spawn({
   name: "background",
   task: "background child task",
+  model: { provider: "test", model: "model-a" },
+  effort: "high",
   namespaces: []
 });
 lam.result("spawned")"#
@@ -385,6 +440,8 @@ fn spawn_wait_response(request: &Value) -> Value {
             "source": r#"const child = await lam.agents.spawn({
   name: "waited",
   task: "waited child task",
+  model: { provider: "test", model: "model-a" },
+  effort: "high",
   namespaces: []
 });
 const receipt = await lam.agents.wait({ addresses: [child.address] });
@@ -416,6 +473,8 @@ fn direct_stop_response(request: &Value) -> Value {
             "source": r#"await lam.agents.spawn({
   name: "worker",
   task: "stop child background",
+  model: { provider: "test", model: "model-a" },
+  effort: "high",
   namespaces: []
 });
 lam.result("spawned")"#
@@ -442,6 +501,8 @@ fn cancel_call_response(request: &Value) -> Value {
             "source": r#"await lam.agents.call({
   name: "cancelled-call",
   task: "blocking call child",
+  model: { provider: "test", model: "model-a" },
+  effort: "high",
   namespaces: []
 });
 lam.result("unexpected")"#
@@ -482,6 +543,8 @@ fn tree_interruption_response(request: &Value) -> Value {
             "source": r#"await lam.agents.call({
   name: "leaf",
   task: "tree leaf task",
+  model: { provider: "test", model: "model-a" },
+  effort: "high",
   namespaces: []
 });
 lam.result("unexpected child completion")"#
@@ -493,6 +556,8 @@ lam.result("unexpected child completion")"#
             "source": r#"await lam.agents.call({
   name: "child",
   task: "tree child task",
+  model: { provider: "test", model: "model-a" },
+  effort: "high",
   namespaces: ["lam.agents"]
 });
 lam.result("unexpected root completion")"#
@@ -514,6 +579,8 @@ fn background_interruption_response(request: &Value) -> Value {
             "source": r#"await lam.agents.spawn({
   name: "background",
   task: "background interrupt child",
+  model: { provider: "test", model: "model-a" },
+  effort: "high",
   namespaces: []
 });
 lam.result("spawned background child")"#
@@ -593,6 +660,33 @@ impl ModelCodec for TestCodec {
 struct TestCodecError;
 
 #[tokio::test(flavor = "current_thread")]
+async fn unsupported_effort_is_a_distinct_typed_spawn_error() {
+    let provider = RoutingProvider::new();
+    let model = Model::new(provider, TestCodec)
+        .with_descriptor(ModelDescriptor::new("test", "model-a", "test/messages").unwrap());
+    let system = AgentSystem::builder(MemStore::new()).build().unwrap();
+    let subagents: SubagentConfig<MemStore> = SubagentConfig::builder(model.clone(), "high")
+        .build()
+        .unwrap();
+    let root = system
+        .host_with_subagents(
+            Lam::builder(model)
+                .state_store(system.state_store())
+                .build()
+                .actor("/effort-root"),
+            subagents,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        root.call("invalid effort task").await.unwrap(),
+        "EFFORT_REJECTED"
+    );
+    system.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn one_worker_hosts_root_and_manifest_spawned_child() {
     let provider = RoutingProvider::new();
     let model = Model::new(provider.clone(), TestCodec)
@@ -602,7 +696,7 @@ async fn one_worker_hosts_root_and_manifest_spawned_child() {
         .max_agents(4)
         .build()
         .unwrap();
-    let subagents: SubagentConfig<MemStore> = SubagentConfig::builder(model.clone())
+    let subagents: SubagentConfig<MemStore> = SubagentConfig::builder(model.clone(), "high")
         .required_instructions("host invariant")
         .agent_namespace(false)
         .build()
@@ -631,8 +725,29 @@ async fn one_worker_hosts_root_and_manifest_spawned_child() {
         .unwrap();
     let root_prompt = root_request.value["systemPrompt"].as_str().unwrap();
     assert!(root_prompt.contains("lam.agents.spawn"));
-    assert!(root_prompt.contains("test/model-a"));
+    assert!(root_prompt.contains("`model: { provider, model }` and `effort` are required"));
+    assert!(root_prompt.contains("lam.agents.models()"));
     assert!(root_prompt.contains("Agent identity: /root"));
+    let child_input = |function: &str| {
+        let marker = format!("lam.agents.{function}(input: ");
+        let line = root_prompt
+            .lines()
+            .find(|line| line.contains(&marker))
+            .unwrap_or_else(|| panic!("missing {function} signature in: {root_prompt}"));
+        let input = &line[line.find(&marker).unwrap() + marker.len()..];
+        input.split_once("): Promise").unwrap().0.to_owned()
+    };
+    let call_input = child_input("call");
+    let spawn_input = child_input("spawn");
+    assert_eq!(call_input, spawn_input);
+    assert!(call_input.starts_with("{ "));
+    assert!(call_input.contains("name: string"));
+    assert!(call_input.contains("task: string"));
+    assert!(call_input.contains("model: { provider: string; model: string }"));
+    assert!(call_input.contains("effort: string"));
+    assert!(call_input.contains("systemPrompt?: string | null"));
+    assert!(!call_input.contains("ChildRequest"));
+    assert!(!call_input.contains('…'));
     let child_request = requests
         .iter()
         .find(|request| request.value.to_string().contains("child task"))
@@ -691,7 +806,7 @@ async fn child_call_returns_one_outcome_without_a_parent_mailbox_copy() {
         .build()
         .unwrap();
     let mut events = system.take_events().unwrap();
-    let subagents: SubagentConfig<MemStore> = SubagentConfig::builder(model.clone())
+    let subagents: SubagentConfig<MemStore> = SubagentConfig::builder(model.clone(), "high")
         .agent_namespace(false)
         .build()
         .unwrap();
@@ -771,7 +886,7 @@ async fn background_outcome_steers_the_parent_and_system_waits_for_quiescence() 
         .max_agents(2)
         .build()
         .unwrap();
-    let subagents: SubagentConfig<MemStore> = SubagentConfig::builder(model.clone())
+    let subagents: SubagentConfig<MemStore> = SubagentConfig::builder(model.clone(), "high")
         .agent_namespace(false)
         .build()
         .unwrap();
@@ -808,7 +923,7 @@ async fn spawn_wait_returns_with_the_durable_outcome_in_the_same_model_turn() {
         .max_agents(2)
         .build()
         .unwrap();
-    let subagents: SubagentConfig<MemStore> = SubagentConfig::builder(model.clone())
+    let subagents: SubagentConfig<MemStore> = SubagentConfig::builder(model.clone(), "high")
         .agent_namespace(false)
         .build()
         .unwrap();
@@ -873,7 +988,7 @@ async fn direct_child_stop_cancels_work_and_releases_the_subtree_capacity() {
         .max_agents(2)
         .build()
         .unwrap();
-    let subagents: SubagentConfig<MemStore> = SubagentConfig::builder(model.clone())
+    let subagents: SubagentConfig<MemStore> = SubagentConfig::builder(model.clone(), "high")
         .agent_namespace(false)
         .build()
         .unwrap();
@@ -912,7 +1027,7 @@ async fn cancelling_child_call_retires_the_owned_subtree() {
         .build()
         .unwrap();
     let mut events = system.take_events().unwrap();
-    let subagents: SubagentConfig<MemStore> = SubagentConfig::builder(model.clone())
+    let subagents: SubagentConfig<MemStore> = SubagentConfig::builder(model.clone(), "high")
         .agent_namespace(false)
         .build()
         .unwrap();
@@ -972,7 +1087,7 @@ async fn tree_interruption_is_durable_and_keeps_only_the_root_resident() {
         .build()
         .unwrap();
     let mut events = system.take_events().unwrap();
-    let subagents: SubagentConfig<MemStore> = SubagentConfig::builder(model.clone())
+    let subagents: SubagentConfig<MemStore> = SubagentConfig::builder(model.clone(), "high")
         .max_depth(2)
         .build()
         .unwrap();
@@ -1104,7 +1219,7 @@ async fn interrupted_background_outcome_is_not_delivered_to_the_root() {
         .build()
         .unwrap();
     let mut events = system.take_events().unwrap();
-    let subagents: SubagentConfig<MemStore> = SubagentConfig::builder(model.clone())
+    let subagents: SubagentConfig<MemStore> = SubagentConfig::builder(model.clone(), "high")
         .agent_namespace(false)
         .build()
         .unwrap();
@@ -1224,7 +1339,7 @@ async fn agents_cannot_stop_actors_outside_their_direct_children() {
     let model = Model::new(provider, TestCodec)
         .with_descriptor(ModelDescriptor::new("test", "model-a", "test/messages").unwrap());
     let system = AgentSystem::builder(MemStore::new()).build().unwrap();
-    let subagents: SubagentConfig<MemStore> = SubagentConfig::builder(model.clone())
+    let subagents: SubagentConfig<MemStore> = SubagentConfig::builder(model.clone(), "high")
         .agent_namespace(false)
         .build()
         .unwrap();
@@ -1257,7 +1372,7 @@ async fn child_message_steers_an_active_parent_on_the_same_worker() {
         .max_agents(2)
         .build()
         .unwrap();
-    let subagents: SubagentConfig<MemStore> = SubagentConfig::builder(model.clone())
+    let subagents: SubagentConfig<MemStore> = SubagentConfig::builder(model.clone(), "high")
         .namespace(gate.signal_namespace())
         .max_depth(1)
         .build()
@@ -1340,7 +1455,7 @@ async fn duplicate_child_names_fail_with_the_canonical_address() {
         .max_agents(3)
         .build()
         .unwrap();
-    let subagents: SubagentConfig<MemStore> = SubagentConfig::builder(model.clone())
+    let subagents: SubagentConfig<MemStore> = SubagentConfig::builder(model.clone(), "high")
         .agent_namespace(false)
         .build()
         .unwrap();
@@ -1410,10 +1525,11 @@ async fn cancelled_spawn_retires_the_child_before_releasing_capacity() {
         .max_agents(2)
         .build()
         .unwrap();
-    let subagents: SubagentConfig<AdmissionGateStore> = SubagentConfig::builder(model.clone())
-        .agent_namespace(false)
-        .build()
-        .unwrap();
+    let subagents: SubagentConfig<AdmissionGateStore> =
+        SubagentConfig::builder(model.clone(), "high")
+            .agent_namespace(false)
+            .build()
+            .unwrap();
     let root = system
         .host_with_subagents(
             Lam::builder(model.clone())
@@ -1718,16 +1834,27 @@ fn explicit_subagent_policy_rejects_ambiguous_registrations() {
     let model = Model::new(provider, TestCodec)
         .with_descriptor(ModelDescriptor::new("test", "model-a", "test/messages").unwrap());
     let duplicate_model: Result<SubagentConfig<MemStore>, _> =
-        SubagentConfig::builder(model.clone())
-            .model(model.clone())
+        SubagentConfig::builder(model.clone(), "high")
+            .model(model.clone(), "high")
             .build();
     assert!(matches!(
         duplicate_model,
         Err(SubagentConfigError::DuplicateModel { .. })
     ));
+    let distinct_efforts: Result<SubagentConfig<MemStore>, _> =
+        SubagentConfig::builder(model.clone(), "low")
+            .model(model.clone(), "high")
+            .build();
+    assert!(distinct_efforts.is_ok());
+    let invalid_effort: Result<SubagentConfig<MemStore>, _> =
+        SubagentConfig::builder(model.clone(), " high ").build();
+    assert!(matches!(
+        invalid_effort,
+        Err(SubagentConfigError::InvalidEffort { .. })
+    ));
 
     let duplicate_namespace: Result<SubagentConfig<MemStore>, _> =
-        SubagentConfig::builder(model.clone())
+        SubagentConfig::builder(model.clone(), "high")
             .namespace(lam::Namespace::new("acme.read", "read"))
             .namespace(lam::Namespace::new("acme.read", "duplicate"))
             .build();
@@ -1736,9 +1863,10 @@ fn explicit_subagent_policy_rejects_ambiguous_registrations() {
         Err(SubagentConfigError::DuplicateNamespace { .. })
     ));
 
-    let reserved_namespace: Result<SubagentConfig<MemStore>, _> = SubagentConfig::builder(model)
-        .namespace(lam::Namespace::new("lam.agents", "collision"))
-        .build();
+    let reserved_namespace: Result<SubagentConfig<MemStore>, _> =
+        SubagentConfig::builder(model, "high")
+            .namespace(lam::Namespace::new("lam.agents", "collision"))
+            .build();
     assert!(matches!(
         reserved_namespace,
         Err(SubagentConfigError::ReservedNamespace { .. })

@@ -79,6 +79,21 @@ impl<P, C> Model<P, C> {
     pub fn shared_parts(&self) -> (Arc<P>, Arc<C>) {
         (Arc::clone(&self.provider), Arc::clone(&self.codec))
     }
+
+    /// Shares this model's transport and durable identity with a replacement codec.
+    ///
+    /// Embeddings use this to derive request-policy variants, such as fixed
+    /// reasoning efforts for independently running child actors, without
+    /// rebuilding or duplicating the provider transport.
+    #[must_use]
+    pub fn with_codec<D>(&self, codec: D) -> Model<P, D> {
+        Model {
+            provider: Arc::clone(&self.provider),
+            codec: Arc::new(codec),
+            descriptor: self.descriptor.clone(),
+            context_window_tokens: self.context_window_tokens,
+        }
+    }
 }
 
 pub(crate) struct RegisteredModel {

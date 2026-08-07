@@ -49,6 +49,8 @@ catchable as structured JavaScript values and remain structured
 Two kernel-owned helpers are always available:
 
 - `lam.dir(query?)` synchronously returns matching documentation and schemas;
+  when configured by the embedding, the `lam` descriptor also carries the live
+  `{ provider, model, effort? }` selection as `currentSelection`;
 - `lam.result(value)` marks and returns the final JSON-compatible value.
 
 `Isolate::api_inventory()` returns the concise manifest synopsis used by the

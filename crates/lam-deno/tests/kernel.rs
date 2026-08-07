@@ -2,7 +2,7 @@
 
 use std::future::poll_fn;
 use std::sync::{
-    Arc,
+    Arc, RwLock,
     atomic::{AtomicBool, Ordering},
     mpsc,
 };
@@ -10,8 +10,8 @@ use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use lam_deno::{
-    ConsoleEntry, ConsoleLevel, EvalError, EvalOptions, EvalValue, Isolate, IsolateBuildError,
-    Namespace, Never,
+    ConsoleEntry, ConsoleLevel, DirectorySelection, DirectorySelectionSource, EvalError,
+    EvalOptions, EvalValue, Isolate, IsolateBuildError, Namespace, Never,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -346,7 +346,7 @@ async fn model_api_inventory_is_a_compact_view_of_the_manifest() {
     let inventory = isolate.api_inventory();
 
     assert!(inventory.contains(
-        "- `lam.dir(query?: { path?: string }): NamespaceDescriptor[]` — Discover installed namespaces, functions, and inferred schemas."
+        "- `lam.dir(query?: { path?: string }): NamespaceDescriptor[]` — Discover installed namespaces, functions, and inferred schemas. When the embedding exposes a current model selection, the unfiltered result and `lam` path query include it as `currentSelection` on the `lam` namespace descriptor."
     ));
     assert!(inventory.contains(
         "- `lam.result<T extends JsonValue>(value: T): T` — Returns a JSON-serializable value unchanged, making the eval's final result explicit. Use it as the last expression."
@@ -358,6 +358,47 @@ async fn model_api_inventory_is_a_compact_view_of_the_manifest() {
         "- `acme.catalog.text.echo(input: { text: string }): Promise<{ text: string; isolateGeneration: number }>` — Returns its input and the invoking isolate generation."
     ), "unexpected inventory:\n{inventory}");
     assert!(!inventory.contains("This second paragraph"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dir_reports_the_embeddings_live_model_selection() {
+    let selected = Arc::new(RwLock::new(DirectorySelection {
+        provider: "openai".to_owned(),
+        model: "gpt-first".to_owned(),
+        effort: Some("high".to_owned()),
+    }));
+    let source = DirectorySelectionSource::new({
+        let selected = Arc::clone(&selected);
+        move || selected.read().unwrap().clone()
+    });
+    let mut isolate = Isolate::builder()
+        .directory_selection(source)
+        .build()
+        .await
+        .expect("selection-aware isolate should build");
+
+    let first = isolate
+        .eval("lam.dir({ path: 'lam' })[0].currentSelection")
+        .await
+        .expect("selection should be discoverable");
+    assert_eq!(
+        json_result(first.result),
+        json!({ "provider": "openai", "model": "gpt-first", "effort": "high" })
+    );
+
+    *selected.write().unwrap() = DirectorySelection {
+        provider: "fireworks".to_owned(),
+        model: "deepseek".to_owned(),
+        effort: Some("low".to_owned()),
+    };
+    let second = isolate
+        .eval("lam.dir({ path: 'lam' })[0].currentSelection")
+        .await
+        .expect("updated selection should be discoverable");
+    assert_eq!(
+        json_result(second.result),
+        json!({ "provider": "fireworks", "model": "deepseek", "effort": "low" })
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]

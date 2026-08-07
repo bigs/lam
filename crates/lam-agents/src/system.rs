@@ -18,7 +18,7 @@ use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc, oneshot};
 
 use crate::config::{AGENTS_NAMESPACE, ChildActorSpec};
 use crate::namespace::{
-    SpawnError, SpawnReceipt, SpawnRequest, StopError, WaitError, WaitReceipt, WaitRequest,
+    ChildRequest, SpawnError, SpawnReceipt, StopError, WaitError, WaitReceipt, WaitRequest,
     WaitedTask, agents_namespace,
 };
 use crate::{
@@ -514,6 +514,7 @@ where
     parent: Arc<ResidentActor<S>>,
     address: ActorAddress,
     model: crate::ModelTarget,
+    effort: String,
     namespaces: Vec<String>,
     depth: usize,
     task: String,
@@ -746,13 +747,14 @@ where
         parent_address: ActorAddress,
         parent_depth: usize,
         config: Arc<SubagentConfig<S>>,
-        request: SpawnRequest,
+        request: ChildRequest,
     ) -> Result<SpawnReceipt, SpawnError> {
         let ChildLaunch {
             child,
             parent,
             address,
             model,
+            effort,
             namespaces,
             depth,
             task,
@@ -782,6 +784,7 @@ where
         Ok(SpawnReceipt {
             address,
             model,
+            effort,
             namespaces,
             depth,
             message_id: receipt.message_id.to_string(),
@@ -794,7 +797,7 @@ where
         parent_address: ActorAddress,
         parent_depth: usize,
         config: Arc<SubagentConfig<S>>,
-        request: SpawnRequest,
+        request: ChildRequest,
     ) -> Result<AgentOutcome, SpawnError> {
         let ChildLaunch {
             child,
@@ -921,7 +924,7 @@ where
         parent_address: ActorAddress,
         parent_depth: usize,
         config: Arc<SubagentConfig<S>>,
-        request: SpawnRequest,
+        request: ChildRequest,
     ) -> Result<ChildLaunch<S>, SpawnError> {
         if parent_depth >= config.max_depth {
             return Err(SpawnError::DepthLimit {
@@ -935,17 +938,25 @@ where
                     name: request.name.clone(),
                     message: error.to_string(),
                 })?;
-        let target = request
-            .model
-            .unwrap_or_else(|| config.default_model.clone());
-        let registration =
-            config
-                .registration(&target)
-                .cloned()
-                .ok_or_else(|| SpawnError::ModelNotAllowed {
-                    provider: target.provider.clone(),
-                    model: target.model.clone(),
-                })?;
+        let target = request.model.clone();
+        let effort = request.effort.clone();
+        let registration = config
+            .registration(&target, &effort)
+            .cloned()
+            .ok_or_else(|| {
+                if config.contains_model(&target) {
+                    SpawnError::EffortNotAllowed {
+                        provider: target.provider.clone(),
+                        model: target.model.clone(),
+                        effort: effort.clone(),
+                    }
+                } else {
+                    SpawnError::ModelNotAllowed {
+                        provider: target.provider.clone(),
+                        model: target.model.clone(),
+                    }
+                }
+            })?;
         let selected_paths = config
             .select_namespace_paths(request.namespaces)
             .map_err(|path| SpawnError::NamespaceNotAllowed { path })?;
@@ -998,6 +1009,7 @@ where
             parent,
             address: child_address,
             model: target,
+            effort,
             namespaces: selected_paths,
             depth: child_depth,
             task: request.task,

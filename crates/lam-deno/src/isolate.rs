@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::bridge::ConsoleBuffer;
-use crate::builtin::{Namespace, Registry};
+use crate::builtin::{DirectorySelectionSource, Namespace, Registry};
 use crate::error::{EvalError, IsolateBuildError, RuntimeException};
 use crate::inspector::InspectorClient;
 use crate::transpile;
@@ -64,6 +64,7 @@ impl EvalOptions {
 /// Configures and constructs a persistent TypeScript isolate.
 pub struct IsolateBuilder {
     namespaces: Vec<Namespace>,
+    directory_selection: Option<DirectorySelectionSource>,
     default_timeout: Duration,
     max_timeout: Option<Duration>,
     capture_console: bool,
@@ -73,6 +74,7 @@ impl Default for IsolateBuilder {
     fn default() -> Self {
         Self {
             namespaces: Vec::new(),
+            directory_selection: None,
             default_timeout: DEFAULT_TIMEOUT,
             max_timeout: None,
             capture_console: true,
@@ -92,6 +94,13 @@ impl IsolateBuilder {
     #[must_use]
     pub fn namespaces(mut self, namespaces: impl IntoIterator<Item = Namespace>) -> Self {
         self.namespaces.extend(namespaces);
+        self
+    }
+
+    /// Supplies the live model selection reported by `lam.dir`.
+    #[must_use]
+    pub fn directory_selection(mut self, selection: DirectorySelectionSource) -> Self {
+        self.directory_selection = Some(selection);
         self
     }
 
@@ -133,7 +142,7 @@ impl IsolateBuilder {
                 self.default_timeout.min(max_timeout)
             });
 
-        let registry = Arc::new(Registry::build(self.namespaces)?);
+        let registry = Arc::new(Registry::build(self.namespaces, self.directory_selection)?);
         let console = ConsoleBuffer::new(self.capture_console);
         let generation = 1;
         let mut kernel = Kernel::new(Arc::clone(&registry), console.clone(), generation)?;

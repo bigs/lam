@@ -264,6 +264,7 @@ where
                     };
                     match append {
                         AppendAttempt::Appended(next) => {
+                            self.notify_model_selection(&next);
                             if let Err(error) =
                                 write_checkpoint(self.store.as_ref(), &self.actor_id, &next).await
                             {
@@ -294,6 +295,7 @@ where
 
             match append_event(self.store.as_ref(), &self.actor_id, state, selection_event).await? {
                 AppendAttempt::Appended(next) => {
+                    self.notify_model_selection(&next);
                     return Ok(ModelSwitchReceipt {
                         previous_model_id: previous_id,
                         selected_model_id: target_id,

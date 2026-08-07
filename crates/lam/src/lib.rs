@@ -54,6 +54,7 @@ pub use lam_core::{
     ToolCallDelta, atomic_compaction_units, compaction_prefix_len, estimate_entry_tokens,
 };
 pub use lam_deno::{
-    ConsoleEntry, ConsoleLevel, EvalError, EvalOptions, EvalOutput, EvalValue, Isolate,
-    IsolateBuildError, IsolateBuilder, Namespace, Never, OperationContext, RuntimeException,
+    ConsoleEntry, ConsoleLevel, DirectorySelection, DirectorySelectionSource, EvalError,
+    EvalOptions, EvalOutput, EvalValue, Isolate, IsolateBuildError, IsolateBuilder, Namespace,
+    Never, OperationContext, RuntimeException,
 };

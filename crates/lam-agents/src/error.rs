@@ -1,13 +1,21 @@
 /// Invalid host-side subagent policy.
 #[derive(Debug, thiserror::Error)]
 pub enum SubagentConfigError {
-    /// Two model registrations used the same provider/model pair.
-    #[error("subagent model `{provider}/{model}` was registered more than once")]
+    /// Two model registrations used the same provider/model/effort combination.
+    #[error("subagent model `{provider}/{model}` effort `{effort}` was registered more than once")]
     DuplicateModel {
         /// Provider name.
         provider: String,
         /// Provider-specific model name.
         model: String,
+        /// Duplicate effort.
+        effort: String,
+    },
+    /// A registered effort was empty or padded.
+    #[error("subagent effort `{effort}` must be nonempty and unpadded")]
+    InvalidEffort {
+        /// Invalid effort value.
+        effort: String,
     },
     /// Two namespaces used the same manifest path.
     #[error("subagent namespace `{path}` was registered more than once")]

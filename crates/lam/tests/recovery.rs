@@ -3,7 +3,7 @@
 mod support;
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use lam::{
@@ -294,15 +294,23 @@ async fn reopen_resolves_the_durable_model_selection_from_the_registry() {
 
     let reopened_source = ScriptedProvider::new([]);
     let reopened_target = ScriptedProvider::new([output("target answer")]);
+    let observed = Arc::new(Mutex::new(None));
     let mut actor = Lam::builder(Model::new(reopened_source.clone(), ScriptedCodec))
         .initial_model_id("source")
         .model("target", Model::new(reopened_target.clone(), ScriptedCodec))
         .state_store(RedbStore::open(&path).expect("store should reopen"))
+        .observe_model_selection({
+            let observed = Arc::clone(&observed);
+            move |selection| {
+                *observed.lock().unwrap() = Some(selection.model_id.as_str().to_owned());
+            }
+        })
         .build()
         .actor("durable-selection")
         .build()
         .await
         .unwrap();
+    assert_eq!(observed.lock().unwrap().as_deref(), Some("target"));
     assert_eq!(
         actor
             .actor_ref()
