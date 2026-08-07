@@ -1585,6 +1585,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "lam-batteries"
+version = "0.1.0"
+dependencies = [
+ "lam",
+ "reqwest",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "lam-code"
 version = "0.1.0"
 dependencies = [
@@ -1660,6 +1673,7 @@ dependencies = [
  "crossterm",
  "lam",
  "lam-agents",
+ "lam-batteries",
  "lam-code",
  "lam-openai",
  "lam-redb",

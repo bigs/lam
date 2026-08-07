@@ -9,10 +9,11 @@ use lam::{
     ContextTransition, DeliveryMode, EncodedPayload, InterruptedEvalOutcome, IsolateState,
     JournalStore, Lam, LamBuilder, MemStore, MessageId, MessageSource, Model, ModelCodec,
     ModelDelta, ModelDescriptor, ModelDirective, ModelRequestConfig, ModelResponseMetadata,
-    ModelResponseProjection, ModelSelection, ProjectedContextEntry, Revision, RunProgress,
-    SYSTEM_NOTICE_CODEC_ID, SystemNotice,
+    ModelResponseProjection, ModelSelection, Namespace, ProjectedContextEntry, Revision,
+    RunProgress, SYSTEM_NOTICE_CODEC_ID, SystemNotice,
 };
 use lam_agents::{Agent, AgentSystem, AgentSystemEvents, SubagentConfig, SubagentConfigBuilder};
+use lam_batteries::BatteriesPack;
 use lam_code::{CodingPack, FilesystemAccess, LocalCommandRunner};
 use lam_openai::chat_completions::{
     ChatCompletions, ChatCompletionsCodec, ChatCompletionsProvider,
@@ -22,6 +23,7 @@ use lam_redb::{ReadOnlyStore, RedbStore};
 use thiserror::Error;
 use tokio::sync::mpsc;
 
+use crate::agent_config::AgentConfig;
 use crate::boot::{phase, phase_sync};
 use crate::codex::{
     CODEX_BACKEND_BASE_URL, CodexCredentialStore, default_headers as codex_default_headers,
@@ -285,6 +287,15 @@ impl Runtime {
                 .build()
                 .map_err(|error| RuntimeError::CodingPack(error.to_string()))
         })?;
+        let (agent_config, battery_warnings) =
+            phase_sync("agent_config_load", || AgentConfig::load(None))
+                .map_err(|error| RuntimeError::AgentConfig(error.to_string()))?;
+        startup_warnings.extend(battery_warnings);
+        let batteries = phase_sync("batteries_pack_build", || {
+            build_batteries_pack(&agent_config)
+                .map_err(|error| RuntimeError::BatteriesPack(error.to_string()))
+        })?;
+        let installed_namespaces = collect_namespaces(&coding, batteries.as_ref());
         let store = phase_sync("redb_open", || RedbStore::open(&session.database_path))
             .map_err(RuntimeError::Journal)?;
         let system = phase_sync("agent_system_build", || {
@@ -301,7 +312,12 @@ impl Runtime {
             .iter()
             .map(|configured| configured.choice.clone())
             .collect::<Vec<_>>();
-        let instruction = coding_instruction(&cwd, &active_choices, initial_index);
+        let instruction = coding_instruction(
+            &cwd,
+            &active_choices,
+            initial_index,
+            agent_config.has_search(),
+        );
         let project_instructions = phase_sync("project_instructions", || {
             let entries = load_project_instructions(&cwd);
             match format_project_instructions(&entries) {
@@ -330,7 +346,7 @@ impl Runtime {
             .lam_builder()
             .initial_model_id(initial.choice.registry_id.clone())
             .state_store(system.state_store())
-            .namespaces(coding.namespaces())
+            .namespaces(installed_namespaces.iter().cloned())
             .annotate_system_prompt(&instruction);
         if let Some(project_instructions) = &project_instructions {
             root_builder = root_builder.annotate_system_prompt(project_instructions);
@@ -350,7 +366,7 @@ impl Runtime {
             }
         }
         let children: SubagentConfig<RedbStore> = child_builder
-            .namespaces(coding.namespaces())
+            .namespaces(installed_namespaces.iter().cloned())
             .required_instructions(instruction)
             .build()
             .map_err(|error| RuntimeError::AgentSystem(error.to_string()))?;
@@ -1557,18 +1573,58 @@ fn default_worker_threads() -> usize {
         .clamp(1, 4)
 }
 
-fn coding_instruction(cwd: &Path, models: &[ModelChoice], default_model: usize) -> String {
+fn coding_instruction(
+    cwd: &Path,
+    models: &[ModelChoice],
+    default_model: usize,
+    has_search: bool,
+) -> String {
     let default = models.get(default_model).map_or_else(
         || "the host default".to_owned(),
         |model| format!("`{}/{}`", model.provider, model.model),
     );
+    let search = if has_search {
+        " Web search is available when installed: use `lam.exa.*` and/or `lam.parallel.*` (provider-native shapes; call `lam.dir()` for schemas)."
+    } else {
+        ""
+    };
     format!(
-        "You are a coding agent operating in `{cwd}`. Work within this directory unless the user explicitly directs you otherwise. Use the installed coding and multi-agent namespaces when they help complete the task.
+        "You are a coding agent operating in `{cwd}`. Work within this directory unless the user explicitly directs you otherwise. Use the installed coding and multi-agent namespaces when they help complete the task.{search}
 
 Subagent models: call `lam.agents.models()` to list allowed models grouped by provider (and the default). For `lam.agents.spawn` / `lam.agents.call`, pass `model` as `{{ provider, model }}` taken from that catalog when you need a non-default model. Do not pass the TUI selector string. Omit `model` to use {default}.",
         cwd = cwd.display(),
         default = default,
+        search = search,
     )
+}
+
+fn build_batteries_pack(agent_config: &AgentConfig) -> Result<Option<BatteriesPack>, RuntimeError> {
+    if agent_config.exa.is_none() && agent_config.parallel.is_none() {
+        return Ok(None);
+    }
+    let mut builder = BatteriesPack::builder();
+    if let Some(exa) = &agent_config.exa {
+        builder = builder.exa(exa.config.clone());
+    }
+    if let Some(parallel) = &agent_config.parallel {
+        builder = builder.parallel(parallel.config.clone());
+    }
+    let pack = builder
+        .build()
+        .map_err(|error| RuntimeError::BatteriesPack(error.to_string()))?;
+    if pack.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(pack))
+    }
+}
+
+fn collect_namespaces(coding: &CodingPack, batteries: Option<&BatteriesPack>) -> Vec<Namespace> {
+    let mut namespaces: Vec<Namespace> = coding.namespaces().collect();
+    if let Some(batteries) = batteries {
+        namespaces.extend(batteries.namespaces());
+    }
+    namespaces
 }
 
 /// One project-instruction file discovered between the git root and the
@@ -1663,6 +1719,10 @@ pub(crate) enum RuntimeError {
     Model(String),
     #[error("could not configure coding capabilities: {0}")]
     CodingPack(String),
+    #[error("agent configuration: {0}")]
+    AgentConfig(String),
+    #[error("batteries pack: {0}")]
+    BatteriesPack(String),
     #[error("could not start the agent runtime: {0}")]
     AgentSystem(String),
 }
@@ -2382,10 +2442,11 @@ mod tests {
             },
         ];
 
-        let instruction = coding_instruction(Path::new("/work/project"), &models, 0);
+        let instruction = coding_instruction(Path::new("/work/project"), &models, 0, true);
 
         assert!(instruction.contains("`lam.agents.models()`"));
         assert!(instruction.contains("`openai/gpt-5.6-luna`"));
+        assert!(instruction.contains("lam.exa"));
         assert!(!instruction.contains("Configured inference providers and models:"));
         assert!(!instruction.contains("accounts/fireworks/models/deepseek-v4-flash-0731"));
     }

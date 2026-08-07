@@ -14,6 +14,7 @@ base64.workspace = true
 crossterm = "=0.29.0"
 lam = { path = "../lam" }
 lam-agents = { path = "../lam-agents" }
+lam-batteries = { path = "../lam-batteries" }
 lam-code = { path = "../lam-code" }
 lam-openai = { path = "../lam-openai" }
 lam-redb = { path = "../lam-redb" }

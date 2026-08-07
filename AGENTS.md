@@ -42,6 +42,7 @@ ignored unless explicitly enabled.
 ## House rules
 
 - `.env` and `target/` are gitignored; never commit credentials or build
-  artifacts. TUI provider keys live in `~/.lam/providers.toml`.
+  artifacts. TUI inference providers live in `~/.lam/providers.toml`; agent
+  batteries (web search keys) live in `~/.lam/config.toml`.
 - Commit and push only when asked. Group related changes; write commit
   messages that name the crate or surface they touch.

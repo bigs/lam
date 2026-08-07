@@ -1,0 +1,21 @@
+[package]
+name = "lam-batteries"
+version.workspace = true
+edition.workspace = true
+description = "Optional network capability packs for lam (web search providers)"
+readme = "README.md"
+
+[dependencies]
+lam = { path = "../lam" }
+reqwest.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+
+[lints]
+workspace = true

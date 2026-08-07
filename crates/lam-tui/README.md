@@ -13,6 +13,29 @@ can also start without `~/.lam/providers.toml` when Codex login credentials are
 available. An explicit `--config` file stays authoritative and does not receive
 automatic providers.
 
+### Agent batteries (`~/.lam/config.toml`)
+
+Optional web search packs live in a separate file from inference providers.
+Copy [`config.example.toml`](config.example.toml) to `~/.lam/config.toml` and
+set API keys via environment variables:
+
+```toml
+[exa]
+enabled = true
+api_key_env = "EXA_API_KEY"
+# functions = ["search", "contents", "context", "answer", "findSimilar"]
+
+[parallel]
+enabled = true
+api_key_env = "PARALLEL_API_KEY"
+# functions = ["search", "extract"]
+```
+
+When a key is present, Lam installs the corresponding namespaces
+(`lam.exa.*`, `lam.parallel.*`) for the root agent and subagents. Missing keys
+soft-skip that provider with a startup warning. Function names and request
+shapes match each provider's public API; call `lam.dir()` for schemas.
+
 Provider names and model IDs form stable selector strings such as
 `openai/gpt-5`. Provider-native model paths may contain `/`; the provider name
 is simply prepended to form the selector. A ready-to-copy configuration for

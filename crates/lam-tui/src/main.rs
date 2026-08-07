@@ -1,5 +1,6 @@
 //! Interactive terminal application for the Lam coding-agent runtime.
 
+mod agent_config;
 mod app;
 mod boot;
 mod clipboard;

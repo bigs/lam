@@ -123,11 +123,12 @@ let output = isolate
 | [`lam-openai`](crates/lam-openai/README.md) | Lossless Responses and compatible Chat Completions adapters | Connecting OpenAI or a compatible inference provider |
 | [`lam-agents`](crates/lam-agents/README.md) | Bounded isolate scheduler, actor addressing, and `lam.agents` capabilities | Hosting roots and subagents together |
 | [`lam-code`](crates/lam-code/README.md) | Optional filesystem, editing, and command execution capabilities | Building a coding-agent application |
+| [`lam-batteries`](crates/lam-batteries/README.md) | Optional network packs (Exa / Parallel web search) | Adding provider-native web search to an agent |
 | [`lam-tui`](crates/lam-tui/README.md) | Ratatui executable, provider configuration, and interactive transcript | Running Lam as a coding agent |
 
 The dependency boundary is intentional: `lam` remains a straightforward
-single-actor library; provider, persistence, coding, and multi-agent features
-are optional crates layered around it.
+single-actor library; provider, persistence, coding, batteries, and multi-agent
+features are optional crates layered around it.
 
 ## Core contracts
 

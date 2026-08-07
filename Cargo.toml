@@ -2,6 +2,7 @@
 members = [
     "crates/lam",
     "crates/lam-agents",
+    "crates/lam-batteries",
     "crates/lam-code",
     "crates/lam-core",
     "crates/lam-deno",

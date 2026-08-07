@@ -1,0 +1,17 @@
+# Agent / batteries configuration for lam-agent.
+# Default path: ~/.lam/config.toml
+#
+# Inference providers remain in ~/.lam/providers.toml.
+# Missing keys soft-skip the corresponding search namespace.
+
+[exa]
+enabled = true
+api_key_env = "EXA_API_KEY"
+# api_key = "…"  # prefer api_key_env; do not set both
+# Optional allowlist (default: all of the following):
+# functions = ["search", "contents", "context", "answer", "findSimilar"]
+
+[parallel]
+enabled = true
+api_key_env = "PARALLEL_API_KEY"
+# functions = ["search", "extract"]
