@@ -1274,7 +1274,14 @@ fn agent_history(
         } else {
             "Ready".to_owned()
         },
-        run_completed: !active,
+        // Subagents restored from the durable journal are never considered
+        // actively running: their runner is not live after a cold boot, and
+        // an aborted/cancelled run may have left a dangling active_run in the
+        // journal without a terminal Interrupted entry. Showing them as
+        // running would make a cancelled subagent appear busy after a
+        // session reload, and any subsequent cancel would be rejected
+        // because the manager already considers it cancelled.
+        run_completed: if restored_child { true } else { !active },
         context_tokens,
         history,
     }

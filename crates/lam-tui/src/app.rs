@@ -1622,9 +1622,24 @@ impl App {
         self.ensure_agent(address, parent_address(address), "Working…");
         let owner = address.to_owned();
         let context_tokens = outcome.context_tokens;
+        let should_update_run_active = address == "/root"
+            || outcome.active_run.is_none()
+            || outcome.interrupted
+            || outcome
+                .rows
+                .iter()
+                .any(|row| row.run_id.as_deref() == outcome.active_run.as_deref());
         let run_active = outcome.active_run.is_some();
         self.with_agent(address, move |app| {
-            app.set_current_run_active(run_active);
+            if should_update_run_active || address == "/root" {
+                app.set_current_run_active(run_active);
+            }
+            // For a child, an empty fold that still reports a dangling
+            // active_run (no Interrupted boundary and no new rows for
+            // that run) preserves the existing running flag instead of
+            // resurrecting it. The live Retired event already cleared
+            // it; without this guard a later periodic fold would flip
+            // it back on.
             // A fold with no new model response reports `None`; keep the
             // last known provider usage (e.g. the value seeded from the
             // journal at startup) rather than clearing it.
