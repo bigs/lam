@@ -11,7 +11,7 @@ use crate::path::{CodingWorkspace, PathFailure};
 #[derive(Clone, Debug, JsonSchema, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ReadRequest {
-    /// Relative workspace path or an allowed absolute path.
+    /// Path relative to the configured working directory, or an absolute path.
     pub path: String,
     /// One-indexed source line at which to begin; defaults to one.
     #[serde(default)]
@@ -43,7 +43,7 @@ pub(crate) struct ReadOutput {
 #[derive(Clone, Debug, Default, JsonSchema, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ListRequest {
-    /// Directory to list; defaults to the primary workspace root.
+    /// Directory to list; defaults to the configured working-directory base.
     #[serde(default)]
     pub path: Option<String>,
     /// Return entries lexically after this previously returned name.
@@ -328,7 +328,6 @@ fn trim_line_ending(line: &mut String) {
 fn fs_path_error(error: PathFailure) -> FsError {
     match error {
         PathFailure::Invalid { path, message } => FsError::InvalidPath { path, message },
-        PathFailure::OutsideRoots { path } => FsError::OutsideRoots { path },
         PathFailure::Unavailable { path, message } => FsError::Unavailable { path, message },
     }
 }

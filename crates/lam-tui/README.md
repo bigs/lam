@@ -304,6 +304,6 @@ cargo run -p lam-tui --bin lam-agent
 ```
 
 The root and every subagent receive read/write filesystem, editing, and local
-shell namespaces scoped to that directory. These are application-level path
-guardrails, not an OS sandbox; see `lam-code`'s safety notes before using the
-TUI with untrusted instructions.
+shell namespaces based in that directory. Their paths are not confined to it,
+and the local shell inherits the Lam process's host authority. See `lam-code`'s
+safety notes before using the TUI with untrusted instructions.

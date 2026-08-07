@@ -156,7 +156,7 @@ impl fmt::Debug for CodingPack {
 }
 
 impl CodingPack {
-    /// Starts a pack configured around one primary workspace root.
+    /// Starts a pack using one directory as the base for relative paths.
     #[must_use]
     pub fn builder(root: impl Into<PathBuf>) -> CodingPackBuilder {
         CodingPackBuilder {

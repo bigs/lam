@@ -13,12 +13,6 @@ pub(crate) enum FsError {
         /// Validation diagnostic.
         message: String,
     },
-    /// A path resolved outside configured readable roots.
-    #[error("path `{path}` is outside configured readable roots")]
-    OutsideRoots {
-        /// Rejected path.
-        path: String,
-    },
     /// A path could not be resolved or read.
     #[error("path `{path}` is unavailable: {message}")]
     Unavailable {
@@ -81,7 +75,7 @@ pub(crate) enum EditError {
         /// Parse diagnostic.
         message: String,
     },
-    /// A mutation path was invalid or outside the writable root.
+    /// A mutation path was invalid.
     #[error("invalid mutation path `{path}`: {message}")]
     InvalidPath {
         /// Rejected path.
@@ -124,7 +118,7 @@ pub(crate) enum ShellError {
     /// A shell command was empty.
     #[error("command must not be empty")]
     InvalidCommand,
-    /// A requested working directory was invalid or outside readable roots.
+    /// A requested working directory was invalid.
     #[error("invalid command working directory `{path}`: {message}")]
     InvalidCwd {
         /// Rejected working directory.

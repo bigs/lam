@@ -76,28 +76,16 @@ impl CodingWorkspace {
 
     pub(crate) async fn resolve_read(&self, raw: &str) -> Result<PathBuf, PathFailure> {
         let candidate = self.candidate(raw)?;
-        let resolved = tokio::fs::canonicalize(&candidate).await.map_err(|error| {
-            PathFailure::Unavailable {
+        tokio::fs::canonicalize(&candidate)
+            .await
+            .map_err(|error| PathFailure::Unavailable {
                 path: raw.to_owned(),
                 message: error.to_string(),
-            }
-        })?;
-        if self.is_readable(&resolved) {
-            Ok(resolved)
-        } else {
-            Err(PathFailure::OutsideRoots {
-                path: raw.to_owned(),
             })
-        }
     }
 
     pub(crate) async fn resolve_write(&self, raw: &str) -> Result<PathBuf, PathFailure> {
         let candidate = self.candidate(raw)?;
-        if !candidate.starts_with(&self.inner.root) || candidate == self.inner.root {
-            return Err(PathFailure::OutsideRoots {
-                path: raw.to_owned(),
-            });
-        }
         let mut existing = candidate.as_path();
         let existing_metadata = loop {
             match tokio::fs::symlink_metadata(existing).await {
@@ -130,11 +118,6 @@ impl CodingWorkspace {
                     path: raw.to_owned(),
                     message: error.to_string(),
                 })?;
-        if !resolved_ancestor.starts_with(&self.inner.root) {
-            return Err(PathFailure::OutsideRoots {
-                path: raw.to_owned(),
-            });
-        }
         if existing == candidate {
             Ok(resolved_ancestor)
         } else {
@@ -176,19 +159,14 @@ impl CodingWorkspace {
         };
         lexical_normalize(&joined).ok_or_else(|| PathFailure::Invalid {
             path: raw.to_owned(),
-            message: "path escapes the filesystem root".to_owned(),
+            message: "path could not be normalized".to_owned(),
         })
-    }
-
-    fn is_readable(&self, path: &Path) -> bool {
-        path.starts_with(&self.inner.root) || path.starts_with(&self.inner.scratch_root)
     }
 }
 
 #[derive(Debug)]
 pub(crate) enum PathFailure {
     Invalid { path: String, message: String },
-    OutsideRoots { path: String },
     Unavailable { path: String, message: String },
 }
 

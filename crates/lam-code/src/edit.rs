@@ -84,7 +84,7 @@ pub(crate) struct ApplyPatchOutput {
 /// Input accepted by `lam.edit.write`.
 #[derive(Clone, Debug, JsonSchema, Deserialize)]
 pub(crate) struct WriteRequest {
-    /// Relative workspace path or an allowed absolute path.
+    /// Path relative to the configured working directory, or an absolute path.
     pub path: String,
     /// Complete UTF-8 file contents as a string, or as an array of lines.
     /// Prefer the line-array form when contents contain backtick characters.
@@ -169,10 +169,6 @@ pub(crate) fn edit_path_error(error: PathFailure) -> EditError {
         PathFailure::Invalid { path, message } | PathFailure::Unavailable { path, message } => {
             EditError::InvalidPath { path, message }
         }
-        PathFailure::OutsideRoots { path } => EditError::InvalidPath {
-            path,
-            message: "path is outside the writable workspace root".to_owned(),
-        },
     }
 }
 

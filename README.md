@@ -84,7 +84,7 @@ let coding = CodingPack::builder(".")
 let mut actor = Lam::builder(model)
     .namespaces(&coding)
     .context_window_tokens(128_000)
-    .annotate_system_prompt("Work only inside the configured project root.")
+    .annotate_system_prompt("Use the configured project directory as your working base.")
     .build()
     .actor("main")
     .build()
@@ -209,10 +209,11 @@ leaves the addressed root available for later input.
 lam's default is absence of authority. Capabilities are installed explicitly on
 builders and can be omitted or replaced by application-specific namespaces.
 
-`lam-code` applies path validation, limits, and process cleanup, but these are
-API guardrails—not an operating-system sandbox. Its supplied local command
-runner inherits the embedding process's host authority. A production embedding
-should run lam inside an appropriate OS/container sandbox or inject a sandboxed
+`lam-code` applies validation, limits, and process cleanup, but these are API
+guardrails—not an operating-system sandbox. Filesystem and editing paths are
+not confined to the configured directory, and the supplied local command runner
+inherits the embedding process's host authority. A production embedding should
+run lam inside an appropriate OS/container sandbox or inject a sandboxed
 `CommandRunner` when executing untrusted programs.
 
 Eval timeout does not roll back host effects which completed before

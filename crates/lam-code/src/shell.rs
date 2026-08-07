@@ -22,7 +22,7 @@ use crate::path::{CodingWorkspace, PathFailure};
 pub(crate) struct ShellRequest {
     /// Shell program text, including pipes and redirections.
     pub command: String,
-    /// Optional relative workspace or allowed absolute working directory.
+    /// Optional working directory, relative to the configured base or absolute.
     #[serde(default)]
     pub cwd: Option<String>,
     /// Optional positive execution timeout in milliseconds.
@@ -439,10 +439,6 @@ fn shell_path_error(error: PathFailure) -> ShellError {
         PathFailure::Invalid { path, message } | PathFailure::Unavailable { path, message } => {
             ShellError::InvalidCwd { path, message }
         }
-        PathFailure::OutsideRoots { path } => ShellError::InvalidCwd {
-            path,
-            message: "path is outside configured readable roots".to_owned(),
-        },
     }
 }
 

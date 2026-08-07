@@ -471,32 +471,46 @@ async fn shell_timeout_kills_background_descendants() {
     assert!(!marker.exists(), "background descendant survived timeout");
 }
 
-#[cfg(unix)]
 #[tokio::test(flavor = "current_thread")]
-async fn filesystem_paths_reject_symlink_escapes() {
-    use std::os::unix::fs::symlink;
-
-    let root = tempfile::tempdir().expect("temporary workspace");
-    let outside = tempfile::tempdir().expect("outside directory");
-    let escaped = outside.path().join("escaped.txt");
-    symlink(&escaped, root.path().join("link.txt")).expect("create broken symlink");
-    let secret = outside.path().join("secret.txt");
-    std::fs::write(&secret, "secret").expect("write outside fixture");
-    symlink(&secret, root.path().join("secret-link.txt")).expect("create outside symlink");
-    let pack = CodingPack::builder(root.path())
-        .build()
-        .expect("coding pack");
+async fn filesystem_and_edit_paths_are_not_confined_to_the_configured_directory() {
+    let host = tempfile::tempdir().expect("temporary host directory");
+    let root = host.path().join("workspace");
+    let outside = host.path().join("outside");
+    std::fs::create_dir(&root).expect("create workspace");
+    std::fs::create_dir(&outside).expect("create outside directory");
+    std::fs::write(outside.join("secret.txt"), "secret\n").expect("write outside fixture");
+    let pack = CodingPack::builder(&root).build().expect("coding pack");
     let mut isolate = isolate(&pack).await;
 
-    let failure = isolate
-        .eval("lam.edit.write({ path: 'link.txt', content: 'escaped' })")
+    let read = isolate
+        .eval("await lam.fs.read({ path: '../outside/secret.txt' })")
         .await
-        .expect_err("broken symbolic link must be rejected");
-    assert!(matches!(failure, EvalError::BuiltinFailure { .. }));
-    assert!(!escaped.exists());
-    let failure = isolate
-        .eval("lam.fs.read({ path: 'secret-link.txt' })")
+        .expect("read outside configured directory");
+    assert_eq!(json_result(read.result)["content"], "1\tsecret");
+
+    isolate
+        .eval("await lam.edit.write({ path: '../outside/written.txt', content: 'written\\n' })")
         .await
-        .expect_err("reads through outside symbolic links must be rejected");
-    assert!(matches!(failure, EvalError::BuiltinFailure { .. }));
+        .expect("write outside configured directory");
+    assert_eq!(
+        std::fs::read_to_string(outside.join("written.txt")).expect("read written file"),
+        "written\n"
+    );
+
+    let patch = r"*** Begin Patch
+*** Add File: ../outside/patched.txt
++patched
+*** End Patch";
+    let source = format!(
+        "await lam.edit.apply({{ patch: {} }})",
+        serde_json::to_string(patch).expect("serialize patch")
+    );
+    isolate
+        .eval(&source)
+        .await
+        .expect("patch outside configured directory");
+    assert_eq!(
+        std::fs::read_to_string(outside.join("patched.txt")).expect("read patched file"),
+        "patched\n"
+    );
 }

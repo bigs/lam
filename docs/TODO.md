@@ -20,6 +20,9 @@
   - Resolve cancellation races at the journal append boundary and document that external tool side effects are not rolled back.
   - After committing their interruption records, descendants retire and release residency. Their durable journals remain browseable in `/agents`, their addresses remain non-reusable, and `/root` alone remains resident for later conversation.
   - Interruption permanently closes the active run. A later user message starts a new run from the retained context and interruption notice; cancelled provider requests, evals, and tool loops are never restarted automatically.
+- [ ] Refresh an already-open agents drawer when an agent is interrupted or retired.
+  - Observed after a timed-out parent eval cancelled a child: `lam.agents.list` correctly reported that the child was no longer resident, but the open drawer retained its pre-interruption status.
+  - Preserve the retired agent as browseable durable history, but clear its running/resident presentation immediately. Determine whether the drawer missed a lifecycle event, failed to fold it, or simply did not redraw, and add a regression test for interruption while the drawer is open.
 - [x] Interpolate project instructions (AGENTS.md preferred, CLAUDE.md fallback) into the root system prompt at boot.
   - Codex discovery semantics: walk from cwd up to the nearest `.git` marker; when none exists, only cwd is considered.
   - Collect every AGENTS.md/CLAUDE.md from the project root down to cwd, inclusive, ordered root-first (deeper files take precedence on conflicts).
@@ -35,6 +38,12 @@
 - [ ] Consider a substring/regex replace capability in `lam.edit` for edits that line-oriented patching handles poorly.
   - `lam.edit.apply` matches whole lines only (now documented); a single-line blob such as a long embedded help string cannot be patched by targeting an inner substring and forced a shell-out to `perl`.
   - Documented the whole-line rule in the `apply` description; a targeted string replace remains a possible additive capability.
+- [ ] Add opt-in filesystem/edit sandboxing; keep it disabled by default.
+  - Expose an explicit builder/config flag rather than treating the configured working directory as an implicit security boundary.
+  - When enabled, reuse the project-instruction discovery semantics: walk upward from the configured working directory to the nearest ancestor with a `.git` directory or file, falling back to the working directory when no marker exists.
+  - Confine canonical read/list/write/patch paths to that discovered root, including symlink-safe writes, while keeping the original working directory as the base for relative paths.
+- [ ] Add a real opt-in sandbox for local shell commands.
+  - Working-directory validation alone cannot constrain absolute paths, parent traversal, symlinks, redirections, subprocesses, or inherited process authority. Use an OS/container boundary or a `CommandRunner` with equivalent controls.
 - [x] Clarify the eval tool description so the model passes structured values to `lam.result` directly instead of pre-stringifying.
   - Root cause: the double JSON encoding was model behavior, not a harness defect. The provider APIs force exactly one stringification at the wire (`function_call_output.output` is a string); the second appeared only when the model called `JSON.stringify` before `lam.result`.
   - Added `Pass structured values directly to lam.result without JSON.stringify; the runtime handles encoding` to `EVAL_TOOL_DESCRIPTION`.

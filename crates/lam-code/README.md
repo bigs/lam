@@ -52,8 +52,9 @@ later starting line rather than pulling a large file into model context at
 once. `lam.fs.list` uses lexical cursors and returns direct children in stable
 order.
 
-Paths are resolved beneath the configured project root. Symlink traversal and
-path normalization are checked to prevent API-level escape from that root.
+Relative paths use the configured directory as their base. Parent-relative and
+absolute paths are accepted, so `lam.fs` and `lam.edit` have the embedding
+process's filesystem authority; they are not confined to that directory.
 `ReadConfig` and `ListConfig` configure the associated limits.
 
 ## Editing
@@ -105,9 +106,10 @@ runner using exactly the same interface.
 
 ## Security boundary
 
-The path rules, timeouts, limits, and process cleanup are useful guardrails,
-not an operating-system sandbox. `LocalCommandRunner` inherits the authority of
-the lam process. A model which can run arbitrary shell commands can generally
+The validation, timeouts, limits, and process cleanup are useful guardrails,
+not an operating-system sandbox. Filesystem and editing paths are deliberately
+not confined to the configured directory. `LocalCommandRunner` also inherits
+the authority of the lam process. A model with these capabilities can generally
 reach anything that process can reach.
 
 For untrusted workloads, combine lam with an established OS/container sandbox

@@ -1680,10 +1680,11 @@ deliberately small:
 
 `CodingPack` owns filesystem access, read/list/output limits, scratch storage,
 and the optional runner. Filesystem access can be disabled, read-only, or
-read-write; shell is absent unless explicitly supplied. These are API-level
-guardrails, not process containment: the local runner has the host process's
-authority. Established external sandboxes can implement the same runner
-boundary later.
+read-write; shell is absent unless explicitly supplied. The configured
+directory is a relative-path base, not a confinement boundary. These are
+API-level guardrails, not process containment: filesystem/edit operations and
+the local runner have the host process's authority. Established external
+sandboxes can implement the same runner boundary later.
 
 Interactive approval is deferred until the TUI supplies a real consumer and
 the builtin operation context carries actor/run identity. Shell execution and
@@ -1691,7 +1692,7 @@ parsed file mutations remain centralized interception points for that work.
 
 End-to-end isolate tests cover namespace gating, manifest-generated calls,
 numbered pagination, lexical directory cursors, multi-file patch actions and
-prevalidation, complete writes, symlink escape rejection, nonzero exits,
+prevalidation, complete writes, unconfined parent-relative paths, nonzero exits,
 independent output capture and spill reads, process-tree timeout, and
 cancellation cleanup. All provider and actor crates remain unaware of the
 optional pack.
