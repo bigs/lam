@@ -1,6 +1,9 @@
 use std::time::Duration;
 
-use lam::{CodecId, CodecRef, EncodedPayload, EvalRequest, ModelDirective, OutputContract};
+use lam::{
+    CodecId, CodecRef, EncodedPayload, EvalRequest, ModelDirective, OutputContract,
+    ServiceUnavailableRetry,
+};
 use std::sync::Arc;
 
 use reqwest::header::{HeaderMap, HeaderValue};
@@ -65,6 +68,7 @@ pub(crate) struct SharedBuilder {
     pricing: Option<ModelPricing>,
     client: Option<reqwest::Client>,
     stream_idle_timeout: Duration,
+    service_unavailable_retry: ServiceUnavailableRetry,
 }
 
 pub(crate) struct BuiltConfig {
@@ -87,6 +91,7 @@ impl SharedBuilder {
             pricing: None,
             client: None,
             stream_idle_timeout: DEFAULT_STREAM_IDLE_TIMEOUT,
+            service_unavailable_retry: ServiceUnavailableRetry::default(),
         }
     }
 
@@ -138,6 +143,11 @@ impl SharedBuilder {
         self
     }
 
+    pub(crate) fn service_unavailable_retry(mut self, policy: ServiceUnavailableRetry) -> Self {
+        self.service_unavailable_retry = policy;
+        self
+    }
+
     pub(crate) fn build(
         self,
         path: &'static str,
@@ -166,8 +176,13 @@ impl SharedBuilder {
         };
         let authorization = resolve_authorization(self.auth, self.api_key)?;
         let endpoint = endpoint(&self.base_url, path)?;
-        let mut transport =
-            HttpTransport::new(client, endpoint, authorization, self.stream_idle_timeout);
+        let mut transport = HttpTransport::new(
+            client,
+            endpoint,
+            authorization,
+            self.stream_idle_timeout,
+            self.service_unavailable_retry,
+        );
         if !self.default_headers.is_empty() {
             transport = transport.with_default_headers(self.default_headers);
         }

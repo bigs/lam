@@ -198,6 +198,65 @@ pub enum ModelCostSource {
     Estimated,
 }
 
+/// Automatic retries when a model endpoint reports temporary overload.
+///
+/// Providers apply this policy to HTTP 503 (and equivalent transport signals)
+/// before any response body is consumed, so intermediate failures never reach
+/// model-visible context. After retries are exhausted the host still receives
+/// a provider error; that failure is not injected into the model transcript.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ServiceUnavailableRetry {
+    /// How many times to re-send after the first overload response.
+    ///
+    /// Total attempts are `1 + max_retries`. Zero disables automatic retry.
+    pub max_retries: u32,
+    /// Delay before the first retry. Subsequent delays double until
+    /// [`Self::max_backoff`].
+    pub initial_backoff: Duration,
+    /// Upper bound on a single retry delay.
+    pub max_backoff: Duration,
+}
+
+impl Default for ServiceUnavailableRetry {
+    fn default() -> Self {
+        Self {
+            max_retries: 12,
+            initial_backoff: Duration::from_millis(250),
+            // 250ms * 2^11 = 512s, so all twelve retries stay on the exponential curve.
+            max_backoff: Duration::from_secs(512),
+        }
+    }
+}
+
+impl ServiceUnavailableRetry {
+    /// Builds a policy with the given retry budget and default backoff curve.
+    #[must_use]
+    pub fn new(max_retries: u32) -> Self {
+        Self {
+            max_retries,
+            ..Self::default()
+        }
+    }
+
+    /// Replaces the initial and maximum backoff delays.
+    #[must_use]
+    pub const fn with_backoff(mut self, initial: Duration, max: Duration) -> Self {
+        self.initial_backoff = initial;
+        self.max_backoff = max;
+        self
+    }
+
+    /// Delay before the `attempt`-th retry (`0` = first retry after the first 503).
+    #[must_use]
+    pub fn backoff(&self, attempt: u32) -> Duration {
+        let shift = attempt.min(16);
+        let factor = 1_u32.checked_shl(shift).unwrap_or(u32::MAX);
+        self.initial_backoff
+            .saturating_mul(factor)
+            .min(self.max_backoff)
+    }
+}
+
 /// Non-blocking destination for ephemeral model deltas.
 #[derive(Clone)]
 pub struct ModelEventSink {
@@ -277,5 +336,36 @@ pub trait ModelCodec: Send + Sync + 'static {
     /// Reports whether an exact materialized replacement can be replayed.
     fn accepts_compaction_replacement(&self, _replacement: &EncodedPayload) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ServiceUnavailableRetry;
+    use std::time::Duration;
+
+    #[test]
+    fn service_unavailable_retry_defaults_and_backoff() {
+        let policy = ServiceUnavailableRetry::default();
+        assert_eq!(policy.max_retries, 12);
+        assert_eq!(policy.initial_backoff, Duration::from_millis(250));
+        assert_eq!(policy.max_backoff, Duration::from_secs(512));
+        assert_eq!(policy.backoff(0), Duration::from_millis(250));
+        assert_eq!(policy.backoff(1), Duration::from_millis(500));
+        assert_eq!(policy.backoff(2), Duration::from_secs(1));
+        assert_eq!(policy.backoff(5), Duration::from_secs(8));
+        assert_eq!(policy.backoff(9), Duration::from_secs(128));
+        assert_eq!(policy.backoff(11), Duration::from_secs(512));
+        assert_eq!(policy.backoff(u32::MAX), Duration::from_secs(512));
+    }
+
+    #[test]
+    fn service_unavailable_retry_builder_overrides() {
+        let policy = ServiceUnavailableRetry::new(3)
+            .with_backoff(Duration::from_millis(10), Duration::from_millis(40));
+        assert_eq!(policy.max_retries, 3);
+        assert_eq!(policy.backoff(0), Duration::from_millis(10));
+        assert_eq!(policy.backoff(1), Duration::from_millis(20));
+        assert_eq!(policy.backoff(3), Duration::from_millis(40));
     }
 }
