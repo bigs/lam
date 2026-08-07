@@ -20,7 +20,7 @@
   - Resolve cancellation races at the journal append boundary and document that external tool side effects are not rolled back.
   - After committing their interruption records, descendants retire and release residency. Their durable journals remain browseable in `/agents`, their addresses remain non-reusable, and `/root` alone remains resident for later conversation.
   - Interruption permanently closes the active run. A later user message starts a new run from the retained context and interruption notice; cancelled provider requests, evals, and tool loops are never restarted automatically.
-- [ ] Refresh an already-open agents drawer when an agent is interrupted or retired.
+- [x] Refresh an already-open agents drawer when an agent is interrupted or retired.
   - Observed after a timed-out parent eval cancelled a child: `lam.agents.list` correctly reported that the child was no longer resident, but the open drawer retained its pre-interruption status.
   - Preserve the retired agent as browseable durable history, but clear its running/resident presentation immediately. Determine whether the drawer missed a lifecycle event, failed to fold it, or simply did not redraw, and add a regression test for interruption while the drawer is open.
 - [x] Interpolate project instructions (AGENTS.md preferred, CLAUDE.md fallback) into the root system prompt at boot.
@@ -35,9 +35,9 @@
   - Symptom: panics at tokio runtime/blocking/shutdown.rs with "Cannot drop a runtime in a context where blocking is not allowed" whenever quitting with Ctrl+C.
   - Root cause: the TUI Runtime owns a multi-thread tokio Runtime (command_runtime, added for non-blocking commands); dropping a tokio Runtime performs a blocking shutdown, which is illegal inside the current-thread async context of tokio_main.
   - Fix: Runtime::quiesce() drains in-flight command tasks (bounded by COMMAND_DRAIN_TIMEOUT) and drops the multi-thread runtime on a plain thread where blocking is allowed; called on the quit and session-switch paths. Session switch covered by tests.
-- [ ] Consider a substring/regex replace capability in `lam.edit` for edits that line-oriented patching handles poorly.
-  - `lam.edit.apply` matches whole lines only (now documented); a single-line blob such as a long embedded help string cannot be patched by targeting an inner substring and forced a shell-out to `perl`.
-  - Documented the whole-line rule in the `apply` description; a targeted string replace remains a possible additive capability.
+- [x] Consider a substring/regex replace capability in `lam.edit` for edits that line-oriented patching handles poorly.
+  - Deferred: `lam.edit.apply` deliberately matches whole lines, while string-array patch/content inputs mitigate the recurring backtick and template-literal failures.
+  - Replacing a complete line, rewriting the file, or using `lam.shell` adequately covers the remaining rare cases. Revisit if substring replacement becomes a recurring need.
 - [ ] Add opt-in filesystem/edit sandboxing; keep it disabled by default.
   - Expose an explicit builder/config flag rather than treating the configured working directory as an implicit security boundary.
   - When enabled, reuse the project-instruction discovery semantics: walk upward from the configured working directory to the nearest ancestor with a `.git` directory or file, falling back to the working directory when no marker exists.
