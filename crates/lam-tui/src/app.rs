@@ -1143,6 +1143,10 @@ impl App {
                 message_id: None,
                 text: input.clone(),
             });
+            // Sending re-attaches the viewport to the tail so the submitted
+            // message and its run output stay visible even from a scrolled-up
+            // position.
+            self.follow_conversation_tail = true;
             return Some(Command::Message(input));
         }
         if self.busy {
@@ -1942,7 +1946,10 @@ impl App {
         {
             self.selected_entry = Some(selected + 1);
         }
-        if self.focus == Focus::Input || self.follow_conversation_tail {
+        // Only an attached viewport tracks the newest row. While the input is
+        // focused on a scrolled-up (detached) viewport, new content must not
+        // drag the selection away from what the user is reading.
+        if self.follow_conversation_tail {
             self.selected_entry = self.entries.len().checked_sub(1);
         }
     }
@@ -2088,7 +2095,7 @@ impl App {
         let mut entry = pinned_entry(kind, title.into(), body.into());
         entry.expanded = expanded;
         self.entries.push(entry);
-        if self.focus == Focus::Input || self.follow_conversation_tail {
+        if self.follow_conversation_tail {
             self.selected_entry = self.entries.len().checked_sub(1);
         }
     }
@@ -2108,7 +2115,9 @@ impl App {
     }
 
     fn scroll_conversation(&mut self, direction: isize) {
-        self.focus = Focus::Conversation;
+        // Scrolling must never steal focus from the input: with the input
+        // focused the wheel only moves the viewport, and the selection
+        // changes only on an explicit click in the pane or on Tab.
         self.selection_drives_viewport = false;
         let viewport = self.conversation_viewport_height.max(1);
         let maximum = self.conversation_total_lines.saturating_sub(viewport);
@@ -2119,8 +2128,18 @@ impl App {
                 .saturating_add(MOUSE_SCROLL_LINES)
                 .min(maximum)
         };
-        self.follow_conversation_tail = direction > 0 && self.conversation_offset == maximum;
-        self.keep_selection_in_view(direction, viewport);
+        if direction < 0 {
+            // A wheel-up on a conversation that already fits the viewport is a
+            // no-op: it must not silently stop following streamed output.
+            if maximum > 0 {
+                self.follow_conversation_tail = false;
+            }
+        } else {
+            self.follow_conversation_tail = self.conversation_offset == maximum;
+        }
+        if self.focus == Focus::Conversation {
+            self.keep_selection_in_view(direction, viewport);
+        }
     }
 
     fn keep_selection_in_view(&mut self, direction: isize, viewport: usize) {
@@ -4946,6 +4965,103 @@ mod tests {
 
         assert_eq!(app.selected_entry, Some(0));
         assert!(app.selection_drives_viewport);
+    }
+
+    #[test]
+    fn mouse_scroll_while_typing_scrolls_without_stealing_focus_or_selection() {
+        let mut app = app();
+        app.push_entry(EntryKind::System, "Older", "first");
+        app.push_entry(EntryKind::System, "Middle", "second");
+        app.push_entry(EntryKind::System, "Latest", "third");
+        app.focus = Focus::Input;
+        app.selected_entry = Some(0);
+        app.conversation_ranges = vec![(0, 9), (10, 19), (20, 29)];
+        app.conversation_viewport_height = 10;
+        app.conversation_total_lines = 30;
+        app.conversation_offset = 20;
+        app.follow_conversation_tail = true;
+        let wheel_up = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        let wheel_down = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        app.handle_mouse(wheel_up);
+
+        assert_eq!(app.focus, Focus::Input, "scrolling must not steal focus");
+        assert_eq!(
+            app.selected_entry,
+            Some(0),
+            "scrolling must not move the selection"
+        );
+        assert_eq!(app.conversation_offset, 18);
+        assert!(!app.follow_conversation_tail);
+        assert!(!app.selection_drives_viewport);
+
+        app.handle_mouse(wheel_down);
+
+        assert_eq!(app.conversation_offset, 20);
+        assert!(
+            app.follow_conversation_tail,
+            "reaching the bottom re-attaches"
+        );
+        assert_eq!(app.focus, Focus::Input);
+        assert_eq!(app.selected_entry, Some(0));
+    }
+
+    #[test]
+    fn sending_a_message_reattaches_a_detached_viewport() {
+        let mut app = app();
+        app.push_entry(EntryKind::System, "Entry", "body");
+        app.conversation_ranges = vec![(0, 9)];
+        app.conversation_viewport_height = 10;
+        app.conversation_total_lines = 30;
+        app.conversation_offset = 15;
+        app.follow_conversation_tail = false;
+        app.input.text = "one more".to_owned();
+        app.input.cursor = app.input.char_count();
+
+        let command = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(matches!(command, Some(Command::Message(input)) if input == "one more"));
+        assert!(
+            app.follow_conversation_tail,
+            "sending re-attaches the viewport to the tail"
+        );
+    }
+
+    #[test]
+    fn wheel_up_on_a_fitting_conversation_does_not_detach() {
+        let mut app = app();
+        app.push_entry(EntryKind::System, "Entry", "body");
+        app.conversation_ranges = vec![(0, 9)];
+        app.conversation_viewport_height = 10;
+        app.conversation_total_lines = 10; // maximum == 0: everything fits
+        app.conversation_offset = 0;
+        app.follow_conversation_tail = true;
+        app.focus = Focus::Input;
+        let wheel_up = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        app.handle_mouse(wheel_up);
+
+        assert!(
+            app.follow_conversation_tail,
+            "a no-op wheel-up must not silently stop following the tail"
+        );
+        assert_eq!(app.conversation_offset, 0);
+        assert_eq!(app.focus, Focus::Input);
     }
 
     #[test]

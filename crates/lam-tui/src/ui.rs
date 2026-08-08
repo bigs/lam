@@ -190,7 +190,10 @@ fn render_conversation(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     });
     let offset = viewport_offset(
         app.conversation_offset,
-        app.focus == Focus::Input || app.follow_conversation_tail,
+        // Only an explicit detach (wheel up) or re-attach (send, Tab, wheel
+        // to the bottom) decides tail-following. Focusing the input alone
+        // must not snap a scrolled-up viewport back to the tail.
+        app.follow_conversation_tail,
         selected_start.flatten(),
         total,
         viewport,
@@ -2571,5 +2574,13 @@ mod tests {
         assert!(middle.contains("row-41"));
         assert!(!middle.contains("row-79"));
         assert!(!middle.contains("row-2 "));
+
+        // The detached position survives while the input is focused: focusing
+        // the input alone must not snap a scrolled-up viewport to the tail.
+        app.focus = Focus::Input;
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let typing = buffer_text(&terminal);
+        assert!(typing.contains("row-41"));
+        assert!(!typing.contains("row-79"));
     }
 }
