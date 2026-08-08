@@ -67,6 +67,9 @@
   - Mechanism: on the first admitted user message of a session (the TUI sees the admission receipt and its projector knows the message count), write the preview to the catalog via SessionCatalog::store_preview, applying the same 300-char cap as first_user_message.
   - Only write when the record has no preview yet; failure is best-effort (warn; the boot-time backfill remains the catch-all).
   - Derive "first" from the projector state (first user-sourced message) rather than a separate journal scan.
+- [ ] Mouse scrolling while the input is focused must not steal focus or move the conversation selection.
+  - Observed: App::scroll_conversation (crates/lam-tui/src/app.rs) unconditionally sets focus = Focus::Conversation, and keep_selection_in_view can move the selected entry, so a scroll wheel over the conversation pane while typing disables the input.
+  - Desired: with Focus::Input, ScrollUp/ScrollDown only move the conversation viewport and leave the input selected; the conversation selection changes only on an explicit click in the pane or on Tab.
 
 ## Tooling / eval harness
 
