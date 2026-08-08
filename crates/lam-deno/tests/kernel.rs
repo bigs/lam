@@ -449,11 +449,64 @@ async fn multiple_isolates_share_one_thread_without_sharing_state() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn timeout_discards_and_replaces_the_isolate() {
+async fn default_eval_has_no_wall_deadline() {
+    let pending_namespace = Namespace::new("lam.wait", "No wall deadline probe.").function(
+        "briefly",
+        "Resolves after the configured execution limit would have elapsed.",
+        |_context, (): ()| async move {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            Ok::<_, Never>(())
+        },
+    );
+    let mut isolate = Isolate::builder()
+        .namespace(pending_namespace)
+        .execution_timeout(Duration::from_millis(20))
+        .build()
+        .await
+        .expect("test isolate should initialize");
+
+    let started_at = Instant::now();
+    isolate
+        .eval("await lam.wait.briefly(); lam.result(1)")
+        .await
+        .expect("pending builtin waits must not consume the execution limit");
+    assert!(
+        started_at.elapsed() >= Duration::from_millis(80),
+        "the builtin should have waited past the execution limit"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn pending_builtin_can_outlive_execution_limit_and_succeed() {
+    let pending_namespace = Namespace::new("lam.wait", "Execution limit probe.").function(
+        "later",
+        "Stays pending longer than the continuous execution limit.",
+        |_context, (): ()| async move {
+            tokio::time::sleep(Duration::from_millis(75)).await;
+            Ok::<_, Never>("ok")
+        },
+    );
+    let mut isolate = Isolate::builder()
+        .namespace(pending_namespace)
+        .execution_timeout(Duration::from_millis(15))
+        .build()
+        .await
+        .expect("test isolate should initialize");
+    let generation = isolate.generation();
+
+    let output = isolate
+        .eval("lam.result(await lam.wait.later())")
+        .await
+        .expect("async Pending must not trip the execution watchdog");
+    assert_eq!(json_result(output.result), json!("ok"));
+    assert_eq!(isolate.generation(), generation);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn synchronous_infinite_javascript_hits_execution_timeout() {
     let mut isolate = Isolate::builder()
         .namespace(math_namespace())
-        .default_timeout(Duration::from_millis(200))
-        .max_timeout(Duration::from_millis(200))
+        .execution_timeout(Duration::from_millis(20))
         .build()
         .await
         .expect("test isolate should initialize");
@@ -470,15 +523,12 @@ async fn timeout_discards_and_replaces_the_isolate() {
     let previous_generation = isolate.generation();
 
     let error = isolate
-        .eval_with(
-            "while (true) {}",
-            EvalOptions::default().timeout(Duration::from_millis(20)),
-        )
+        .eval("while (true) {}")
         .await
-        .expect_err("infinite execution should be interrupted");
+        .expect_err("infinite execution should hit the continuous limit");
     assert_eq!(
         error,
-        EvalError::TimedOut {
+        EvalError::ExecutionTimedOut {
             timeout_ms: 20,
             previous_generation,
             new_generation: previous_generation + 1,
@@ -489,7 +539,7 @@ async fn timeout_discards_and_replaces_the_isolate() {
     let state = isolate
         .eval("typeof survivor")
         .await
-        .expect("fresh generation should be ready before timeout is returned");
+        .expect("fresh generation should be ready before the error is returned");
     assert_eq!(json_result(state.result), json!("undefined"));
 
     let builtin = isolate
@@ -503,6 +553,53 @@ async fn timeout_discards_and_replaces_the_isolate() {
         .await
         .expect("replacing one isolate must not disturb its sibling");
     assert_eq!(json_result(sibling_state.result), json!(42));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn explicit_wall_deadline_times_out_pending_builtin() {
+    let dropped = Arc::new(AtomicBool::new(false));
+    let handler_dropped = Arc::clone(&dropped);
+    let pending_namespace = Namespace::new("lam.wait", "Wall deadline probe.").function(
+        "forever",
+        "Waits forever so the wall deadline must cancel this operation.",
+        move |_context, (): ()| {
+            let handler_dropped = Arc::clone(&handler_dropped);
+            async move {
+                let _drop_flag = DropFlag(handler_dropped);
+                std::future::pending::<()>().await;
+                Ok::<(), Never>(())
+            }
+        },
+    );
+    let mut isolate = Isolate::builder()
+        .namespace(pending_namespace)
+        .execution_timeout(Duration::from_secs(5))
+        .build()
+        .await
+        .expect("test isolate should initialize");
+    let previous_generation = isolate.generation();
+
+    let error = isolate
+        .eval_with(
+            "lam.wait.forever()",
+            EvalOptions::default().timeout(Duration::from_millis(20)),
+        )
+        .await
+        .expect_err("a pending Rust op must still respect an explicit wall deadline");
+
+    assert_eq!(
+        error,
+        EvalError::TimedOut {
+            timeout_ms: 20,
+            previous_generation,
+            new_generation: previous_generation + 1,
+        }
+    );
+    assert!(
+        dropped.load(Ordering::SeqCst),
+        "dropping the poisoned runtime should cancel its pending op future"
+    );
+    assert_eq!(isolate.generation(), previous_generation + 1);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -521,8 +618,7 @@ async fn host_interruption_crosses_an_async_builtin_handoff() {
     );
     let mut isolate = Isolate::builder()
         .namespace(started)
-        .default_timeout(Duration::from_secs(5))
-        .max_timeout(Duration::from_secs(5))
+        .execution_timeout(Duration::from_secs(5))
         .build()
         .await
         .expect("test isolate should initialize");
@@ -542,7 +638,7 @@ async fn host_interruption_crosses_an_async_builtin_handoff() {
     stopper.join().expect("interrupt thread should finish");
     assert!(
         started_at.elapsed() < Duration::from_secs(2),
-        "host interruption should not wait for the eval timeout"
+        "host interruption should not wait for an ambient wall deadline"
     );
 
     let previous_generation = isolate.generation();
@@ -615,50 +711,36 @@ async fn console_capture_can_be_disabled_without_removing_console() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn timeout_cancels_pending_rust_builtin_work() {
-    let dropped = Arc::new(AtomicBool::new(false));
-    let handler_dropped = Arc::clone(&dropped);
-    let pending_namespace = Namespace::new("lam.wait", "Cancellation probe.").function(
+async fn builder_default_timeout_applies_as_wall_deadline() {
+    let pending_namespace = Namespace::new("lam.wait", "Default wall probe.").function(
         "forever",
-        "Waits forever so isolate replacement must drop this operation.",
-        move |_context, (): ()| {
-            let handler_dropped = Arc::clone(&handler_dropped);
-            async move {
-                let _drop_flag = DropFlag(handler_dropped);
-                std::future::pending::<()>().await;
-                Ok::<(), Never>(())
-            }
+        "Never resolves.",
+        |_context, (): ()| async move {
+            std::future::pending::<()>().await;
+            Ok::<(), Never>(())
         },
     );
     let mut isolate = Isolate::builder()
         .namespace(pending_namespace)
-        .default_timeout(Duration::from_millis(200))
-        .max_timeout(Duration::from_millis(200))
+        .default_timeout(Duration::from_millis(25))
+        .execution_timeout(Duration::from_secs(5))
         .build()
         .await
         .expect("test isolate should initialize");
     let previous_generation = isolate.generation();
 
     let error = isolate
-        .eval_with(
-            "lam.wait.forever()",
-            EvalOptions::default().timeout(Duration::from_millis(20)),
-        )
+        .eval("lam.wait.forever()")
         .await
-        .expect_err("a pending Rust op must still respect the eval deadline");
-
+        .expect_err("builder default wall deadline should bound pending work");
     assert!(matches!(
         error,
         EvalError::TimedOut {
+            timeout_ms: 25,
             previous_generation: generation,
-            ..
-        } if generation == previous_generation
+            new_generation,
+        } if generation == previous_generation && new_generation == previous_generation + 1
     ));
-    assert!(
-        dropped.load(Ordering::SeqCst),
-        "dropping the poisoned runtime should cancel its pending op future"
-    );
-    assert_eq!(isolate.generation(), previous_generation + 1);
 }
 
 #[tokio::test(flavor = "current_thread")]

@@ -82,27 +82,22 @@ impl Default for CaptureConfig {
 
 /// Host bounds applied to `lam.shell.run` before invoking a runner.
 ///
-/// The isolate's eval timeout remains an outer bound. Configure it above the
-/// longest shell timeout when timeouts should return a normal shell outcome
-/// rather than interrupting and replacing the isolate.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Shell command deadlines are optional. When both the TypeScript request and
+/// [`ShellConfig::default_timeout`] omit a deadline, the runner is asked to wait
+/// indefinitely. Cancellation and drop still tear the process tree down.
+///
+/// The isolate's eval wall deadline remains an independent outer bound. Configure
+/// it above any deliberate shell timeout when timeouts should return a normal
+/// shell outcome rather than interrupting and replacing the isolate.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ShellConfig {
-    /// Timeout used when the TypeScript request omits one.
-    pub default_timeout: Duration,
-    /// Largest timeout TypeScript may request.
-    pub max_timeout: Duration,
+    /// Deadline used when the TypeScript request omits one.
+    ///
+    /// `None` means no shell deadline is applied unless the caller supplies an
+    /// explicit positive `timeoutMs`.
+    pub default_timeout: Option<Duration>,
     /// Output capture limits passed to the runner.
     pub capture: CaptureConfig,
-}
-
-impl Default for ShellConfig {
-    fn default() -> Self {
-        Self {
-            default_timeout: Duration::from_secs(20),
-            max_timeout: Duration::from_secs(10 * 60),
-            capture: CaptureConfig::default(),
-        }
-    }
 }
 
 /// Invalid coding-pack configuration or workspace setup.
@@ -305,16 +300,10 @@ fn validate_list(config: ListConfig) -> Result<(), CodingPackBuildError> {
 fn validate_shell(config: ShellConfig) -> Result<(), CodingPackBuildError> {
     nonzero("shell.capture.max_lines", config.capture.max_lines)?;
     nonzero("shell.capture.max_bytes", config.capture.max_bytes)?;
-    if config.default_timeout.is_zero() {
+    if config.default_timeout == Some(Duration::ZERO) {
         return Err(CodingPackBuildError::InvalidLimit {
             field: "shell.default_timeout",
-            message: "must be greater than zero".to_owned(),
-        });
-    }
-    if config.max_timeout.is_zero() || config.default_timeout > config.max_timeout {
-        return Err(CodingPackBuildError::InvalidLimit {
-            field: "shell.max_timeout",
-            message: "must be nonzero and at least shell.default_timeout".to_owned(),
+            message: "must be greater than zero when set".to_owned(),
         });
     }
     Ok(())

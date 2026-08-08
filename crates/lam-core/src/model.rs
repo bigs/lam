@@ -65,7 +65,11 @@ pub struct EvalRequest {
     pub intent: String,
     /// TypeScript program to evaluate in the actor's persistent isolate.
     pub source: String,
-    /// Optional model-requested timeout, still bounded by the host maximum.
+    /// Optional wall-clock deadline for this eval.
+    ///
+    /// `None` selects the host default, which is normally no wall deadline. A
+    /// positive duration is opt-in and should name a meaningful operation
+    /// deadline, not a guessed bound for subagent, build, or test work.
     pub timeout: Option<Duration>,
 }
 

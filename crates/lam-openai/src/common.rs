@@ -337,7 +337,7 @@ pub(crate) fn eval_parameters() -> Value {
             "timeoutMs": {
                 "type": ["integer", "null"],
                 "minimum": 1,
-                "description": "Requested timeout in milliseconds, bounded by the host, or null for the host default."
+                "description": "Optional wall-clock deadline in milliseconds. null selects the host default, normally no wall deadline. Use a positive value only for a meaningful operation deadline, not a guessed duration for subagent, build, or test work."
             }
         },
         "required": ["intent", "source", "timeoutMs"],

@@ -43,13 +43,28 @@ pub enum EvalError {
         message: String,
     },
 
-    /// The host deadline interrupted the cell and replaced its isolate.
+    /// The host wall-clock deadline interrupted the cell and replaced its isolate.
     ///
     /// The previous heap is lost. Host side effects completed before the
     /// interruption are not rolled back.
     #[error("evaluation timed out after {timeout_ms} ms; isolate restarted")]
     TimedOut {
-        /// Effective host-bounded timeout.
+        /// Effective wall-clock timeout.
+        timeout_ms: u64,
+        /// Generation which was interrupted.
+        previous_generation: u64,
+        /// Fresh generation installed before this error was returned.
+        new_generation: u64,
+    },
+
+    /// Continuous JavaScript execution exceeded the per-poll limit and the
+    /// isolate was replaced.
+    ///
+    /// The previous heap is lost. Host side effects completed before the
+    /// interruption are not rolled back.
+    #[error("evaluation exceeded the {timeout_ms} ms execution limit; isolate restarted")]
+    ExecutionTimedOut {
+        /// Configured continuous-execution limit.
         timeout_ms: u64,
         /// Generation which was interrupted.
         previous_generation: u64,
@@ -71,13 +86,31 @@ pub enum EvalError {
         new_generation: u64,
     },
 
-    /// The poisoned isolate was dropped, but its replacement could not start.
+    /// The poisoned isolate was dropped after a wall-clock timeout, but its
+    /// replacement could not start.
     ///
     /// The previous heap is lost. Host side effects completed before the
     /// interruption are not rolled back.
     #[error("evaluation timed out and isolate restart failed: {message}")]
     RestartFailed {
-        /// Effective host-bounded timeout.
+        /// Effective wall-clock timeout.
+        timeout_ms: u64,
+        /// Generation which was interrupted.
+        previous_generation: u64,
+        /// Generation which failed to initialize.
+        attempted_generation: u64,
+        /// Startup failure.
+        message: String,
+    },
+
+    /// The poisoned isolate was dropped after an execution-limit timeout, but
+    /// its replacement could not start.
+    ///
+    /// The previous heap is lost. Host side effects completed before the
+    /// interruption are not rolled back.
+    #[error("evaluation exceeded the execution limit and isolate restart failed: {message}")]
+    ExecutionRestartFailed {
+        /// Configured continuous-execution limit.
         timeout_ms: u64,
         /// Generation which was interrupted.
         previous_generation: u64,
@@ -149,7 +182,7 @@ pub enum IsolateBuildError {
         /// Function occupying that path.
         function: String,
     },
-    /// The default or maximum timeout was zero.
+    /// A configured wall or execution timeout was zero.
     #[error("isolate timeouts must be greater than zero")]
     InvalidTimeout,
     /// V8, the Lam bootstrap, or the local inspector failed to initialize.

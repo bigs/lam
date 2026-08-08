@@ -3,12 +3,13 @@
 use std::future::Future;
 use std::mem::ManuallyDrop;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::thread::{self, ThreadId};
 
 use deno_core::v8::{self, UnsafeRawIsolatePtr};
 
-use super::{EvalError, EvalValue, KernelInner};
+use super::{EvalError, EvalValue, ExecutionArm, KernelInner};
 
 /// A kernel whose V8 isolate is entered only while Lam is polling or
 /// inspecting it.
@@ -50,11 +51,12 @@ impl Kernel {
         &mut self,
         source: &str,
         cell_id: u64,
+        execution_arm: Arc<ExecutionArm>,
     ) -> Result<EvalValue, EvalError> {
         let isolate = self.isolate;
         let owner = self.owner;
         let future = self.inner.evaluate(source, cell_id);
-        ActivatedFuture::new(future, isolate, owner).await
+        ActivatedFuture::new(future, isolate, owner, execution_arm).await
     }
 
     fn assert_owner(&self) {
@@ -89,14 +91,21 @@ struct ActivatedFuture<F> {
     future: ManuallyDrop<F>,
     isolate: UnsafeRawIsolatePtr,
     owner: ThreadId,
+    execution_arm: Arc<ExecutionArm>,
 }
 
 impl<F> ActivatedFuture<F> {
-    fn new(future: F, isolate: UnsafeRawIsolatePtr, owner: ThreadId) -> Self {
+    fn new(
+        future: F,
+        isolate: UnsafeRawIsolatePtr,
+        owner: ThreadId,
+        execution_arm: Arc<ExecutionArm>,
+    ) -> Self {
         Self {
             future: ManuallyDrop::new(future),
             isolate,
             owner,
+            execution_arm,
         }
     }
 
@@ -117,6 +126,10 @@ impl<F: Future> Future for ActivatedFuture<F> {
         // it is never moved before being dropped in this type's `Drop` impl.
         let this = unsafe { self.get_unchecked_mut() };
         this.assert_owner();
+        // Arm immediately before the entered poll so only continuous work in
+        // this poll consumes the execution budget. The guard disarms when the
+        // poll returns Ready or Pending, including panic paths.
+        let _armed = this.execution_arm.arm();
         let _entered = EnteredIsolate::new(this.isolate);
         unsafe { Pin::new_unchecked(&mut *this.future) }.poll(cx)
     }
@@ -125,6 +138,8 @@ impl<F: Future> Future for ActivatedFuture<F> {
 impl<F> Drop for ActivatedFuture<F> {
     fn drop(&mut self) {
         self.assert_owner();
+        // Drop-time activation is not continuous eval work; leave the
+        // execution watchdog disarmed so destructor cleanup cannot trip it.
         let _entered = EnteredIsolate::new(self.isolate);
 
         // SAFETY: `future` has not moved and is dropped exactly once here.

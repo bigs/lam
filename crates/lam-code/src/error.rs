@@ -126,13 +126,11 @@ pub(crate) enum ShellError {
         /// Validation diagnostic.
         message: String,
     },
-    /// A caller-supplied timeout exceeded host policy.
-    #[error("invalid timeout {timeout_ms} ms: must be between 1 and {max_timeout_ms} ms")]
+    /// A caller-supplied timeout was zero or otherwise invalid.
+    #[error("invalid timeout {timeout_ms} ms: must be greater than zero")]
     InvalidTimeout {
-        /// Requested timeout.
+        /// Rejected timeout.
         timeout_ms: u64,
-        /// Host maximum.
-        max_timeout_ms: u64,
     },
     /// The injected runner failed before producing a normal command outcome.
     #[error("command runner failed: {message}")]

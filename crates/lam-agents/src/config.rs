@@ -46,7 +46,7 @@ pub(crate) struct ChildActorSpec<S> {
     pub(crate) system_prompt: Option<String>,
     pub(crate) instructions: Vec<String>,
     pub(crate) default_eval_timeout: Option<Duration>,
-    pub(crate) max_eval_timeout: Option<Duration>,
+    pub(crate) eval_execution_timeout: Option<Duration>,
     pub(crate) capture_console: bool,
 }
 
@@ -82,7 +82,7 @@ pub struct SubagentConfig<S> {
     pub(crate) max_depth: usize,
     pub(crate) allow_agent_namespace: bool,
     pub(crate) default_eval_timeout: Option<Duration>,
-    pub(crate) max_eval_timeout: Option<Duration>,
+    pub(crate) eval_execution_timeout: Option<Duration>,
     pub(crate) capture_console: bool,
 }
 
@@ -95,7 +95,7 @@ impl<S> Clone for SubagentConfig<S> {
             max_depth: self.max_depth,
             allow_agent_namespace: self.allow_agent_namespace,
             default_eval_timeout: self.default_eval_timeout,
-            max_eval_timeout: self.max_eval_timeout,
+            eval_execution_timeout: self.eval_execution_timeout,
             capture_console: self.capture_console,
         }
     }
@@ -177,7 +177,7 @@ pub struct SubagentConfigBuilder<S> {
     max_depth: usize,
     allow_agent_namespace: bool,
     default_eval_timeout: Option<Duration>,
-    max_eval_timeout: Option<Duration>,
+    eval_execution_timeout: Option<Duration>,
     capture_console: bool,
 }
 
@@ -200,7 +200,7 @@ where
             max_depth: 4,
             allow_agent_namespace: true,
             default_eval_timeout: None,
-            max_eval_timeout: None,
+            eval_execution_timeout: None,
             capture_console: true,
         }
     }
@@ -256,17 +256,21 @@ where
         self
     }
 
-    /// Sets the default eval timeout inherited by children.
+    /// Sets an optional wall-clock default eval deadline inherited by children.
+    ///
+    /// When unset, children inherit no ambient wall deadline.
     #[must_use]
     pub const fn default_eval_timeout(mut self, timeout: Duration) -> Self {
         self.default_eval_timeout = Some(timeout);
         self
     }
 
-    /// Sets the maximum eval timeout inherited by children.
+    /// Sets the continuous JavaScript execution limit inherited by children.
+    ///
+    /// When unset, children use the isolate execution default (30 seconds).
     #[must_use]
-    pub const fn max_eval_timeout(mut self, timeout: Duration) -> Self {
-        self.max_eval_timeout = Some(timeout);
+    pub const fn eval_execution_timeout(mut self, timeout: Duration) -> Self {
+        self.eval_execution_timeout = Some(timeout);
         self
     }
 
@@ -316,7 +320,7 @@ where
             max_depth: self.max_depth,
             allow_agent_namespace: self.allow_agent_namespace,
             default_eval_timeout: self.default_eval_timeout,
-            max_eval_timeout: self.max_eval_timeout,
+            eval_execution_timeout: self.eval_execution_timeout,
             capture_console: self.capture_console,
         })
     }
@@ -350,7 +354,7 @@ where
                 system_prompt,
                 instructions,
                 default_eval_timeout,
-                max_eval_timeout,
+                eval_execution_timeout,
                 capture_console,
             } = spec;
             let mut builder = Lam::builder(model.clone())
@@ -378,8 +382,8 @@ where
             if let Some(timeout) = default_eval_timeout {
                 builder = builder.default_eval_timeout(timeout);
             }
-            if let Some(timeout) = max_eval_timeout {
-                builder = builder.max_eval_timeout(timeout);
+            if let Some(timeout) = eval_execution_timeout {
+                builder = builder.eval_execution_timeout(timeout);
             }
             builder.build().actor(address.to_string())
         }),

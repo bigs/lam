@@ -1287,14 +1287,23 @@ extension-specific TypeScript shim, npm toolchain, build script, bundle, or
 generated runtime file. A bare isolate has no filesystem, network, process,
 URL/fetch, npm, or third-party framework runtime.
 
-Each eval has a host timeout bounded by the builder's maximum. When it fires,
-Lam interrupts V8, considers that isolate poisoned, drops it and pending Rust
-op futures, constructs the next generation, and only then returns `TimedOut`.
-The variant guarantees that heap state was lost and already-completed external
+Each eval may take an optional wall-clock deadline. `None` / a null request
+timeout selects the host default, which is normally no wall deadline; the
+builder may still install an opt-in default. Explicit positive timeouts are
+deliberate operation deadlines, not guessed bounds for subagent, build, or
+test work. Separately, one continuous non-yielding JavaScript poll is bounded
+by the isolate's execution timeout (default 30 seconds). Async builtin waits—
+including agent calls/waits and shell processes—park without consuming that
+execution limit. When either limit fires, Lam interrupts V8, considers that
+isolate poisoned, drops it and pending Rust op futures, constructs the next
+generation, and only then returns. Wall deadlines surface as `TimedOut` when
+replacement succeeds; if replacement fails, the actor-facing layer observes
+`RestartFailed` or `Poisoned` rather than continuing on the interrupted heap.
+Execution-limit violations use the additive `ExecutionTimedOut` /
+`ExecutionRestartFailed` variants with the same replacement guarantees. Those
+variants guarantee that heap state was lost and already-completed external
 side effects may remain; these invariants are not duplicated as boolean
-fields. `TimedOut` carries both generations and means replacement succeeded.
-If replacement fails, the actor-facing layer will observe `RestartFailed` or
-`Poisoned` rather than continuing on the interrupted heap.
+fields.
 
 Acceptance coverage proves TypeScript persistence and top-level await, absence
 of ambient authority, Promise composition, typed error catch and propagation,
@@ -1677,9 +1686,10 @@ deliberately small:
   validates every path and hunk before its first mutation, and
   `lam.edit.write` creates or completely rewrites UTF-8 text files;
 - `lam.shell.run` delegates to an injected `CommandRunner`. The supplied local
-  runner accepts a shell string, optional working directory and bounded
-  timeout, kills its process tree on timeout or cancellation, and returns exit
-  status plus independently captured stdout and stderr;
+  runner accepts a shell string, optional working directory, and optional
+  timeout (default none: no deadline). An explicit timeout still kills its
+  process tree; cancellation remains independent and does the same. The runner
+  returns exit status plus independently captured stdout and stderr;
 - bounded shell output keeps its tail in the eval result and spills complete
   raw streams to pack-owned temporary files. `lam.fs.read` is the one
   pagination mechanism for UTF-8 spills; paths are intentionally ephemeral and
@@ -1700,7 +1710,7 @@ parsed file mutations remain centralized interception points for that work.
 End-to-end isolate tests cover namespace gating, manifest-generated calls,
 numbered pagination, lexical directory cursors, multi-file patch actions and
 prevalidation, complete writes, unconfined parent-relative paths, nonzero exits,
-independent output capture and spill reads, process-tree timeout, and
+independent output capture and spill reads, optional process-tree timeout, and
 cancellation cleanup. All provider and actor crates remain unaware of the
 optional pack.
 

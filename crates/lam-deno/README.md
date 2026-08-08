@@ -69,13 +69,26 @@ ambient `Deno` object. Those capabilities must be registered by the embedding.
 
 ## Timeouts and replacement
 
-`eval_with` can select a timeout independently of the builder's default.
-Hosts can optionally configure a maximum. When
-the watchdog fires, lam interrupts V8, treats the isolate as poisoned, drops
-pending Rust op futures, and constructs a fresh generation before returning.
+There are two independent limits:
 
-`EvalError::TimedOut` means replacement succeeded and reports the previous and
-new generation. `RestartFailed` or `Poisoned` means no healthy continuation is
+- **Wall deadline** — optional. `IsolateBuilder::default_timeout` opts into a
+  default wall-clock deadline for cells that do not override it; the builder
+  default is no wall deadline. `EvalOptions::timeout` sets an explicit
+  per-cell wall deadline. Long `Poll::Pending` waits (for example async
+  builtins) only hit a wall deadline when one of those is configured.
+- **Execution limit** — always on. `IsolateBuilder::execution_timeout`
+  caps continuous time spent inside one eval-future poll and defaults to 30
+  seconds. Pending waits do not consume it. Synchronous infinite JavaScript
+  is interrupted by this watchdog.
+
+Configured wall and execution durations must be greater than zero. There is no
+host maximum wall clamp.
+
+When either watchdog fires, lam interrupts V8, treats the isolate as poisoned,
+drops pending Rust op futures, and constructs a fresh generation before
+returning. `EvalError::TimedOut` / `RestartFailed` report wall-deadline
+replacement. `EvalError::ExecutionTimedOut` / `ExecutionRestartFailed` report
+execution-limit replacement. `Poisoned` means no healthy continuation is
 available. Host effects completed before interruption are not rolled back.
 
 `IsolateInterrupt` provides out-of-band cancellation without waiting for the

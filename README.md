@@ -49,7 +49,8 @@ reasoning-effort selection as `currentSelection` on the `lam` descriptor.
 - Persistent TypeScript cells with lexical state and top-level `await`.
 - Typed, Promise-native Rust namespaces using Serde and JSON Schema inference.
 - Explicit JSON results and ordered structured `console` capture.
-- Bounded eval timeouts which interrupt and replace poisoned isolates.
+- Optional eval wall deadlines and a continuous non-yielding JavaScript
+  execution watchdog that interrupt and replace poisoned isolates.
 - Durable actor mailboxes and model-visible context in append-only journals.
 - Linear `call`, durable `send`, steering, queueing, and structured outputs.
 - Provider-native context preservation, including encrypted reasoning traces.
@@ -213,13 +214,22 @@ builders and can be omitted or replaced by application-specific namespaces.
 `lam-code` applies validation, limits, and process cleanup, but these are API
 guardrails—not an operating-system sandbox. Filesystem and editing paths are
 not confined to the configured directory, and the supplied local command runner
-inherits the embedding process's host authority. A production embedding should
-run lam inside an appropriate OS/container sandbox or inject a sandboxed
-`CommandRunner` when executing untrusted programs.
+inherits the embedding process's host authority. Shell commands have no
+deadline by default; an explicit shell timeout still cleans up the process
+tree, and cancellation remains independent of that deadline. A production
+embedding should run lam inside an appropriate OS/container sandbox or inject a
+sandboxed `CommandRunner` when executing untrusted programs.
 
-Eval timeout does not roll back host effects which completed before
-interruption. lam reports the isolate replacement and possible partial effects
-rather than pretending execution was transactional.
+Eval wall deadlines and the continuous execution watchdog do not roll back host
+effects which completed before interruption. lam reports the isolate
+replacement and possible partial effects rather than pretending execution was
+transactional. `timeoutMs: null` / no requested timeout means the host
+default, normally no wall deadline. Explicit positive timeouts are opt-in and
+should mark meaningful operation deadlines only—not guessed durations for
+subagent, build, or test work. Async builtin waits, including agent
+calls/waits and shell processes, park the isolate without consuming the
+continuous execution limit; one non-yielding JavaScript poll remains bounded
+and resets the isolate on violation.
 
 ## Events and observability
 

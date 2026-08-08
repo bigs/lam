@@ -19,10 +19,12 @@ tool-call semantics. They share only transport, SSE parsing, context helpers,
 errors, and metadata extraction.
 
 Both declare the same strict `eval` input: a brief one-line `intent`, the
-TypeScript `source`, and a nullable `timeoutMs`. Intent is limited to 120
-characters for use as a compact user-facing operation title. Native responses
-recorded before this field was introduced remain replayable with a neutral
-fallback intent.
+TypeScript `source`, and a nullable `timeoutMs`. `timeoutMs: null` selects the
+host default, normally no wall deadline; a positive value is an opt-in wall
+deadline for a meaningful operation, not a guessed bound for subagent, build,
+or test work. Intent is limited to 120 characters for use as a compact
+user-facing operation title. Native responses recorded before this field was
+introduced remain replayable with a neutral fallback intent.
 
 ## OpenAI Responses
 

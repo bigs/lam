@@ -993,7 +993,7 @@ where
             system_prompt: request.system_prompt,
             instructions,
             default_eval_timeout: config.default_eval_timeout,
-            max_eval_timeout: config.max_eval_timeout,
+            eval_execution_timeout: config.eval_execution_timeout,
             capture_console: config.capture_console,
         });
         let parent = self.resident(&parent_address).map_err(spawn_system_error)?;

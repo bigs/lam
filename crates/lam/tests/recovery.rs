@@ -89,7 +89,7 @@ async fn build_actor(
 ) -> Actor<RedbStore> {
     let mut builder = Lam::builder(Model::new(provider, ScriptedCodec))
         .state_store(store)
-        .max_eval_timeout(Duration::from_secs(10));
+        .eval_execution_timeout(Duration::from_secs(10));
     for namespace in namespaces {
         builder = builder.namespace(namespace);
     }

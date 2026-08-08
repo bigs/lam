@@ -26,6 +26,9 @@ pub(crate) struct ShellRequest {
     #[serde(default)]
     pub cwd: Option<String>,
     /// Optional positive execution timeout in milliseconds.
+    ///
+    /// Omit the field for no request-level deadline; the configured
+    /// [`ShellConfig::default_timeout`] then applies, which may also be absent.
     #[serde(default)]
     pub timeout_ms: Option<u64>,
 }
@@ -74,8 +77,8 @@ pub struct CommandRequest {
     pub command: String,
     /// Canonical initial working directory.
     pub cwd: PathBuf,
-    /// Effective host-bounded timeout.
-    pub timeout: Duration,
+    /// Explicit positive deadline, or `None` to wait without a shell timeout.
+    pub timeout: Option<Duration>,
     /// Tail and spill thresholds.
     pub capture: CaptureConfig,
     /// Pack-owned directory for complete truncated streams.
@@ -189,11 +192,11 @@ pub(crate) fn shell_namespace(
 ) -> Namespace {
     Namespace::new(
         "lam.shell",
-        "Runs explicitly enabled host shell commands with bounded time and model-visible output.",
+        "Runs explicitly enabled host shell commands with optional deadlines and model-visible output.",
     )
     .function(
         "run",
-        "Run one shell command string. A nonzero exit or command timeout is returned as a normal outcome; policy, spawn, capture, or reap failures reject the Promise. Truncated stdout or stderr includes a fullOutputPath; UTF-8 output is pageable when lam.fs is installed.",
+        "Run one shell command string. Omit timeoutMs for no request deadline; an explicit positive timeout is deliberate. A nonzero exit or command timeout is returned as a normal outcome; policy, spawn, capture, or reap failures reject the Promise. Truncated stdout or stderr includes a fullOutputPath; UTF-8 output is pageable when lam.fs is installed.",
         move |_context, request: ShellRequest| {
             let workspace = workspace.clone();
             let runner = Arc::clone(&runner);
@@ -229,16 +232,23 @@ async fn run_command(
         });
     }
 
-    let timeout = request
-        .timeout_ms
-        .map(Duration::from_millis)
-        .unwrap_or(config.default_timeout);
-    if timeout.is_zero() || timeout > config.max_timeout {
-        return Err(ShellError::InvalidTimeout {
-            timeout_ms: duration_millis(timeout),
-            max_timeout_ms: duration_millis(config.max_timeout),
-        });
-    }
+    let timeout = match request.timeout_ms {
+        Some(timeout_ms) => {
+            let timeout = Duration::from_millis(timeout_ms);
+            if timeout.is_zero() {
+                return Err(ShellError::InvalidTimeout { timeout_ms });
+            }
+            Some(timeout)
+        }
+        None => match config.default_timeout {
+            Some(timeout) if timeout.is_zero() => {
+                return Err(ShellError::InvalidTimeout {
+                    timeout_ms: duration_millis(timeout),
+                });
+            }
+            other => other,
+        },
+    };
     let output = runner
         .run(CommandRequest {
             command: request.command,
@@ -316,25 +326,29 @@ async fn run_local(
         stderr = Some(await_capture(&mut stderr_task, "stderr").await?);
         Ok::<_, CommandRunnerError>(())
     };
-    let timed_out = match tokio::time::timeout(request.timeout, execution).await {
-        Ok(result) => {
-            result?;
+    let timed_out = match request.timeout {
+        Some(timeout) => match tokio::time::timeout(timeout, execution).await {
+            Ok(result) => {
+                result?;
+                false
+            }
+            Err(_) => {
+                finish_timed_out(
+                    &mut process_tree,
+                    &mut child,
+                    &mut status,
+                    &mut stdout_task,
+                    &mut stderr_task,
+                    &mut stdout,
+                    &mut stderr,
+                )
+                .await?;
+                true
+            }
+        },
+        None => {
+            execution.await?;
             false
-        }
-        Err(_) => {
-            process_tree.kill()?;
-            if status.is_none() {
-                status = Some(child.wait().await.map_err(|error| {
-                    CommandRunnerError::new(format!("could not reap timed-out shell: {error}"))
-                })?);
-            }
-            if stdout.is_none() {
-                stdout = Some(await_capture(&mut stdout_task, "stdout").await?);
-            }
-            if stderr.is_none() {
-                stderr = Some(await_capture(&mut stderr_task, "stderr").await?);
-            }
-            true
         }
     };
     let status = status.ok_or_else(|| CommandRunnerError::new("shell produced no exit status"))?;
@@ -349,6 +363,30 @@ async fn run_local(
         stderr,
         duration: started.elapsed(),
     })
+}
+
+async fn finish_timed_out(
+    process_tree: &mut ProcessTreeGuard,
+    child: &mut tokio::process::Child,
+    status: &mut Option<std::process::ExitStatus>,
+    stdout_task: &mut tokio::task::JoinHandle<std::io::Result<CapturedStream>>,
+    stderr_task: &mut tokio::task::JoinHandle<std::io::Result<CapturedStream>>,
+    stdout: &mut Option<CapturedStream>,
+    stderr: &mut Option<CapturedStream>,
+) -> Result<(), CommandRunnerError> {
+    process_tree.kill()?;
+    if status.is_none() {
+        *status = Some(child.wait().await.map_err(|error| {
+            CommandRunnerError::new(format!("could not reap timed-out shell: {error}"))
+        })?);
+    }
+    if stdout.is_none() {
+        *stdout = Some(await_capture(stdout_task, "stdout").await?);
+    }
+    if stderr.is_none() {
+        *stderr = Some(await_capture(stderr_task, "stderr").await?);
+    }
+    Ok(())
 }
 
 async fn await_capture(

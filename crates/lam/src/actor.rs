@@ -149,7 +149,7 @@ impl Lam {
             directory_selection: None,
             model_selection_observer: None,
             default_timeout: None,
-            max_timeout: None,
+            execution_timeout: None,
             capture_console: true,
             clock: Arc::new(SystemClock),
             system_prompt: SystemPrompt::default(),
@@ -169,7 +169,7 @@ pub struct LamBuilder<S> {
     directory_selection: Option<DirectorySelectionSource>,
     model_selection_observer: Option<ModelSelectionObserver>,
     default_timeout: Option<Duration>,
-    max_timeout: Option<Duration>,
+    execution_timeout: Option<Duration>,
     capture_console: bool,
     clock: Arc<dyn Clock>,
     system_prompt: SystemPrompt,
@@ -195,7 +195,7 @@ impl<S> LamBuilder<S> {
             directory_selection: self.directory_selection,
             model_selection_observer: self.model_selection_observer,
             default_timeout: self.default_timeout,
-            max_timeout: self.max_timeout,
+            execution_timeout: self.execution_timeout,
             capture_console: self.capture_console,
             clock: self.clock,
             system_prompt: self.system_prompt,
@@ -327,17 +327,23 @@ impl<S> LamBuilder<S> {
         self
     }
 
-    /// Sets the default timeout for eval programs.
+    /// Sets an optional wall-clock default deadline for eval programs.
+    ///
+    /// When unset, evals have no ambient wall deadline. Callers can still set
+    /// an explicit per-eval wall deadline through eval options.
     #[must_use]
     pub const fn default_eval_timeout(mut self, timeout: Duration) -> Self {
         self.default_timeout = Some(timeout);
         self
     }
 
-    /// Sets the hard upper bound for eval timeouts.
+    /// Sets the maximum continuous JavaScript execution time for one eval poll.
+    ///
+    /// When unset, the isolate uses its built-in execution default (30 seconds).
+    /// Long `Poll::Pending` waits do not consume this budget.
     #[must_use]
-    pub const fn max_eval_timeout(mut self, timeout: Duration) -> Self {
-        self.max_timeout = Some(timeout);
+    pub const fn eval_execution_timeout(mut self, timeout: Duration) -> Self {
+        self.execution_timeout = Some(timeout);
         self
     }
 
@@ -370,7 +376,7 @@ impl<S> LamBuilder<S> {
             directory_selection: self.directory_selection,
             model_selection_observer: self.model_selection_observer,
             default_timeout: self.default_timeout,
-            max_timeout: self.max_timeout,
+            execution_timeout: self.execution_timeout,
             capture_console: self.capture_console,
             clock: self.clock,
             system_prompt: self.system_prompt,
@@ -390,7 +396,7 @@ pub struct LamRuntime<S> {
     directory_selection: Option<DirectorySelectionSource>,
     model_selection_observer: Option<ModelSelectionObserver>,
     default_timeout: Option<Duration>,
-    max_timeout: Option<Duration>,
+    execution_timeout: Option<Duration>,
     capture_console: bool,
     clock: Arc<dyn Clock>,
     system_prompt: SystemPrompt,
@@ -412,7 +418,7 @@ impl<S> LamRuntime<S> {
             directory_selection: self.directory_selection,
             model_selection_observer: self.model_selection_observer,
             default_timeout: self.default_timeout,
-            max_timeout: self.max_timeout,
+            execution_timeout: self.execution_timeout,
             capture_console: self.capture_console,
             clock: self.clock,
             system_prompt: self.system_prompt,
@@ -433,7 +439,7 @@ pub struct ActorBuilder<S> {
     directory_selection: Option<DirectorySelectionSource>,
     model_selection_observer: Option<ModelSelectionObserver>,
     default_timeout: Option<Duration>,
-    max_timeout: Option<Duration>,
+    execution_timeout: Option<Duration>,
     capture_console: bool,
     clock: Arc<dyn Clock>,
     system_prompt: SystemPrompt,
@@ -554,7 +560,7 @@ struct PreparedActor<S> {
     directory_selection: Option<DirectorySelectionSource>,
     model_selection_observer: Option<ModelSelectionObserver>,
     default_timeout: Option<Duration>,
-    max_timeout: Option<Duration>,
+    execution_timeout: Option<Duration>,
     capture_console: bool,
     clock: Arc<dyn Clock>,
     system_prompt: SystemPrompt,
@@ -599,7 +605,7 @@ where
             directory_selection: builder.directory_selection,
             model_selection_observer: builder.model_selection_observer,
             default_timeout: builder.default_timeout,
-            max_timeout: builder.max_timeout,
+            execution_timeout: builder.execution_timeout,
             capture_console: builder.capture_console,
             clock: builder.clock,
             system_prompt: builder.system_prompt,
@@ -640,8 +646,8 @@ where
         if let Some(timeout) = self.default_timeout {
             isolate_builder = isolate_builder.default_timeout(timeout);
         }
-        if let Some(timeout) = self.max_timeout {
-            isolate_builder = isolate_builder.max_timeout(timeout);
+        if let Some(timeout) = self.execution_timeout {
+            isolate_builder = isolate_builder.execution_timeout(timeout);
         }
         isolate_builder = isolate_builder.capture_console(self.capture_console);
         let isolate_started = Instant::now();

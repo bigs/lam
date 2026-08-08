@@ -1,13 +1,15 @@
 //! End-to-end checks for the coding capability namespaces.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use lam::{EvalError, EvalValue, Isolate};
 use lam_code::{
-    CaptureConfig, CodingPack, FilesystemAccess, ListConfig, LocalCommandRunner, ReadConfig,
-    ShellConfig,
+    CaptureConfig, CapturedStream, CodingPack, CommandFuture, CommandOutput, CommandRequest,
+    CommandRunner, FilesystemAccess, ListConfig, LocalCommandRunner, ReadConfig, ShellConfig,
 };
 use serde_json::{Value, json};
+use tokio::sync::Mutex;
 
 fn json_result(value: EvalValue) -> Value {
     match value {
@@ -22,6 +24,40 @@ async fn isolate(pack: &CodingPack) -> Isolate {
         .build()
         .await
         .expect("coding namespaces should build")
+}
+
+#[derive(Clone)]
+struct RecordingRunner {
+    seen: Arc<Mutex<Option<Option<Duration>>>>,
+}
+
+impl CommandRunner for RecordingRunner {
+    fn run(&self, request: CommandRequest) -> CommandFuture {
+        let seen = Arc::clone(&self.seen);
+        Box::pin(async move {
+            *seen.lock().await = Some(request.timeout);
+            Ok(CommandOutput {
+                exit_code: Some(0),
+                signal: None,
+                timed_out: false,
+                stdout: CapturedStream {
+                    content: String::new(),
+                    total_lines: 0,
+                    total_bytes: 0,
+                    truncated: false,
+                    full_output_path: None,
+                },
+                stderr: CapturedStream {
+                    content: String::new(),
+                    total_lines: 0,
+                    total_bytes: 0,
+                    truncated: false,
+                    full_output_path: None,
+                },
+                duration: Duration::from_millis(1),
+            })
+        })
+    }
 }
 
 #[test]
@@ -410,8 +446,7 @@ async fn shell_returns_normal_failures_and_spilled_output_is_numbered_by_fs_read
     let root = tempfile::tempdir().expect("temporary workspace");
     let pack = CodingPack::builder(root.path())
         .shell_config(ShellConfig {
-            default_timeout: Duration::from_secs(2),
-            max_timeout: Duration::from_secs(3),
+            default_timeout: Some(Duration::from_secs(2)),
             capture: CaptureConfig {
                 max_lines: 2,
                 max_bytes: 64,
@@ -446,20 +481,26 @@ async fn shell_returns_normal_failures_and_spilled_output_is_numbered_by_fs_read
 #[tokio::test(flavor = "current_thread")]
 async fn shell_timeout_kills_background_descendants() {
     let root = tempfile::tempdir().expect("temporary workspace");
+    let ready = root.path().join("ready.txt");
     let marker = root.path().join("orphaned.txt");
     let pack = CodingPack::builder(root.path())
         .shell_config(ShellConfig {
-            default_timeout: Duration::from_secs(1),
-            max_timeout: Duration::from_secs(2),
+            default_timeout: None,
             capture: CaptureConfig::default(),
         })
         .shell(LocalCommandRunner::default())
         .build()
         .expect("shell pack");
     let mut isolate = isolate(&pack).await;
-    let command = format!("(sleep 0.3; printf orphaned > '{}') &", marker.display());
+    // Immediate readiness, delayed orphan write, long-lived foreground so an explicit
+    // mid-window timeout can fire after the child starts but before either write window ends.
+    let command = format!(
+        "(printf ready > '{}'; sleep 0.5; printf orphaned > '{}') & sleep 2",
+        ready.display(),
+        marker.display()
+    );
     let source = format!(
-        "await lam.shell.run({{ command: {}, timeoutMs: 50 }})",
+        "await lam.shell.run({{ command: {}, timeoutMs: 200 }})",
         serde_json::to_string(&command).expect("serialize command")
     );
     let result = isolate
@@ -467,8 +508,116 @@ async fn shell_timeout_kills_background_descendants() {
         .await
         .expect("timeout is a normal outcome");
     assert_eq!(json_result(result.result)["timedOut"], true);
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        ready.exists(),
+        "background descendant never became ready before timeout"
+    );
+    tokio::time::sleep(Duration::from_millis(800)).await;
     assert!(!marker.exists(), "background descendant survived timeout");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn shell_omitted_timeout_reaches_custom_runner_as_none() {
+    let root = tempfile::tempdir().expect("temporary workspace");
+    let seen = Arc::new(Mutex::new(None));
+    let pack = CodingPack::builder(root.path())
+        .shell_config(ShellConfig {
+            default_timeout: None,
+            capture: CaptureConfig::default(),
+        })
+        .shell(RecordingRunner {
+            seen: Arc::clone(&seen),
+        })
+        .build()
+        .expect("shell pack");
+    let mut isolate = isolate(&pack).await;
+    isolate
+        .eval("await lam.shell.run({ command: \"true\" })")
+        .await
+        .expect("custom runner accepts omitted timeout");
+    let timeout = *seen.lock().await;
+    assert_eq!(
+        timeout,
+        Some(None),
+        "omitted timeout must reach runner as None"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn shell_explicit_timeout_reaches_custom_runner_as_some() {
+    let root = tempfile::tempdir().expect("temporary workspace");
+    let seen = Arc::new(Mutex::new(None));
+    let pack = CodingPack::builder(root.path())
+        .shell_config(ShellConfig {
+            default_timeout: None,
+            capture: CaptureConfig::default(),
+        })
+        .shell(RecordingRunner {
+            seen: Arc::clone(&seen),
+        })
+        .build()
+        .expect("shell pack");
+    let mut isolate = isolate(&pack).await;
+    isolate
+        .eval("await lam.shell.run({ command: \"true\", timeoutMs: 1500 })")
+        .await
+        .expect("custom runner accepts explicit timeout");
+    let timeout = *seen.lock().await;
+    assert_eq!(
+        timeout,
+        Some(Some(Duration::from_millis(1500))),
+        "explicit timeout must reach runner as Some"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn shell_config_default_timeout_reaches_custom_runner_when_request_omits() {
+    let root = tempfile::tempdir().expect("temporary workspace");
+    let seen = Arc::new(Mutex::new(None));
+    let pack = CodingPack::builder(root.path())
+        .shell_config(ShellConfig {
+            default_timeout: Some(Duration::from_millis(2500)),
+            capture: CaptureConfig::default(),
+        })
+        .shell(RecordingRunner {
+            seen: Arc::clone(&seen),
+        })
+        .build()
+        .expect("shell pack");
+    let mut isolate = isolate(&pack).await;
+    isolate
+        .eval("await lam.shell.run({ command: \"true\" })")
+        .await
+        .expect("custom runner accepts pack default timeout");
+    let timeout = *seen.lock().await;
+    assert_eq!(
+        timeout,
+        Some(Some(Duration::from_millis(2500))),
+        "pack default_timeout must reach runner when request omits timeoutMs"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn shell_omitted_timeout_can_exceed_former_default() {
+    let root = tempfile::tempdir().expect("temporary workspace");
+    let pack = CodingPack::builder(root.path())
+        .shell_config(ShellConfig {
+            default_timeout: None,
+            capture: CaptureConfig::default(),
+        })
+        .shell(LocalCommandRunner::default())
+        .build()
+        .expect("shell pack");
+    let mut isolate = isolate(&pack).await;
+    // Former default was 20s; sleeping past a short bound must still finish normally.
+    let result = isolate
+        .eval("await lam.shell.run({ command: \"sleep 0.05\" })")
+        .await
+        .expect("omitted timeout waits without a shell deadline");
+    let result = json_result(result.result);
+    assert_eq!(result["timedOut"], false);
+    assert_eq!(result["exitCode"], 0);
 }
 
 #[tokio::test(flavor = "current_thread")]
