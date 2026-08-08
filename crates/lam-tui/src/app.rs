@@ -10,7 +10,7 @@ use lam::{ModelDelta, RunEvent, RunId, RuntimeEvent, ToolCallDelta};
 use lam_agents::{AgentOutcome, AgentSystemEvent, StopReason};
 use ratatui::layout::Rect;
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthStr;
 
 use crate::config::ModelChoice;
 use crate::runtime::{
@@ -158,6 +158,12 @@ pub(crate) struct InputBuffer {
     pub(crate) text: String,
     pub(crate) cursor: usize,
     preferred_column: Option<usize>,
+    /// Last explicit visual caret `(row, column)` chosen by vertical
+    /// movement or a click. A split-word boundary is clickable at the end of
+    /// one row and the start of the next; this remembers which occurrence
+    /// the caret sits at until the cursor moves horizontally or the text is
+    /// edited.
+    caret: Option<(usize, usize)>,
 }
 
 struct InputHistory {
@@ -169,6 +175,11 @@ struct InputHistory {
 struct InputLayout {
     rows: Vec<String>,
     cursor_positions: Vec<(usize, usize)>,
+    /// Per-row clickable source boundaries: `(boundary, display column)`.
+    /// A boundary shared by a long-word split appears in both adjacent rows
+    /// so clicks at the end of one row and the start of the next both
+    /// select it.
+    row_hits: Vec<Vec<(usize, usize)>>,
 }
 
 /// A cell position in the conversation viewport: a layout row and column
@@ -300,6 +311,9 @@ pub(crate) struct App {
     pub(crate) focus: Focus,
     pub(crate) input: InputBuffer,
     pub(crate) input_width: usize,
+    /// Rows hidden above the visible input window when the draft is taller
+    /// than the shelf; set each frame and used to map mouse rows.
+    pub(crate) input_scroll: usize,
     /// Terminal geometry of the input box from the last rendered frame, so
     /// mouse clicks can be mapped back to character positions.
     pub(crate) input_area: Option<Rect>,
@@ -475,6 +489,7 @@ impl App {
             focus: Focus::Input,
             input: InputBuffer::default(),
             input_width: 80,
+            input_scroll: 0,
             input_area: None,
             entries,
             selected_entry,
@@ -985,23 +1000,19 @@ impl App {
                 None
             }
             KeyCode::Left => {
-                self.input.cursor = self.input.cursor.saturating_sub(1);
-                self.input.preferred_column = None;
+                self.input.move_left();
                 None
             }
             KeyCode::Right => {
-                self.input.cursor = (self.input.cursor + 1).min(self.input.char_count());
-                self.input.preferred_column = None;
+                self.input.move_right();
                 None
             }
             KeyCode::Home => {
-                self.input.cursor = 0;
-                self.input.preferred_column = None;
+                self.input.move_to_start();
                 None
             }
             KeyCode::End => {
-                self.input.cursor = self.input.char_count();
-                self.input.preferred_column = None;
+                self.input.move_to_end();
                 None
             }
             KeyCode::Backspace => {
@@ -1320,6 +1331,7 @@ impl App {
                     self.text_selection = None;
                     self.focus = Focus::Input;
                     let row = usize::from(mouse.row - area.y);
+                    let row = row.saturating_add(self.input_scroll);
                     let column = usize::from(mouse.column - area.x).saturating_sub(3);
                     self.input.cursor = self.input.cursor_at(self.input_width, row, column);
                     self.input.preferred_column = None;
@@ -2786,12 +2798,13 @@ fn partial_json_string(arguments: &str, start: usize) -> Option<StreamedIntent> 
 }
 
 impl InputBuffer {
-    fn at_end(text: String) -> Self {
+    pub(crate) fn at_end(text: String) -> Self {
         let cursor = text.chars().count();
         Self {
             text,
             cursor,
             preferred_column: None,
+            caret: None,
         }
     }
 
@@ -2805,13 +2818,97 @@ impl InputBuffer {
 
     pub(crate) fn cursor_position(&self, width: usize) -> (usize, usize) {
         let layout = self.layout(width);
-        layout.cursor_positions[self.cursor.min(self.char_count())]
+        let cursor = self.cursor.min(self.char_count());
+        if let Some((row, column)) = self.caret
+            && row < layout.row_hits.len()
+            && layout.row_hits[row].contains(&(cursor, column))
+        {
+            return (row, column);
+        }
+        layout.cursor_positions[cursor]
+    }
+
+    /// Moves the cursor left by one extended grapheme cluster so editing
+    /// never lands inside an emoji sequence or a combining mark.
+    fn move_left(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let byte = byte_index(&self.text, self.cursor);
+        let last = self.text[..byte]
+            .graphemes(true)
+            .next_back()
+            .map_or(0, |grapheme| grapheme.chars().count());
+        self.cursor -= last;
+        self.preferred_column = None;
+        self.caret = None;
+    }
+
+    /// Moves the cursor right by one extended grapheme cluster.
+    fn move_right(&mut self) {
+        if self.cursor == self.char_count() {
+            return;
+        }
+        let byte = byte_index(&self.text, self.cursor);
+        let first = self.text[byte..]
+            .graphemes(true)
+            .next()
+            .map_or(0, |grapheme| grapheme.chars().count());
+        self.cursor += first;
+        self.preferred_column = None;
+        self.caret = None;
+    }
+
+    /// Moves the cursor to the start of the input (Home).
+    fn move_to_start(&mut self) {
+        self.cursor = 0;
+        self.preferred_column = None;
+        self.caret = None;
+    }
+
+    /// Moves the cursor to the end of the input (End).
+    fn move_to_end(&mut self) {
+        self.cursor = self.char_count();
+        self.preferred_column = None;
+        self.caret = None;
+    }
+
+    /// Snaps the cursor to a grapheme boundary of the current text. Edits can
+    /// join or split clusters around the cursor (typing a base character
+    /// before a pasted combining mark, deleting a separator); this prefers
+    /// the end of the cluster containing the cursor so subsequent editing
+    /// continues after a composed character instead of between its scalars.
+    fn normalize_cursor(&mut self) {
+        let byte = byte_index(&self.text, self.cursor);
+        let mut cluster_start = 0usize;
+        for (start, _) in self.text.grapheme_indices(true) {
+            if start > byte {
+                break;
+            }
+            cluster_start = start;
+        }
+        if cluster_start == byte {
+            return;
+        }
+        let cluster = self.text[cluster_start..]
+            .graphemes(true)
+            .next()
+            .unwrap_or_default();
+        let cluster_end = cluster_start + cluster.len();
+        self.cursor = self.text[..cluster_end].chars().count();
     }
 
     fn move_vertical(&mut self, direction: isize, width: usize) -> bool {
         let layout = self.layout(width);
         let cursor = self.cursor.min(self.char_count());
-        let (row, column) = layout.cursor_positions[cursor];
+        let (row, column) = if let Some((row, column)) = self.caret
+            && row < layout.row_hits.len()
+            && layout.row_hits[row].contains(&(cursor, column))
+        {
+            (row, column)
+        } else {
+            layout.cursor_positions[cursor]
+        };
         let target_row = if direction < 0 {
             let Some(row) = row.checked_sub(1) else {
                 return false;
@@ -2824,50 +2921,130 @@ impl InputBuffer {
             row + 1
         };
         let preferred = self.preferred_column.unwrap_or(column);
-        let Some((target, _)) = layout
-            .cursor_positions
+        let Some((target, target_column)) = layout.row_hits[target_row]
             .iter()
-            .enumerate()
-            .filter(|(_, (candidate_row, _))| *candidate_row == target_row)
-            .min_by_key(|(index, (_, candidate_column))| {
-                (candidate_column.abs_diff(preferred), usize::MAX - *index)
+            .min_by_key(|(boundary, candidate_column)| {
+                (candidate_column.abs_diff(preferred), usize::MAX - *boundary)
             })
+            .copied()
         else {
             return false;
         };
         self.cursor = target;
         self.preferred_column = Some(preferred);
+        self.caret = Some((target_row, target_column));
         true
     }
 
+    /// Lays the input text out into display rows, one canonical cursor
+    /// position per source boundary, and per-row click hits. Soft wraps move
+    /// before a word whenever the word fits the full width; a word wider
+    /// than the width is split with two-space-indented continuation rows.
+    /// Whitespace dropped at a soft wrap maps every hidden boundary to the
+    /// next row's content start.
     fn layout(&self, width: usize) -> InputLayout {
         let width = width.max(1);
-        let mut rows = vec![String::new()];
-        let mut cursor_positions = Vec::with_capacity(self.char_count() + 1);
-        let mut row = 0;
-        let mut column = 0;
-        cursor_positions.push((row, column));
-        for character in self.text.chars() {
-            if character == '\n' {
-                rows.push(String::new());
-                row += 1;
-                column = 0;
-                cursor_positions.push((row, column));
-                continue;
+        let characters: Vec<char> = self.text.chars().collect();
+        let mut rows = Vec::new();
+        let mut cursor_positions: Vec<Option<(usize, usize)>> = vec![None; self.char_count() + 1];
+        let mut row_hits: Vec<Vec<(usize, usize)>> = Vec::new();
+
+        let mut segment_start = 0;
+        loop {
+            let segment_end = characters[segment_start..]
+                .iter()
+                .position(|character| *character == '\n')
+                .map_or(characters.len(), |offset| segment_start + offset);
+            // Grapheme clusters of this logical line, with their character
+            // ranges, so atomic clusters are never torn by a wrap.
+            let segment_text: String = characters[segment_start..segment_end].iter().collect();
+            let mut graphemes: Vec<(String, usize, usize)> = Vec::new();
+            let mut grapheme_start = segment_start;
+            for grapheme in segment_text.graphemes(true) {
+                let grapheme_end = grapheme_start + grapheme.chars().count();
+                graphemes.push((grapheme.to_owned(), grapheme_start, grapheme_end));
+                grapheme_start = grapheme_end;
             }
-            let character_width = character.width().unwrap_or(0);
-            if column > 0 && column + character_width > width {
-                rows.push(String::new());
-                row += 1;
-                column = 0;
+            let wrapped = crate::text_wrap::wrap_items(
+                &graphemes,
+                width,
+                |(grapheme, _, _)| grapheme.as_str(),
+                |(grapheme, _, _)| {
+                    crate::text_wrap::is_breakable_whitespace(
+                        grapheme.chars().next().unwrap_or('\0'),
+                    )
+                },
+            );
+            for (local_index, wrap_row) in wrapped.iter().enumerate() {
+                let row_index = rows.len();
+                if graphemes.is_empty() {
+                    // Empty logical line: one empty row at the segment start.
+                    rows.push(String::new());
+                    row_hits.push(vec![(segment_start, 0)]);
+                    cursor_positions[segment_start] = Some((row_index, 0));
+                    continue;
+                }
+                let global_start = graphemes[wrap_row.start].1;
+                let global_end = graphemes[wrap_row.end - 1].2;
+                let mut row_string =
+                    String::with_capacity(wrap_row.indent + global_end - global_start);
+                row_string.push_str(&" ".repeat(wrap_row.indent));
+                let mut column = wrap_row.indent;
+                let mut hits = Vec::new();
+                hits.push((global_start, column));
+                cursor_positions[global_start] = Some((row_index, column));
+                for (grapheme, grapheme_start, grapheme_end) in
+                    &graphemes[wrap_row.start..wrap_row.end]
+                {
+                    let grapheme_width = UnicodeWidthStr::width(grapheme.as_str());
+                    row_string.push_str(grapheme);
+                    // Boundaries inside the cluster share its end column so
+                    // clicks never land inside an atomic cluster.
+                    let end_column = column + grapheme_width;
+                    for (boundary, position) in cursor_positions
+                        .iter_mut()
+                        .enumerate()
+                        .take(*grapheme_end + 1)
+                        .skip(grapheme_start + 1)
+                    {
+                        *position = Some((row_index, end_column));
+                        hits.push((boundary, end_column));
+                    }
+                    column = end_column;
+                }
+                rows.push(row_string);
+                row_hits.push(hits);
+                // Whitespace dropped at a soft wrap is invisible; every
+                // hidden boundary maps to the next row's content start.
+                if let Some(next) = wrapped.get(local_index + 1)
+                    && graphemes[wrap_row.end - 1].2 < graphemes[next.start].1
+                {
+                    let hidden_start = graphemes[wrap_row.end - 1].2 + 1;
+                    let hidden_end = graphemes[next.start].1;
+                    for position in cursor_positions
+                        .iter_mut()
+                        .take(hidden_end)
+                        .skip(hidden_start)
+                    {
+                        *position = Some((row_index + 1, next.indent));
+                    }
+                }
             }
-            rows[row].push(character);
-            column += character_width;
-            cursor_positions.push((row, column));
+            if segment_end < characters.len() {
+                segment_start = segment_end + 1;
+            } else {
+                break;
+            }
         }
+
+        let cursor_positions = cursor_positions
+            .into_iter()
+            .map(|position| position.unwrap_or((0, 0)))
+            .collect();
         InputLayout {
             rows,
             cursor_positions,
+            row_hits,
         }
     }
 
@@ -2876,6 +3053,8 @@ impl InputBuffer {
         self.text.insert(byte, character);
         self.cursor += 1;
         self.preferred_column = None;
+        self.caret = None;
+        self.normalize_cursor();
     }
 
     fn insert_text(&mut self, text: &str) {
@@ -2883,27 +3062,42 @@ impl InputBuffer {
         self.text.insert_str(byte, text);
         self.cursor += text.chars().count();
         self.preferred_column = None;
+        self.caret = None;
+        self.normalize_cursor();
     }
 
     fn backspace(&mut self) {
         if self.cursor == 0 {
             return;
         }
-        let start = byte_index(&self.text, self.cursor - 1);
+        let byte = byte_index(&self.text, self.cursor);
+        let count = self.text[..byte]
+            .graphemes(true)
+            .next_back()
+            .map_or(0, |grapheme| grapheme.chars().count());
+        let start = byte_index(&self.text, self.cursor - count);
         let end = byte_index(&self.text, self.cursor);
         self.text.replace_range(start..end, "");
-        self.cursor -= 1;
+        self.cursor -= count;
         self.preferred_column = None;
+        self.caret = None;
+        self.normalize_cursor();
     }
 
     fn delete(&mut self) {
         if self.cursor == self.char_count() {
             return;
         }
-        let start = byte_index(&self.text, self.cursor);
-        let end = byte_index(&self.text, self.cursor + 1);
-        self.text.replace_range(start..end, "");
+        let byte = byte_index(&self.text, self.cursor);
+        let count = self.text[byte..]
+            .graphemes(true)
+            .next()
+            .map_or(0, |grapheme| grapheme.chars().count());
+        let end = byte_index(&self.text, self.cursor + count);
+        self.text.replace_range(byte..end, "");
         self.preferred_column = None;
+        self.caret = None;
+        self.normalize_cursor();
     }
 
     /// Character index of the start of the logical line containing the cursor.
@@ -2927,12 +3121,14 @@ impl InputBuffer {
     fn move_to_line_start(&mut self) {
         self.cursor = self.line_start();
         self.preferred_column = None;
+        self.caret = None;
     }
 
     /// Moves the cursor to the end of its logical line (Ctrl-E).
     fn move_to_line_end(&mut self) {
         self.cursor = self.line_end();
         self.preferred_column = None;
+        self.caret = None;
     }
 
     /// Removes the whitespace-delimited word immediately before the cursor
@@ -2950,26 +3146,31 @@ impl InputBuffer {
         self.text.replace_range(start..byte, "");
         self.cursor = self.text[..start].chars().count();
         self.preferred_column = None;
+        self.caret = None;
+        self.normalize_cursor();
     }
 
     /// Character index of the cursor position nearest the clicked visual
     /// (row, column) within the wrapped layout. Rows below the text place the
     /// cursor at the end of the input.
-    pub(crate) fn cursor_at(&self, width: usize, row: usize, column: usize) -> usize {
+    pub(crate) fn cursor_at(&mut self, width: usize, row: usize, column: usize) -> usize {
         let layout = self.layout(width);
         if row >= layout.rows.len() {
             return self.char_count();
         }
-        layout
-            .cursor_positions
+        let hits = &layout.row_hits[row];
+        let chosen = match hits
             .iter()
-            .enumerate()
-            .filter(|(_, (candidate_row, _))| *candidate_row == row)
-            .max_by_key(|(_, (_, candidate_column))| {
-                (*candidate_column <= column, *candidate_column)
-            })
-            .map(|(index, _)| index)
-            .unwrap_or(0)
+            .filter(|(_, hit_column)| *hit_column <= column)
+            .max_by_key(|(boundary, hit_column)| (*hit_column, *boundary))
+        {
+            Some((boundary, hit_column)) => (*boundary, *hit_column),
+            None => hits
+                .first()
+                .map_or((0, 0), |(boundary, hit_column)| (*boundary, *hit_column)),
+        };
+        self.caret = Some((row, chosen.1));
+        chosen.0
     }
 }
 
@@ -2989,7 +3190,12 @@ mod tests {
         TokenUsage, ToolCallDelta,
     };
     use lam_agents::{ActorAddress, AgentOutcome, AgentSystemEvent};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
     use ratatui::layout::Rect;
+    use std::time::{Duration, Instant};
+
+    use crate::ui::render;
 
     use super::{
         App, CellPos, CopyRow, EntryKind, Focus, Hitbox, InputBuffer, MODEL_PICKER_HINT,
@@ -3147,6 +3353,7 @@ mod tests {
             text: "aλ".to_owned(),
             cursor: 2,
             preferred_column: None,
+            caret: None,
         };
         input.backspace();
         input.insert('界');
@@ -3156,7 +3363,7 @@ mod tests {
 
     #[test]
     fn cursor_at_maps_clicked_columns_to_character_positions() {
-        let input = InputBuffer::at_end("ab界d".to_owned());
+        let mut input = InputBuffer::at_end("ab界d".to_owned());
         assert_eq!(input.cursor_at(10, 0, 0), 0);
         assert_eq!(
             input.cursor_at(10, 0, 1),
@@ -3188,7 +3395,7 @@ mod tests {
 
     #[test]
     fn cursor_at_maps_multiline_and_wrapped_rows() {
-        let input = InputBuffer::at_end("first\nsecond".to_owned());
+        let mut input = InputBuffer::at_end("first\nsecond".to_owned());
         assert_eq!(input.cursor_at(10, 0, 2), 2);
         assert_eq!(input.cursor_at(10, 0, 99), 5, "end of the first line");
         assert_eq!(input.cursor_at(10, 1, 0), 6, "start of the second line");
@@ -4274,11 +4481,11 @@ mod tests {
             ),
         );
         app.input_width = 4;
-        app.input = InputBuffer::at_end("abcdef".to_owned());
+        app.input = InputBuffer::at_end("abc def".to_owned());
 
         app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-        assert_eq!(app.input.text, "abcdef");
-        assert_eq!(app.input.cursor, 2, "cursor should move to the row above");
+        assert_eq!(app.input.text, "abc def");
+        assert_eq!(app.input.cursor, 3, "cursor should move to the row above");
 
         app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         assert_eq!(app.input.text, "two");
@@ -4287,9 +4494,9 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(app.input.text, "two");
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-        assert_eq!(app.input.text, "abcdef");
+        assert_eq!(app.input.text, "abc def");
         assert_eq!(
-            app.input.cursor, 2,
+            app.input.cursor, 3,
             "history should restore the draft cursor"
         );
     }
@@ -4302,6 +4509,316 @@ mod tests {
         assert_eq!(input.cursor, 2);
         assert!(input.move_vertical(1, 20));
         assert_eq!(input.cursor, input.char_count());
+    }
+
+    #[test]
+    fn input_layout_wraps_words_and_indents_overwide_words() {
+        let input = InputBuffer::at_end("abcdef".to_owned());
+        let layout = input.layout(4);
+        assert_eq!(layout.rows, ["abcd", "  ef"]);
+        assert_eq!(
+            layout.cursor_positions,
+            [(0, 0), (0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (1, 4)]
+        );
+        assert_eq!(layout.cursor_positions.len(), input.char_count() + 1);
+    }
+
+    #[test]
+    fn input_layout_maps_dropped_whitespace_to_the_next_row() {
+        let input = InputBuffer::at_end("abc  de".to_owned());
+        let layout = input.layout(4);
+        assert_eq!(layout.rows, ["abc", "de"]);
+        assert_eq!(
+            layout.cursor_positions,
+            [
+                (0, 0),
+                (0, 1),
+                (0, 2),
+                (0, 3),
+                (1, 0),
+                (1, 0),
+                (1, 1),
+                (1, 2)
+            ]
+        );
+    }
+
+    #[test]
+    fn input_layout_keeps_hard_newlines_as_row_boundaries() {
+        let input = InputBuffer::at_end("abcdef\nxy".to_owned());
+        let layout = input.layout(4);
+        assert_eq!(layout.rows, ["abcd", "  ef", "xy"]);
+        assert_eq!(
+            layout.cursor_positions[6],
+            (1, 4),
+            "the boundary before the newline stays at the prior row end"
+        );
+        assert_eq!(
+            layout.cursor_positions[7],
+            (2, 0),
+            "the boundary after the newline starts the next row"
+        );
+    }
+
+    #[test]
+    fn input_layout_places_zero_width_characters_at_the_same_column() {
+        let input = InputBuffer::at_end("e\u{301}x".to_owned());
+        let layout = input.layout(10);
+        assert_eq!(layout.cursor_positions, [(0, 0), (0, 1), (0, 1), (0, 2)]);
+    }
+
+    #[test]
+    fn cursor_at_selects_the_shared_boundary_of_a_split_word() {
+        let mut input = InputBuffer::at_end("abcdef".to_owned());
+        assert_eq!(input.cursor_at(4, 1, 0), 4);
+        assert_eq!(input.cursor_at(4, 1, 1), 4);
+        assert_eq!(input.cursor_at(4, 1, 2), 4);
+        assert_eq!(input.cursor_at(4, 1, 3), 5);
+        assert_eq!(input.cursor_at(4, 1, 99), 6);
+        assert_eq!(
+            input.cursor_at(4, 0, 99),
+            4,
+            "clicking past the first row selects the shared split boundary"
+        );
+    }
+
+    #[test]
+    fn cursor_at_prefers_the_boundary_after_dropped_whitespace() {
+        let mut input = InputBuffer::at_end("abc  de".to_owned());
+        assert_eq!(input.cursor_at(4, 1, 0), 5);
+    }
+
+    #[test]
+    fn input_layout_treats_emoji_clusters_as_atomic() {
+        let input = InputBuffer::at_end("👩‍💻x".to_owned());
+        let layout = input.layout(3);
+        assert_eq!(layout.rows, ["👩‍💻x"]);
+        assert_eq!(
+            layout.cursor_positions,
+            [(0, 0), (0, 2), (0, 2), (0, 2), (0, 3)]
+        );
+        assert_eq!(layout.cursor_positions.len(), input.char_count() + 1);
+    }
+
+    #[test]
+    fn vertical_navigation_prefers_the_shared_split_boundary() {
+        let mut input = InputBuffer::at_end("abcdef".to_owned());
+        input.cursor = input.char_count();
+        assert!(input.move_vertical(-1, 4));
+        assert_eq!(input.cursor, 4, "up lands after the first chunk");
+        assert_eq!(
+            input.cursor_position(4),
+            (0, 4),
+            "the caret stays on the first row"
+        );
+        input.insert('X');
+        assert_eq!(input.text, "abcdXef", "typing continues the first chunk");
+    }
+
+    #[test]
+    fn vertical_navigation_down_restores_the_end_after_up() {
+        let mut input = InputBuffer::at_end("abcdef".to_owned());
+        input.cursor = input.char_count();
+        assert!(input.move_vertical(-1, 4));
+        assert!(input.move_vertical(1, 4));
+        assert_eq!(input.cursor, 6, "down returns to the end of the input");
+        assert_eq!(input.cursor_position(4), (1, 4));
+    }
+
+    #[test]
+    fn clicking_the_first_row_end_selects_the_split_boundary() {
+        let mut input = InputBuffer::at_end("abcdef".to_owned());
+        input.cursor = input.cursor_at(4, 0, 99);
+        assert_eq!(input.cursor, 4);
+        assert_eq!(
+            input.cursor_position(4),
+            (0, 4),
+            "the caret follows the click"
+        );
+    }
+
+    #[test]
+    fn horizontal_movement_clears_the_split_boundary_affinity() {
+        let mut input = InputBuffer::at_end("abcdef".to_owned());
+        input.cursor = input.cursor_at(4, 0, 99);
+        assert_eq!(input.cursor, 4);
+        input.move_right();
+        assert_eq!(input.cursor, 5);
+        input.move_left();
+        assert_eq!(input.cursor, 4);
+        assert_eq!(
+            input.cursor_position(4),
+            (1, 2),
+            "the stale row-0 affinity must not revive after horizontal movement"
+        );
+    }
+
+    #[test]
+    fn horizontal_movement_and_deletion_are_grapheme_aware() {
+        let mut input = InputBuffer::at_end("👩‍💻x".to_owned());
+        input.move_left();
+        assert_eq!(input.cursor, 3, "left from the end lands before x");
+        input.move_left();
+        assert_eq!(input.cursor, 0, "left again lands before the whole emoji");
+
+        let mut input = InputBuffer::at_end("a👩‍💻b".to_owned());
+        input.cursor = input.char_count();
+        input.backspace();
+        assert_eq!(input.text, "a👩‍💻");
+        input.backspace();
+        assert_eq!(input.text, "a");
+
+        let mut input = InputBuffer::at_end("a👩‍💻b".to_owned());
+        input.cursor = 1;
+        input.delete();
+        assert_eq!(input.text, "ab");
+    }
+
+    #[test]
+    fn backspace_does_not_tear_combining_marks() {
+        let mut input = InputBuffer::at_end("e\u{301}x".to_owned());
+        input.cursor = 2;
+        input.backspace();
+        assert_eq!(input.text, "x");
+    }
+
+    #[test]
+    fn inserting_a_base_character_before_a_combining_mark_stays_on_boundaries() {
+        let mut input = InputBuffer::at_end("\u{301}".to_owned());
+        input.cursor = 0;
+        input.insert('e');
+        assert_eq!(input.text, "e\u{301}");
+        assert_eq!(
+            input.cursor, 2,
+            "the cursor lands after the composed grapheme"
+        );
+        input.backspace();
+        assert_eq!(
+            input.text, "",
+            "backspace removes the whole composed grapheme"
+        );
+    }
+
+    #[test]
+    fn deleting_a_separator_that_joins_graphemes_normalizes_the_cursor() {
+        let mut input = InputBuffer::at_end("e \u{301}x".to_owned());
+        input.cursor = 2;
+        input.backspace();
+        assert_eq!(input.text, "e\u{301}x");
+        assert_eq!(
+            input.cursor, 2,
+            "the cursor lands after the joined grapheme"
+        );
+    }
+
+    #[test]
+    fn shelf_reserves_a_row_for_the_interruption_warning() {
+        let mut app = app();
+        app.input = InputBuffer::at_end(
+            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789".to_owned(),
+        );
+        app.interruption_deadline = Some(Instant::now() + Duration::from_secs(1));
+        let backend = TestBackend::new(24, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let content: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(
+            content.contains("Press Esc again"),
+            "the interruption warning must stay visible"
+        );
+        assert!(
+            app.input_scroll > 0,
+            "the tall draft scrolls beneath the warning"
+        );
+    }
+
+    #[test]
+    fn selected_text_strips_synthetic_continuation_indent_via_pad() {
+        let rows = vec![
+            CopyRow {
+                pad: 0,
+                text: "abcdefghijklmn".to_owned(),
+            },
+            CopyRow {
+                pad: 7,
+                text: "       op".to_owned(),
+            },
+        ];
+        assert_eq!(
+            selected_text(
+                &rows,
+                CellPos { row: 0, col: 0 },
+                CellPos { row: 1, col: 99 },
+            ),
+            "abcdefghijklmn\nop"
+        );
+    }
+
+    #[test]
+    fn vertical_navigation_crosses_indented_rows_and_hard_lines() {
+        let mut input = InputBuffer::at_end("abcdef\nxy".to_owned());
+        input.cursor = input.char_count();
+        assert!(input.move_vertical(-1, 4));
+        assert_eq!(
+            input.cursor, 4,
+            "up from the last row lands on the indented continuation"
+        );
+        assert!(input.move_vertical(-1, 4));
+        assert_eq!(input.cursor, 2, "up again lands at the matching column");
+        assert!(input.move_vertical(1, 4));
+        assert_eq!(input.cursor, 4, "down returns to the continuation row");
+    }
+
+    #[test]
+    fn vertical_navigation_keeps_the_preferred_column_across_rows() {
+        let mut input = InputBuffer::at_end("ab cdef".to_owned());
+        input.cursor = input.char_count();
+        assert!(input.move_vertical(-1, 4));
+        assert_eq!(input.cursor, 2, "up lands at the end of the first row");
+        assert!(input.move_vertical(1, 4));
+        assert_eq!(input.cursor, 7, "down restores the preferred column");
+    }
+
+    #[test]
+    fn clicking_the_input_continuation_indent_selects_the_split_boundary() {
+        let mut app = app();
+        app.input_width = 4;
+        app.input = InputBuffer::at_end("abcdef".to_owned());
+        app.focus = Focus::Conversation;
+        app.input_area = Some(Rect {
+            x: 0,
+            y: 10,
+            width: 10,
+            height: 2,
+        });
+        for column in 3..=5 {
+            app.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row: 11,
+                modifiers: KeyModifiers::NONE,
+            });
+            assert_eq!(
+                app.input.cursor, 4,
+                "clicking the indented continuation row's cells selects the split"
+            );
+        }
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 6,
+            row: 11,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(
+            app.input.cursor, 5,
+            "the first content cell lands before 'e'"
+        );
     }
 
     #[test]

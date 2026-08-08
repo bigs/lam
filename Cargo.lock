@@ -1678,6 +1678,7 @@ dependencies = [
  "lam-openai",
  "lam-redb",
  "nix",
+ "pulldown-cmark",
  "ratatui",
  "redb",
  "reqwest",

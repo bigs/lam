@@ -1,14 +1,17 @@
+use pulldown_cmark::{Event, Parser};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use std::borrow::Cow;
 use tui_markdown::{Options as MarkdownOptions, StyleSheet, from_str_with_options};
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{
     App, CellPos, ConversationEntry, CopyRow, EntryKind, EntryLayout, Focus, Hitbox, LayoutKey,
-    NoticeKind, Suggestion, TextSelection, Toast,
+    Notice, NoticeKind, Suggestion, TextSelection, Toast,
 };
 
 const ACCENT: Color = Color::Rgb(105, 210, 190);
@@ -490,22 +493,22 @@ fn entry_lines(
         let body_width = width.saturating_sub(6).max(1);
         if renders_markdown(entry.kind) {
             let base = dim_ambient(style_fg(Color::Gray), dimmed);
-            for body_line in markdown_lines(&entry.body, body_width, base) {
+            for (body_line, indent) in markdown_lines(&entry.body, body_width, base) {
                 let mut spans = Vec::with_capacity(body_line.spans.len() + 2);
                 spans.push(selection_span.clone());
                 spans.push(Span::raw("    "));
                 spans.extend(body_line.spans);
                 lines.push(Line::from(spans));
-                pads.push(5);
+                pads.push(5 + indent);
             }
         } else {
-            for body_line in wrap_text(&entry.body, body_width) {
+            for (body_line, indent) in wrap_text_rows(&entry.body, body_width) {
                 lines.push(Line::from(vec![
                     selection_span.clone(),
                     Span::raw("    "),
                     Span::styled(body_line, dim_ambient(style_fg(Color::Gray), dimmed)),
                 ]));
-                pads.push(5);
+                pads.push(5 + indent);
             }
         }
     }
@@ -530,10 +533,55 @@ fn renders_markdown(kind: EntryKind) -> bool {
     matches!(kind, EntryKind::Assistant | EntryKind::Reasoning)
 }
 
-fn markdown_lines(markdown: &str, width: usize, base: Style) -> Vec<Line<'static>> {
+/// Renders markdown as wrapped lines plus each line's synthetic continuation
+/// indent, so callers can strip presentation indentation from copied text.
+fn markdown_lines(markdown: &str, width: usize, base: Style) -> Vec<(Line<'static>, usize)> {
     let options = MarkdownOptions::new(MarkdownStyle);
-    let text = from_str_with_options(markdown, &options);
+    let normalized = preserve_markdown_newlines(markdown);
+    let text = from_str_with_options(&normalized, &options);
     wrap_markdown_lines(text.lines, width, base)
+}
+
+/// Returns the markdown source with parser-recognized soft breaks converted
+/// to hard breaks (two trailing spaces before the newline) so prose line
+/// breaks survive rendering instead of collapsing into spaces.
+fn preserve_markdown_newlines(markdown: &str) -> Cow<'_, str> {
+    let parser = Parser::new_ext(markdown, markdown_parse_options()).into_offset_iter();
+    let mut soft_breaks = Vec::new();
+    for (event, range) in parser {
+        if matches!(event, Event::SoftBreak) {
+            soft_breaks.push(range.start);
+        }
+    }
+    if soft_breaks.is_empty() {
+        return Cow::Borrowed(markdown);
+    }
+    let mut output = String::with_capacity(markdown.len() + soft_breaks.len() * 2);
+    let mut previous = 0;
+    for offset in soft_breaks {
+        output.push_str(&markdown[previous..offset]);
+        output.push_str("  ");
+        previous = offset;
+    }
+    output.push_str(&markdown[previous..]);
+    Cow::Owned(output)
+}
+
+/// Parser flags mirroring `tui-markdown` 0.3.9 so soft-break detection sees
+/// exactly the events the renderer would.
+fn markdown_parse_options() -> pulldown_cmark::Options {
+    use pulldown_cmark::Options as MarkdownParseOptions;
+    MarkdownParseOptions::ENABLE_STRIKETHROUGH
+        | MarkdownParseOptions::ENABLE_TASKLISTS
+        | MarkdownParseOptions::ENABLE_HEADING_ATTRIBUTES
+        | MarkdownParseOptions::ENABLE_YAML_STYLE_METADATA_BLOCKS
+        | MarkdownParseOptions::ENABLE_SUPERSCRIPT
+        | MarkdownParseOptions::ENABLE_SUBSCRIPT
+        | MarkdownParseOptions::ENABLE_MATH
+        | MarkdownParseOptions::ENABLE_FOOTNOTES
+        | MarkdownParseOptions::ENABLE_DEFINITION_LIST
+        | MarkdownParseOptions::ENABLE_GFM
+        | MarkdownParseOptions::ENABLE_TABLES
 }
 
 fn markdown_preview(markdown: &str) -> String {
@@ -541,9 +589,17 @@ fn markdown_preview(markdown: &str) -> String {
     one_line(&from_str_with_options(markdown, &options).to_string())
 }
 
-fn wrap_markdown_lines(lines: Vec<Line<'_>>, width: usize, base: Style) -> Vec<Line<'static>> {
+fn wrap_markdown_lines(
+    lines: Vec<Line<'_>>,
+    width: usize,
+    base: Style,
+) -> Vec<(Line<'static>, usize)> {
     let mut output = Vec::new();
     let mut lines = lines.into_iter().peekable();
+    // Width of the innermost list/task/footnote/definition marker seen so far.
+    // A hard-break continuation line without its own prefix belongs to that
+    // item and hangs beneath its content.
+    let mut pending_hang = None;
     while let Some(line) = lines.next() {
         if line.to_string().starts_with('┌') {
             let mut table = vec![line];
@@ -558,15 +614,40 @@ fn wrap_markdown_lines(lines: Vec<Line<'_>>, width: usize, base: Style) -> Vec<L
                 .is_some_and(|bottom| bottom.to_string().starts_with('└'))
                 && let Some(wrapped) = wrap_markdown_table(table.clone(), width, base)
             {
-                output.extend(wrapped);
+                pending_hang = None;
+                output.extend(wrapped.into_iter().map(|line| (line, 0)));
                 continue;
             }
             for line in table {
-                output.extend(wrap_styled_line(line, width, base));
+                output.extend(wrap_styled_line_indented(line, width, base, 0));
             }
-        } else {
-            output.extend(wrap_styled_line(line, width, base));
+            continue;
         }
+        if line.spans.is_empty() {
+            // A blank line separates blocks; the next line is not a
+            // continuation of the previous item.
+            pending_hang = None;
+            output.extend(wrap_styled_line_indented(line, width, base, 0));
+            continue;
+        }
+        let base_indent = match leading_structural_prefix(&line) {
+            Some(StructuralPrefix::Hang {
+                width: marker_width,
+                ..
+            }) => {
+                // A marker that consumes the whole width is wrapped as
+                // ordinary content; its continuation must not hang by more
+                // than the container can hold.
+                pending_hang = (marker_width < width).then_some(marker_width);
+                0
+            }
+            Some(StructuralPrefix::Repeat { .. }) => {
+                pending_hang = None;
+                0
+            }
+            None => pending_hang.unwrap_or(0),
+        };
+        output.extend(wrap_styled_line_indented(line, width, base, base_indent));
     }
     output
 }
@@ -582,14 +663,37 @@ fn wrap_markdown_table(
     if available < desired.len() {
         return None;
     }
+    // When the renderer's column widths already fit the pane, keep the
+    // original rows so declared column alignment survives instead of being
+    // rebuilt left-aligned.
+    if desired.iter().sum::<usize>() <= available {
+        return Some(
+            table
+                .into_iter()
+                .map(|line| {
+                    let line_style = base.patch(line.style);
+                    Line::from(
+                        line.spans
+                            .into_iter()
+                            .map(|span| {
+                                Span::styled(
+                                    span.content.into_owned(),
+                                    line_style.patch(span.style),
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect(),
+        );
+    }
     let widths = constrain_column_widths(&desired, available);
     let mut output = Vec::new();
     for line in table {
         let text = line.to_string();
-        let border_style = line
-            .spans
-            .first()
-            .map_or(line.style, |span| line.style.patch(span.style));
+        let border_style = line.spans.first().map_or(base.patch(line.style), |span| {
+            base.patch(line.style).patch(span.style)
+        });
         match text.chars().next() {
             Some('┌') => output.push(table_border_line('┌', '┬', '┐', &widths, border_style)),
             Some('├') => output.push(table_border_line('├', '┼', '┤', &widths, border_style)),
@@ -659,7 +763,9 @@ fn wrap_table_row(line: Line<'_>, widths: &[usize], base: Style) -> Option<Vec<L
         .spans
         .iter()
         .find(|span| span.content.as_ref() == "│")
-        .map_or(line.style, |span| line.style.patch(span.style));
+        .map_or(base.patch(line.style), |span| {
+            base.patch(line.style).patch(span.style)
+        });
     let mut cells = Vec::new();
     let mut cell = Vec::new();
     let mut inside = false;
@@ -682,7 +788,7 @@ fn wrap_table_row(line: Line<'_>, widths: &[usize], base: Style) -> Option<Vec<L
     let cells = cells
         .into_iter()
         .zip(widths)
-        .map(|(spans, width)| wrap_styled_words(Line::from(spans), *width, base))
+        .map(|(spans, width)| wrap_styled_line(Line::from(spans), *width, base))
         .collect::<Vec<_>>();
     let height = cells.iter().map(Vec::len).max().unwrap_or(1);
     let mut rows = Vec::with_capacity(height);
@@ -727,113 +833,224 @@ fn trim_cell_spans(mut spans: Vec<Span<'static>>) -> Vec<Span<'static>> {
     spans
 }
 
-fn wrap_styled_words(line: Line<'_>, width: usize, base: Style) -> Vec<Line<'static>> {
+/// Wraps one rendered Markdown line into display rows, returning each row
+/// with its synthetic continuation indent (list-marker hang plus long-word
+/// indent). List and task-list markers stay attached to the first row;
+/// whitespace inside code-styled spans is significant and never becomes a
+/// soft-wrap point.
+fn wrap_styled_line_indented(
+    line: Line<'_>,
+    width: usize,
+    base: Style,
+    base_indent: usize,
+) -> Vec<(Line<'static>, usize)> {
     if width == 0 {
-        return vec![Line::default()];
+        return vec![(Line::default(), 0)];
     }
     let line_style = base.patch(line.style);
-    let characters = line
-        .spans
-        .into_iter()
-        .flat_map(|span| {
-            let style = line_style.patch(span.style);
-            span.content
-                .into_owned()
-                .chars()
-                .map(move |character| (character, style))
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
-    if characters.is_empty() {
-        return vec![Line::default()];
+    let mut text = String::new();
+    let mut styles = Vec::new();
+    for span in &line.spans {
+        let style = line_style.patch(span.style);
+        for character in span.content.chars() {
+            text.push(character);
+            styles.push(style);
+        }
+    }
+    if text.is_empty() {
+        return vec![(Line::default(), 0)];
+    }
+    let mut graphemes: Vec<(String, Style)> = Vec::new();
+    let mut char_index = 0usize;
+    for grapheme in text.graphemes(true) {
+        let style = styles[char_index];
+        graphemes.push((grapheme.to_owned(), style));
+        char_index += grapheme.chars().count();
     }
 
-    let mut lines = Vec::new();
-    let mut start = 0;
-    while start < characters.len() {
-        while start < characters.len() && characters[start].0.is_whitespace() {
-            start += 1;
+    // A leading structural prefix (list/task marker, blockquote `>`,
+    // footnote `[label]: `, or definition `: `) stays attached to the
+    // first row. Blockquote prefixes repeat on every row; the others
+    // hang-indent continuation rows beneath the item content. When the
+    // prefix alone consumes the whole width, the line wraps as ordinary
+    // content so rows never exceed the container.
+    let prefix = leading_structural_prefix(&line).filter(|prefix| prefix.width() < width);
+    let marker_count = prefix.map_or(0, StructuralPrefix::count);
+    let marker_width = prefix.map_or(0, StructuralPrefix::width);
+
+    let content = if marker_count > 0 {
+        &graphemes[marker_count..]
+    } else {
+        &graphemes[..]
+    };
+    let content_width = width
+        .saturating_sub(base_indent)
+        .saturating_sub(marker_width)
+        .max(1);
+    let rows = crate::text_wrap::wrap_items(
+        content,
+        content_width,
+        |(grapheme, _)| grapheme.as_str(),
+        |(grapheme, style)| {
+            crate::text_wrap::is_breakable_whitespace(grapheme.chars().next().unwrap_or('\0'))
+                && !is_code_style(*style)
+        },
+    );
+
+    let mut output = Vec::with_capacity(rows.len());
+    for (index, row) in rows.into_iter().enumerate() {
+        let mut spans = Vec::new();
+        if base_indent > 0 {
+            // A hard-break continuation of a list/task/footnote/definition
+            // item hangs beneath its content; this is content, so it is
+            // copied with the row.
+            spans.push(Span::raw(" ".repeat(base_indent)));
         }
-        if start == characters.len() {
-            break;
-        }
-        let mut end = start;
-        let mut used = 0;
-        while end < characters.len() {
-            let character_width = characters[end].0.width().unwrap_or(0);
-            if end > start && used + character_width > width {
-                break;
+        if index == 0 {
+            spans.extend(styled_graphemes(&graphemes[..marker_count]));
+        } else if marker_count > 0 {
+            match prefix {
+                Some(StructuralPrefix::Repeat { .. }) => {
+                    spans.extend(styled_graphemes(&graphemes[..marker_count]));
+                }
+                Some(StructuralPrefix::Hang { .. }) => {
+                    spans.push(Span::raw(" ".repeat(marker_width)));
+                }
+                None => {}
             }
-            used += character_width;
-            end += 1;
-            if used >= width {
-                break;
-            }
         }
-        let cut = if end < characters.len() {
-            characters[start..end]
-                .iter()
-                .rposition(|(character, _)| character.is_whitespace())
-                .map_or(end, |space| start + space)
-        } else {
-            end
-        };
-        let cut = cut.max(start + 1);
-        lines.push(styled_character_line(&characters[start..cut]));
-        start = if cut < end { cut + 1 } else { end };
+        if row.indent > 0 {
+            spans.push(Span::raw(" ".repeat(row.indent)));
+        }
+        spans.extend(styled_graphemes(&content[row.start..row.end]));
+        // Blockquote prefixes are content (repeated on every row); hanging
+        // indents are presentation padding stripped from copied text.
+        let indent = row.indent
+            + if index == 0 || matches!(prefix, Some(StructuralPrefix::Repeat { .. })) {
+                0
+            } else {
+                marker_width
+            };
+        output.push((Line::from(spans), indent));
     }
-    if lines.is_empty() {
-        lines.push(Line::default());
-    }
-    lines
+    output
 }
 
-fn styled_character_line(characters: &[(char, Style)]) -> Line<'static> {
+/// Wraps one rendered Markdown line, discarding the synthetic indent
+/// (used by table cells, where indentation lives inside the cell).
+fn wrap_styled_line(line: Line<'_>, width: usize, base: Style) -> Vec<Line<'static>> {
+    wrap_styled_line_indented(line, width, base, 0)
+        .into_iter()
+        .map(|(line, _)| line)
+        .collect()
+}
+
+/// A leading structural prefix of a rendered Markdown line.
+#[derive(Clone, Copy)]
+enum StructuralPrefix {
+    /// Blockquote `>` prefix: repeated on every wrapped row.
+    Repeat { width: usize, count: usize },
+    /// List/task/footnote/definition marker: appears once; continuation rows
+    /// hang-indent with spaces.
+    Hang { width: usize, count: usize },
+}
+
+impl StructuralPrefix {
+    fn width(self) -> usize {
+        match self {
+            StructuralPrefix::Repeat { width, .. } | StructuralPrefix::Hang { width, .. } => width,
+        }
+    }
+
+    fn count(self) -> usize {
+        match self {
+            StructuralPrefix::Repeat { count, .. } | StructuralPrefix::Hang { count, .. } => count,
+        }
+    }
+}
+
+/// Detects a leading structural prefix (`> `, `- `, `* `, `+ `, `1. `,
+/// `- [x] `, `1. [ ] `, `[label]: `, `: `) on a rendered Markdown line,
+/// returning its display width and grapheme count.
+fn leading_structural_prefix(line: &Line<'_>) -> Option<StructuralPrefix> {
+    // Blockquote: one or more `>` spans; tui-markdown adds a space before
+    // the quoted content.
+    let quotes = line
+        .spans
+        .iter()
+        .take_while(|span| span.content.as_ref() == ">")
+        .count();
+    if quotes > 0 {
+        let width = quotes + 1;
+        return Some(StructuralPrefix::Repeat {
+            width,
+            count: width,
+        });
+    }
+
+    let first = line.spans.first()?.content.as_ref();
+    let trimmed = first.trim_start();
+    if !trimmed.ends_with(' ') {
+        return None;
+    }
+    let marker = trimmed.trim_end_matches(' ').trim_start();
+    let is_bullet = matches!(marker, "-" | "*" | "+");
+    let is_ordered = marker
+        .strip_suffix('.')
+        .is_some_and(|digits| !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()));
+    let is_task = marker
+        .strip_prefix("- [")
+        .and_then(|state| state.strip_suffix(']'))
+        .is_some_and(|state| matches!(state, "x" | " "));
+    let is_footnote = marker
+        .strip_prefix('[')
+        .and_then(|label| label.strip_suffix("]:"))
+        .is_some_and(|label| !label.is_empty());
+    let is_definition = marker == ":";
+    if !is_bullet && !is_ordered && !is_task && !is_footnote && !is_definition {
+        return None;
+    }
+    let mut width = UnicodeWidthStr::width(first);
+    let mut count = first.graphemes(true).count();
+    // An ordered marker may be followed by a separate task span ("1. " + "[x] ").
+    if is_ordered
+        && let Some(second) = line.spans.get(1)
+        && is_task_marker(second.content.as_ref())
+    {
+        width += UnicodeWidthStr::width(second.content.as_ref());
+        count += second.content.graphemes(true).count();
+    }
+    Some(StructuralPrefix::Hang { width, count })
+}
+
+/// Whether a span is a task-list checkbox marker (`[x] ` / `[ ] `).
+fn is_task_marker(span: &str) -> bool {
+    span.trim_start()
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix("] "))
+        .is_some_and(|state| matches!(state, "x" | " "))
+}
+
+/// Whether a style belongs to code (`MarkdownStyle::code`), whose
+/// whitespace is significant and must not be dropped at a soft wrap.
+fn is_code_style(style: Style) -> bool {
+    style.bg == Some(PANEL)
+}
+
+/// Rebuilds styled spans from `(grapheme, style)` items, coalescing
+/// adjacent items that share a style.
+fn styled_graphemes(items: &[(String, Style)]) -> Vec<Span<'static>> {
     let mut spans: Vec<Span<'static>> = Vec::new();
-    for (character, style) in characters {
+    for (grapheme, style) in items {
         if let Some(span) = spans.last_mut()
             && span.style == *style
         {
-            span.content.to_mut().push(*character);
+            span.content.to_mut().push_str(grapheme);
         } else {
-            spans.push(Span::styled(character.to_string(), *style));
+            spans.push(Span::styled(grapheme.clone(), *style));
         }
     }
-    Line::from(spans)
-}
-
-fn wrap_styled_line(line: Line<'_>, width: usize, base: Style) -> Vec<Line<'static>> {
-    if width == 0 {
-        return vec![Line::default()];
-    }
-
-    let line_style = base.patch(line.style);
-    let mut wrapped = Vec::new();
-    let mut spans = Vec::new();
-    let mut line_width = 0;
-
-    for span in line.spans {
-        let style = line_style.patch(span.style);
-        let mut fragment = String::new();
-        for character in span.content.chars() {
-            let character_width = character.width().unwrap_or(0);
-            if line_width > 0 && line_width + character_width > width {
-                if !fragment.is_empty() {
-                    spans.push(Span::styled(std::mem::take(&mut fragment), style));
-                }
-                wrapped.push(Line::from(std::mem::take(&mut spans)));
-                line_width = 0;
-            }
-            fragment.push(character);
-            line_width += character_width;
-        }
-        if !fragment.is_empty() {
-            spans.push(Span::styled(fragment, style));
-        }
-    }
-
-    wrapped.push(Line::from(spans));
-    wrapped
+    spans
 }
 
 fn render_shelf(frame: &mut Frame<'_>, area: Rect, app: &mut App, suggestions: &[Suggestion]) {
@@ -868,17 +1085,32 @@ fn render_shelf(frame: &mut Frame<'_>, area: Rect, app: &mut App, suggestions: &
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let input_width = usize::from(inner.width.saturating_sub(4).max(1));
+    let input_width = input_text_width(inner.width);
     app.input_width = input_width;
     let input_rows = app.input.rows(input_width);
 
-    // Allocate by priority: the input keeps every row it needs, then the
-    // notice, then pending steers, then the non-agents suggestion palette.
-    // The agents drawer lives above this shelf and never steals palette rows.
+    // Allocate by priority: a pending destructive confirmation must stay
+    // visible even when the draft is taller than the shelf (the input
+    // viewport scrolls), then the input, then other notices, then steers,
+    // then the non-agents suggestion palette. The agents drawer lives above
+    // this shelf and never steals palette rows.
     let inner_height = usize::from(inner.height);
-    let input_height = input_rows.len().clamp(1, inner_height.max(1));
-    let remaining = inner_height.saturating_sub(input_height);
-    let notice_height = usize::from(app.notice().is_some()).min(remaining);
+    let warning_height = usize::from(matches!(
+        app.notice(),
+        Some(Notice {
+            kind: NoticeKind::Warning,
+            ..
+        })
+    ))
+    .min(inner_height);
+    let remaining = inner_height.saturating_sub(warning_height);
+    let input_height = input_rows.len().clamp(1, remaining.max(1));
+    let remaining = remaining.saturating_sub(input_height);
+    let notice_height = if warning_height > 0 {
+        warning_height
+    } else {
+        usize::from(app.notice().is_some()).min(remaining)
+    };
     let remaining = remaining.saturating_sub(notice_height);
     let steer_height = app
         .pending_steers
@@ -921,13 +1153,35 @@ fn render_shelf(frame: &mut Frame<'_>, area: Rect, app: &mut App, suggestions: &
         frame.render_widget(Paragraph::new(line), notice_area);
     }
 
+    // When the draft is taller than the shelf, scroll the input so the
+    // caret row stays visible; mouse rows map back through the same offset.
+    let caret_row = if app.focus == Focus::Input {
+        app.input.cursor_position(input_width).0
+    } else {
+        0
+    };
+    let input_scroll = if input_rows.len() > input_height {
+        caret_row
+            .saturating_sub(input_height.saturating_sub(1))
+            .min(input_rows.len() - input_height)
+    } else {
+        0
+    };
+    app.input_scroll = input_scroll;
+
     let input_lines = input_rows
-        .into_iter()
+        .iter()
+        .skip(input_scroll)
+        .take(input_height)
         .enumerate()
         .map(|(index, row)| {
             Line::from(vec![
                 Span::styled(
-                    if index == 0 { " › " } else { "   " },
+                    if index == 0 && input_scroll == 0 {
+                        " › "
+                    } else {
+                        "   "
+                    },
                     Style::default().fg(ACCENT),
                 ),
                 Span::raw(row),
@@ -938,9 +1192,10 @@ fn render_shelf(frame: &mut Frame<'_>, area: Rect, app: &mut App, suggestions: &
 
     if app.focus == Focus::Input {
         let (row, column) = app.input.cursor_position(input_width);
+        let visible_row = row.saturating_sub(input_scroll);
         let cursor_y = input_area
             .y
-            .saturating_add(to_u16(row).min(input_area.height.saturating_sub(1)));
+            .saturating_add(to_u16(visible_row).min(input_area.height.saturating_sub(1)));
         frame.set_cursor_position((
             input_area
                 .x
@@ -1116,7 +1371,7 @@ fn render_palette(frame: &mut Frame<'_>, area: Rect, suggestions: &[Suggestion],
 }
 
 fn shelf_height(area: Rect, app: &App, suggestions: &[Suggestion]) -> u16 {
-    let input_width = usize::from(area.width.saturating_sub(6).max(1));
+    let input_width = input_text_width(area.width);
     let input_rows = app.input.rows(input_width).len();
     let provider_headers = suggestions
         .iter()
@@ -1153,26 +1408,44 @@ fn entry_style(kind: EntryKind) -> (&'static str, Color) {
     }
 }
 
-fn wrap_text(text: &str, width: usize) -> Vec<String> {
-    if width == 0 {
-        return vec![String::new()];
-    }
+/// Plain-text wrapping returning each row with its synthetic continuation
+/// indent, so callers can strip presentation indentation from copied text.
+fn wrap_text_rows(text: &str, width: usize) -> Vec<(String, usize)> {
     let mut lines = Vec::new();
     for source_line in text.split('\n') {
-        let mut line = String::new();
-        let mut line_width = 0;
-        for character in source_line.chars() {
-            let character_width = character.width().unwrap_or(0);
-            if line_width > 0 && line_width + character_width > width {
-                lines.push(std::mem::take(&mut line));
-                line_width = 0;
+        let graphemes: Vec<&str> = source_line.graphemes(true).collect();
+        let rows = crate::text_wrap::wrap_items(
+            &graphemes,
+            width,
+            |grapheme| *grapheme,
+            |grapheme| {
+                crate::text_wrap::is_breakable_whitespace(grapheme.chars().next().unwrap_or('\0'))
+            },
+        );
+        for row in rows {
+            let mut line = String::with_capacity(row.indent + row.end - row.start);
+            line.push_str(&" ".repeat(row.indent));
+            for grapheme in &graphemes[row.start..row.end] {
+                line.push_str(grapheme);
             }
-            line.push(character);
-            line_width += character_width;
+            lines.push((line, row.indent));
         }
-        lines.push(line);
     }
     lines
+}
+
+#[cfg(test)]
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    wrap_text_rows(text, width)
+        .into_iter()
+        .map(|(line, _)| line)
+        .collect()
+}
+
+/// Text column budget inside the input shelf: the ` › ` prompt and the
+/// trailing margin occupy four cells.
+fn input_text_width(area_width: u16) -> usize {
+    usize::from(area_width.saturating_sub(4).max(1))
 }
 
 fn one_line(text: &str) -> String {
@@ -1251,10 +1524,16 @@ mod tests {
         renders_markdown, viewport_offset, wrap_text,
     };
     use crate::app::{
-        App, CellPos, CopyRow, EntryKind, Focus, SessionChoice, SessionView, TextSelection,
+        App, CellPos, CopyRow, EntryKind, Focus, InputBuffer, SessionChoice, SessionView,
+        TextSelection,
     };
     use crate::config::ModelChoice;
     use crate::runtime::{AgentHistory, CommittedRow, FoldOutcome, HistoryEntry, HistoryKind};
+
+    /// Renders wrapped markdown lines to plain strings for assertions.
+    fn rendered(lines: &[(ratatui::text::Line<'static>, usize)]) -> Vec<String> {
+        lines.iter().map(|(line, _)| line.to_string()).collect()
+    }
 
     fn test_app(history: Vec<HistoryEntry>) -> App {
         let history = history
@@ -1293,7 +1572,44 @@ mod tests {
 
     #[test]
     fn wraps_wide_characters_by_terminal_cells() {
-        assert_eq!(wrap_text("ab界cd", 4), ["ab界", "cd"]);
+        assert_eq!(wrap_text("ab界cd", 4), ["ab界", "  cd"]);
+    }
+
+    #[test]
+    fn wrap_text_moves_breaks_before_words() {
+        assert_eq!(wrap_text("alpha beta", 7), ["alpha", "beta"]);
+        assert_eq!(wrap_text("a abcde", 5), ["a", "abcde"]);
+    }
+
+    #[test]
+    fn wrap_text_indents_overwide_word_continuations() {
+        assert_eq!(wrap_text("abcdefghij", 6), ["abcdef", "  ghij"]);
+        assert_eq!(
+            wrap_text("abcdefghijklmn", 6),
+            ["abcdef", "  ghij", "  klmn"]
+        );
+        assert_eq!(wrap_text("go abcdefghij", 6), ["go", "abcdef", "  ghij"]);
+        assert_eq!(wrap_text("abcdefg abcde", 6), ["abcdef", "  g", "abcde"]);
+        assert_eq!(wrap_text("abcdefgh x", 6), ["abcdef", "  gh x"]);
+    }
+
+    #[test]
+    fn wrap_text_handles_whitespace_and_narrow_widths() {
+        assert_eq!(wrap_text("aa   bb", 7), ["aa   bb"]);
+        assert_eq!(wrap_text("aa   bb", 6), ["aa", "bb"]);
+        assert_eq!(wrap_text("  abc", 4), ["  ", "abc"]);
+        assert_eq!(wrap_text("abc  ", 4), ["abc ", " "]);
+        assert_eq!(wrap_text("ab", 0), ["a", "b"]);
+        assert_eq!(wrap_text("ab", 1), ["a", "b"]);
+        assert_eq!(wrap_text("abc", 2), ["ab", " c"]);
+        assert_eq!(wrap_text("abcd", 2), ["ab", " c", " d"]);
+        assert_eq!(wrap_text("界", 1), ["界"]);
+    }
+
+    #[test]
+    fn wrap_text_preserves_explicit_newlines() {
+        assert_eq!(wrap_text("a\n\nb\n", 10), ["a", "", "b", ""]);
+        assert_eq!(wrap_text("abcdef\nxy", 4), ["abcd", "  ef", "xy"]);
     }
 
     #[test]
@@ -1369,13 +1685,10 @@ mod tests {
         );
         let spans = lines
             .iter()
-            .flat_map(|line| line.spans.iter())
+            .flat_map(|(line, _)| line.spans.iter())
             .collect::<Vec<_>>();
 
-        assert_eq!(
-            lines.iter().map(ToString::to_string).collect::<String>(),
-            "A bold word and code."
-        );
+        assert_eq!(rendered(&lines).join(" "), "A bold word and code.");
         assert!(spans.iter().any(|span| {
             span.content.contains("bold")
                 && span
@@ -1394,37 +1707,80 @@ mod tests {
     fn markdown_wraps_styled_wide_text_by_terminal_cells() {
         let lines = markdown_lines("**ab界cd**", 4, Style::default().fg(Color::Gray));
 
-        assert_eq!(
-            lines.iter().map(ToString::to_string).collect::<Vec<_>>(),
-            ["ab界", "cd"]
-        );
-        assert!(lines.iter().all(|line| line.width() <= 4));
-        assert!(lines.iter().flat_map(|line| &line.spans).all(|span| {
-            span.style
-                .add_modifier
-                .contains(ratatui::style::Modifier::BOLD)
+        assert_eq!(rendered(&lines), ["ab界", "  cd"]);
+        assert!(lines.iter().all(|(line, _)| line.width() <= 4));
+        // Source characters stay bold; the synthetic continuation indent is
+        // unstyled furniture, not part of the emphasized text.
+        assert!(lines.iter().flat_map(|(line, _)| &line.spans).any(|span| {
+            !span.content.trim().is_empty()
+                && span
+                    .style
+                    .add_modifier
+                    .contains(ratatui::style::Modifier::BOLD)
         }));
+        assert!(lines.iter().flat_map(|(line, _)| &line.spans).any(|span| {
+            span.content.trim().is_empty()
+                && !span
+                    .style
+                    .add_modifier
+                    .contains(ratatui::style::Modifier::BOLD)
+        }));
+    }
+
+    #[test]
+    fn markdown_wraps_styled_text_at_word_boundaries() {
+        let lines = markdown_lines("**alpha beta**", 7, Style::default().fg(Color::Gray));
+        assert_eq!(rendered(&lines), ["alpha", "beta"]);
+    }
+
+    #[test]
+    fn markdown_preserves_source_newlines_as_hard_breaks() {
+        let lines = markdown_lines("first\nsecond", 80, Style::default().fg(Color::Gray));
+        assert_eq!(rendered(&lines), ["first", "second"]);
+    }
+
+    #[test]
+    fn markdown_newline_preservation_leaves_code_blocks_alone() {
+        let markdown = "```rust\nlet a = 1;\nlet b = 2;\n```";
+        let lines = markdown_lines(markdown, 80, Style::default().fg(Color::Gray));
+        let rendered = rendered(&lines).join("\n");
+        assert!(rendered.contains("let a = 1;"));
+        assert!(rendered.contains("let b = 2;"));
+        assert!(
+            !rendered.contains("  let a"),
+            "code lines must not gain indents"
+        );
+    }
+
+    #[test]
+    fn markdown_trailing_newline_does_not_add_an_empty_row() {
+        let lines = markdown_lines("first\n", 80, Style::default().fg(Color::Gray));
+        assert_eq!(rendered(&lines), ["first"]);
     }
 
     #[test]
     fn markdown_tables_wrap_cells_within_the_pane() {
         let markdown = "| Term | Meaning |\n| --- | --- |\n| **Thread-mobile / migratable** | The value can be moved across threads while work is running. |\n| **Thread-affine** | The value must remain on the worker that owns it. |";
         let lines = markdown_lines(markdown, 42, Style::default().fg(Color::Gray));
-        let rendered = lines.iter().map(ToString::to_string).collect::<Vec<_>>();
-        let rows = rendered
+        let rendered_rows = rendered(&lines);
+        let rows = rendered_rows
             .iter()
             .filter(|line| line.starts_with('│'))
             .collect::<Vec<_>>();
 
-        assert!(lines.iter().all(|line| line.width() <= 42));
+        assert!(lines.iter().all(|(line, _)| line.width() <= 42));
         assert!(rows.len() > 3, "cells should grow table rows vertically");
         assert!(
             rows.iter()
                 .all(|line| line.ends_with('│') && line.matches('│').count() == 3)
         );
-        assert!(rendered.iter().any(|line| line.contains("Thread-mobile")));
-        assert!(rendered.iter().any(|line| line.contains("across")));
-        assert!(rendered.iter().any(|line| line.contains("threads")));
+        assert!(
+            rendered_rows
+                .iter()
+                .any(|line| line.contains("Thread-mobile"))
+        );
+        assert!(rendered_rows.iter().any(|line| line.contains("across")));
+        assert!(rendered_rows.iter().any(|line| line.contains("threads")));
     }
 
     #[test]
@@ -1556,6 +1912,210 @@ mod tests {
     }
 
     #[test]
+    fn wrapped_continuation_indent_counts_as_presentation_padding() {
+        let mut app = test_app(vec![HistoryEntry {
+            kind: HistoryKind::User,
+            title: "you".to_owned(),
+            body: "abcdefghijklmnop".to_owned(),
+        }]);
+        app.entries[0].expanded = true;
+        let backend = TestBackend::new(24, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        // Body width is 24 - 4 (pane) - 6 (furniture) = 14, so the 16-cell
+        // word wraps onto an indented continuation row.
+        assert_eq!(
+            app.conversation_rows[2],
+            CopyRow {
+                pad: 5,
+                text: "     abcdefghijklmn".to_owned()
+            }
+        );
+        assert_eq!(
+            app.conversation_rows[3],
+            CopyRow {
+                pad: 7,
+                text: "       op".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn markdown_list_markers_keep_continuations_inside_the_item() {
+        let lines = markdown_lines("- abcdefghijklmnop", 14, Style::default().fg(Color::Gray));
+        assert_eq!(rendered(&lines), ["- abcdefghijkl", "    mnop"]);
+        assert_eq!(
+            lines.iter().map(|(_, indent)| *indent).collect::<Vec<_>>(),
+            [0, 4]
+        );
+    }
+
+    #[test]
+    fn markdown_list_soft_breaks_hang_beneath_the_marker() {
+        let lines = markdown_lines("- first\n  second", 80, Style::default().fg(Color::Gray));
+        assert_eq!(rendered(&lines), ["- first", "  second"]);
+    }
+
+    #[test]
+    fn markdown_task_and_footnote_continuations_hang() {
+        let lines = markdown_lines(
+            "- [ ] first\n  second",
+            80,
+            Style::default().fg(Color::Gray),
+        );
+        assert_eq!(rendered(&lines), ["- [ ] first", "      second"]);
+
+        let lines = markdown_lines(
+            "[^1]: first\n  second",
+            80,
+            Style::default().fg(Color::Gray),
+        );
+        assert_eq!(rendered(&lines), ["[1]: first", "     second"]);
+    }
+
+    #[test]
+    fn markdown_definition_continuations_hang() {
+        let lines = markdown_lines(
+            "term\n: first\n  second",
+            80,
+            Style::default().fg(Color::Gray),
+        );
+        assert_eq!(rendered(&lines), ["term", ": first", "  second"]);
+    }
+
+    #[test]
+    fn markdown_blank_lines_end_the_pending_hang() {
+        let lines = markdown_lines("- first\n\noutside", 80, Style::default().fg(Color::Gray));
+        assert_eq!(rendered(&lines), ["- first", "", "outside"]);
+    }
+
+    #[test]
+    fn oversized_marker_continuations_never_overflow_the_pane() {
+        // The 12-cell "[12345678]: " marker consumes the whole 12-cell width,
+        // so it wraps as ordinary content and its continuation must not hang
+        // by the full marker width.
+        let lines = markdown_lines(
+            "[^12345678]: first\n  second",
+            12,
+            Style::default().fg(Color::Gray),
+        );
+        let rows = rendered(&lines);
+        assert!(
+            rows.iter()
+                .all(|line| unicode_width::UnicodeWidthStr::width(line.as_str()) <= 12),
+            "rows must stay within the pane: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn markdown_code_whitespace_is_preserved_at_wraps() {
+        let lines = markdown_lines("`a  b`", 5, Style::default().fg(Color::Gray));
+        assert_eq!(rendered(&lines), ["a  b"]);
+        let lines = markdown_lines("`a  b`", 3, Style::default().fg(Color::Gray));
+        assert_eq!(rendered(&lines), ["a  ", "  b"]);
+    }
+
+    #[test]
+    fn blockquote_prefixes_repeat_on_wrapped_rows() {
+        let lines = markdown_lines("> alpha beta", 7, Style::default().fg(Color::Gray));
+        assert_eq!(rendered(&lines), ["> alpha", "> beta"]);
+    }
+
+    #[test]
+    fn footnote_prefixes_hang_continuations() {
+        let lines = markdown_lines("[^1]: alpha beta", 12, Style::default().fg(Color::Gray));
+        assert_eq!(rendered(&lines), ["[1]: alpha", "     beta"]);
+        assert_eq!(
+            lines.iter().map(|(_, indent)| *indent).collect::<Vec<_>>(),
+            [0, 5]
+        );
+    }
+
+    #[test]
+    fn footnote_labels_with_combining_marks_do_not_panic() {
+        let lines = markdown_lines(
+            "[^e\u{301}]: alpha beta",
+            12,
+            Style::default().fg(Color::Gray),
+        );
+        let rows = rendered(&lines);
+        assert!(rows[0].contains("alpha"));
+        assert!(rows[1].starts_with(' '), "continuation hangs: {rows:?}");
+        // An empty definition body must not slice past the marker's graphemes.
+        let lines = markdown_lines("[^x]: ", 12, Style::default().fg(Color::Gray));
+        assert!(!rendered(&lines).is_empty());
+    }
+
+    #[test]
+    fn ordered_task_markers_include_the_checkbox_in_the_hang() {
+        let lines = markdown_lines(
+            "1. [ ] abcdefghijklmnop",
+            14,
+            Style::default().fg(Color::Gray),
+        );
+        let rows = rendered(&lines);
+        assert!(
+            rows.iter()
+                .all(|line| unicode_width::UnicodeWidthStr::width(line.as_str()) <= 14)
+        );
+        assert_eq!(rows[0], "1. [ ] abcdefg");
+    }
+
+    #[test]
+    fn nested_list_markers_never_overflow_the_pane() {
+        let markdown = "- a\n  - b\n    - c\n      - abcdefghijklmnop";
+        let lines = markdown_lines(markdown, 14, Style::default().fg(Color::Gray));
+        assert!(
+            lines.iter().all(|(line, _)| line.width() <= 14),
+            "a marker that consumes the whole width must not overflow: {:?}",
+            rendered(&lines)
+        );
+    }
+
+    #[test]
+    fn zero_width_items_do_not_form_phantom_rows() {
+        assert_eq!(wrap_text("\u{2060}界", 1), ["\u{2060}界"]);
+        assert_eq!(wrap_text("\u{200B}abcdefgh", 6), ["abcdef", "  gh"]);
+    }
+
+    #[test]
+    fn fitting_tables_keep_their_declared_alignment() {
+        let markdown = "| long | b |\n|:----:|---|\n| 1 | 2 |";
+        let lines = markdown_lines(markdown, 80, Style::default().fg(Color::Gray));
+        let options = tui_markdown::Options::new(super::MarkdownStyle);
+        let original = tui_markdown::from_str_with_options(markdown, &options);
+        let original_rows: Vec<String> =
+            original.lines.iter().map(|line| line.to_string()).collect();
+        assert_eq!(rendered(&lines), original_rows);
+        // The fast path must still apply the ambient base style.
+        assert!(
+            lines
+                .iter()
+                .flat_map(|(line, _)| &line.spans)
+                .any(|span| { span.content.contains('1') && span.style.fg == Some(Color::Gray) })
+        );
+    }
+
+    #[test]
+    fn input_scrolls_to_keep_the_caret_row_visible() {
+        let mut app = test_app(Vec::new());
+        app.input = InputBuffer::at_end(
+            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789".to_owned(),
+        );
+        app.focus = Focus::Input;
+        let backend = TestBackend::new(24, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(app.input_scroll > 0, "tall drafts scroll the input window");
+        let (caret_row, _) = app.input.cursor_position(app.input_width);
+        let visible = caret_row.saturating_sub(app.input_scroll);
+        assert!(
+            visible < 2,
+            "the caret stays inside the visible input window"
+        );
+    }
+
+    #[test]
     fn copy_toast_renders_in_the_conversation_corner() {
         let mut app = test_app(vec![HistoryEntry {
             kind: HistoryKind::User,
@@ -1649,13 +2209,13 @@ mod tests {
             80,
             Style::default().fg(Color::Gray),
         );
-        let rendered = lines.iter().map(ToString::to_string).collect::<String>();
+        let rendered = rendered(&lines).join("\n");
 
         assert!(rendered.contains("Working…"));
         assert!(rendered.contains("let answer = 42;"));
         assert!(!rendered.contains("```"));
         assert!(
-            lines.iter().flat_map(|line| &line.spans).any(|span| {
+            lines.iter().flat_map(|(line, _)| &line.spans).any(|span| {
                 span.content.contains("let answer") && span.style.bg == Some(PANEL)
             })
         );

@@ -9,6 +9,7 @@ mod config;
 mod diagnostics;
 mod runtime;
 mod session;
+mod text_wrap;
 mod ui;
 mod xai;
 

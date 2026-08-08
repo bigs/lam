@@ -19,6 +19,7 @@ lam-code = { path = "../lam-code" }
 lam-openai = { path = "../lam-openai" }
 lam-redb = { path = "../lam-redb" }
 nix.workspace = true
+pulldown-cmark = "=0.13.4"
 ratatui.workspace = true
 redb.workspace = true
 reqwest.workspace = true
