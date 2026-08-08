@@ -164,6 +164,10 @@ pub struct ModelSelection {
     pub model_id: ModelId,
     /// Durable, non-secret registry description.
     pub descriptor: ModelDescriptor,
+    /// Reasoning effort the actor runs with, when the host records one at
+    /// selection time (e.g. a child spawned with a fixed effort).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
 }
 
 impl ModelSelection {
@@ -173,6 +177,22 @@ impl ModelSelection {
         Self {
             model_id,
             descriptor,
+            effort: None,
+        }
+    }
+
+    /// Couples a registry identity with its durable descriptor and the
+    /// reasoning effort the actor runs with.
+    #[must_use]
+    pub const fn with_effort(
+        model_id: ModelId,
+        descriptor: ModelDescriptor,
+        effort: String,
+    ) -> Self {
+        Self {
+            model_id,
+            descriptor,
+            effort: Some(effort),
         }
     }
 }

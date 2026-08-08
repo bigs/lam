@@ -356,6 +356,9 @@ pub(crate) struct App {
     input_history: Option<InputHistory>,
     current_parent: Option<String>,
     current_model: Option<String>,
+    /// Reasoning effort recorded in the current agent's journal selection,
+    /// when the host recorded one at spawn time.
+    current_effort: Option<String>,
     inactive_agents: BTreeMap<String, AgentConversation>,
     /// Boundary between pinned rows (committed journal rows and local system
     /// rows, in arrival order) and the streaming overlay at the tail.
@@ -399,6 +402,7 @@ struct AgentConversation {
     context_tokens: Option<u64>,
     parent: Option<String>,
     model: Option<String>,
+    effort: Option<String>,
     /// Whether this agent currently has a live harness run.
     run_active: bool,
     /// Monotonic create order for this session view (higher = newer).
@@ -515,6 +519,7 @@ impl App {
             input_history: None,
             current_parent: root.parent,
             current_model: root.model,
+            current_effort: root.effort,
             inactive_agents,
             committed_len,
             overlay_turn: 0,
@@ -544,6 +549,13 @@ impl App {
     }
 
     pub(crate) fn current_agent_effort(&self) -> Option<&str> {
+        // A child's recorded effort is its own fact; the viewer's picker
+        // value only stands in until the journal has established one.
+        if self.current_agent != "/root"
+            && let Some(effort) = self.current_effort.as_deref()
+        {
+            return Some(effort);
+        }
         let model_index = if self.current_agent == "/root" {
             self.selected_model
         } else {
@@ -1661,6 +1673,9 @@ impl App {
             if let Some(model) = outcome.selected_model {
                 app.current_model = Some(model);
             }
+            if let Some(effort) = outcome.selected_effort {
+                app.current_effort = Some(effort);
+            }
             let committed_runs = outcome
                 .rows
                 .iter()
@@ -2411,6 +2426,7 @@ impl App {
             context_tokens: self.context_tokens,
             parent: self.current_parent.take(),
             model: self.current_model.take(),
+            effort: self.current_effort.take(),
             run_active: previous_run_active,
             created_ord: self.current_created_ord,
             committed_len: self.committed_len,
@@ -2429,6 +2445,7 @@ impl App {
         self.context_tokens = next.context_tokens;
         self.current_parent = next.parent;
         self.current_model = next.model;
+        self.current_effort = next.effort;
         self.current_run_active = next.run_active;
         self.current_created_ord = next.created_ord;
         if address == "/root" {
@@ -2490,6 +2507,7 @@ impl AgentConversation {
             context_tokens: None,
             parent,
             model: None,
+            effort: None,
             run_active: false,
             created_ord,
             committed_len: 0,
@@ -2512,6 +2530,7 @@ impl AgentConversation {
             context_tokens: history.context_tokens,
             parent: history.parent,
             model: history.model,
+            effort: history.effort,
             run_active: !history.run_completed,
             created_ord,
             overlay_turn: 0,
@@ -6319,6 +6338,30 @@ mod tests {
             },
         );
         assert_eq!(app.context_tokens, Some(42));
+    }
+
+    #[test]
+    fn child_effort_comes_from_the_journal_not_the_picker() {
+        let mut app = app();
+        app.apply_agent_event(AgentSystemEvent::Hosted {
+            address: ActorAddress::new("/root/worker").unwrap(),
+            parent: Some(ActorAddress::new("/root").unwrap()),
+        });
+        assert!(app.switch_agent("/root/worker"));
+        // Until the journal records one, no effort is claimed.
+        assert_eq!(app.current_agent_effort(), None);
+        app.apply_fold(
+            "/root/worker",
+            FoldOutcome {
+                selected_effort: Some("xhigh".to_owned()),
+                ..FoldOutcome::default()
+            },
+        );
+        assert_eq!(app.current_agent_effort(), Some("xhigh"));
+        // The recorded effort survives a switch round trip.
+        assert!(app.switch_agent("/root"));
+        assert!(app.switch_agent("/root/worker"));
+        assert_eq!(app.current_agent_effort(), Some("xhigh"));
     }
 
     #[test]

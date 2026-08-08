@@ -359,6 +359,7 @@ where
             } = spec;
             let mut builder = Lam::builder(model.clone())
                 .initial_model_id(model_id.clone())
+                .initial_effort(directory_effort.clone())
                 .state_store(store)
                 .directory_selection(DirectorySelectionSource::new({
                     let target = directory_target.clone();

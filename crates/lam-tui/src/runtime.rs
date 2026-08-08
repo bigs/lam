@@ -81,6 +81,9 @@ pub(crate) struct AgentHistory {
     pub(crate) address: String,
     pub(crate) parent: Option<String>,
     pub(crate) model: Option<String>,
+    /// Reasoning effort recorded in the actor's journal selection, when the
+    /// host recorded one at spawn time.
+    pub(crate) effort: Option<String>,
     pub(crate) status: String,
     pub(crate) run_completed: bool,
     /// Provider-reported context consumption (total_tokens) of the newest
@@ -95,6 +98,7 @@ impl AgentHistory {
             address: "/root".to_owned(),
             parent: None,
             model: None,
+            effort: None,
             status: "Ready".to_owned(),
             run_completed: true,
             context_tokens: None,
@@ -209,6 +213,9 @@ pub(crate) struct FoldOutcome {
     /// Registry-style model id selected by this actor after the fold, when
     /// the projector has established one.
     pub(crate) selected_model: Option<String>,
+    /// Reasoning effort recorded in the actor's journal selection, when one
+    /// was recorded (e.g. a child spawned with a fixed effort).
+    pub(crate) selected_effort: Option<String>,
 }
 
 struct Projector {
@@ -357,6 +364,7 @@ impl Runtime {
             .model
             .lam_builder()
             .initial_model_id(initial.choice.registry_id.clone())
+            .initial_effort(effort_controls[initial_index].selected())
             .state_store(system.state_store())
             .directory_selection(directory_selection)
             .observe_model_selection(move |selection| {
@@ -1225,6 +1233,9 @@ async fn fold_projector(
         )
     });
     outcome.selected_model = state.selected_model().map(selected_model_label);
+    outcome.selected_effort = state
+        .selected_model()
+        .and_then(|selection| selection.effort.clone());
     projector.state = Some(state);
     Ok(outcome)
 }
@@ -1344,6 +1355,9 @@ fn agent_history(
             .filter(|separator| *separator > 0)
             .map(|separator| address[..separator].to_owned()),
         model: state.selected_model().map(selected_model_label),
+        effort: state
+            .selected_model()
+            .and_then(|selection| selection.effort.clone()),
         status: if active && restored_child {
             "Interrupted".to_owned()
         } else if active {
@@ -1818,8 +1832,9 @@ mod tests {
         ActorEvent, ActorId, ActorState, AppendOutcome, CodecId, CodecRef, ContextEntry,
         ContextTransition, DeliveryMode, EncodedPayload, EventBatch, InterruptionReason,
         IsolateState, JournalStore, MessageEnvelope, MessageId, MessageSource, Model, ModelDelta,
-        ModelDescriptor, ModelDirective, ModelResponseProjection, Revision, RunId, RunProgress,
-        SYSTEM_NOTICE_CODEC_ID, SYSTEM_NOTICE_CODEC_VERSION, SystemNotice, Timestamp,
+        ModelDescriptor, ModelDirective, ModelId, ModelResponseProjection, ModelSelection,
+        Revision, RunId, RunProgress, SYSTEM_NOTICE_CODEC_ID, SYSTEM_NOTICE_CODEC_VERSION,
+        SystemNotice, Timestamp,
     };
     use lam_openai::chat_completions::{
         ChatCompletions, PAYLOAD_VERSION as CHAT_PAYLOAD_VERSION,
@@ -1858,6 +1873,59 @@ mod tests {
             )
             .unwrap(),
         )
+    }
+
+    #[test]
+    fn model_selection_effort_round_trips_and_stays_optional() {
+        let id = ModelId::new("codex/gpt-5.6-sol").unwrap();
+        let descriptor = ModelDescriptor::new("codex", "gpt-5.6-sol", "codex").unwrap();
+        let plain = ModelSelection::new(id.clone(), descriptor.clone());
+        assert_eq!(plain.effort, None);
+        let with_effort = ModelSelection::with_effort(id, descriptor, "xhigh".to_owned());
+        assert_eq!(with_effort.effort.as_deref(), Some("xhigh"));
+
+        // The effort survives a journal round trip, and selections written
+        // before the field existed still decode (the field is omitted when
+        // absent, which is exactly the legacy wire form).
+        let encoded = serde_json::to_string(&with_effort).unwrap();
+        let decoded: ModelSelection = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, with_effort);
+        let legacy = serde_json::to_string(&plain).unwrap();
+        let decoded: ModelSelection = serde_json::from_str(&legacy).unwrap();
+        assert_eq!(decoded, plain);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fold_surfaces_the_recorded_effort() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = RedbStore::create(directory.path().join("session.redb")).unwrap();
+        let actor = ActorId::new("/root/worker").unwrap();
+        let appended = store
+            .append(
+                &actor,
+                Revision::ZERO,
+                EventBatch::new(
+                    ActorEvent::model_selected(ModelSelection::with_effort(
+                        ModelId::new("codex/gpt-5.6-sol").unwrap(),
+                        ModelDescriptor::new("codex", "gpt-5.6-sol", "codex").unwrap(),
+                        "xhigh".to_owned(),
+                    )),
+                    Vec::new(),
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(appended, AppendOutcome::Appended { .. }));
+
+        let mut projector = Projector {
+            actor_id: actor.clone(),
+            state: Some(ActorState::new()),
+        };
+        let outcome = fold_projector(&store, &[], "/root/worker", &mut projector)
+            .await
+            .unwrap();
+        assert_eq!(outcome.selected_model.as_deref(), Some("codex/gpt-5.6-sol"));
+        assert_eq!(outcome.selected_effort.as_deref(), Some("xhigh"));
     }
 
     #[tokio::test(flavor = "current_thread")]

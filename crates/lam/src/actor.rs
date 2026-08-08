@@ -142,6 +142,7 @@ impl Lam {
         let compactor = Arc::new(SummaryTailCompactor::new(model.clone()));
         LamBuilder {
             initial_model_id: ModelId::new("default"),
+            initial_effort: None,
             initial_model: RegisteredModel::new(model, Some(compactor)),
             additional_models: Vec::new(),
             store: MemStore::new(),
@@ -162,6 +163,7 @@ impl Lam {
 /// Configures the dependencies shared by an actor runtime.
 pub struct LamBuilder<S> {
     initial_model_id: Result<ModelId, lam_core::InvalidIdentifier>,
+    initial_effort: Option<String>,
     initial_model: RegisteredModel,
     additional_models: Vec<PendingModel>,
     store: S,
@@ -188,6 +190,7 @@ impl<S> LamBuilder<S> {
     pub fn state_store<T>(self, store: T) -> LamBuilder<T> {
         LamBuilder {
             initial_model_id: self.initial_model_id,
+            initial_effort: self.initial_effort,
             initial_model: self.initial_model,
             additional_models: self.additional_models,
             store,
@@ -209,6 +212,15 @@ impl<S> LamBuilder<S> {
     #[must_use]
     pub fn initial_model_id(mut self, model_id: impl Into<String>) -> Self {
         self.initial_model_id = ModelId::new(model_id);
+        self
+    }
+
+    /// Records the reasoning effort the actor runs with, so the journal's
+    /// model selection carries it for downstream observability (e.g. the TUI
+    /// showing a child's actual effort rather than the viewer's picker state).
+    #[must_use]
+    pub fn initial_effort(mut self, effort: impl Into<String>) -> Self {
+        self.initial_effort = Some(effort.into());
         self
     }
 
@@ -369,6 +381,7 @@ impl<S> LamBuilder<S> {
     pub fn build(self) -> LamRuntime<S> {
         LamRuntime {
             initial_model_id: self.initial_model_id,
+            initial_effort: self.initial_effort,
             initial_model: self.initial_model,
             additional_models: self.additional_models,
             store: self.store,
@@ -389,6 +402,7 @@ impl<S> LamBuilder<S> {
 /// Frozen single-actor configuration.
 pub struct LamRuntime<S> {
     initial_model_id: Result<ModelId, lam_core::InvalidIdentifier>,
+    initial_effort: Option<String>,
     initial_model: RegisteredModel,
     additional_models: Vec<PendingModel>,
     store: S,
@@ -411,6 +425,7 @@ impl<S> LamRuntime<S> {
         ActorBuilder {
             actor_id: ActorId::new(actor_id),
             initial_model_id: self.initial_model_id,
+            initial_effort: self.initial_effort,
             initial_model: self.initial_model,
             additional_models: self.additional_models,
             store: self.store,
@@ -432,6 +447,7 @@ impl<S> LamRuntime<S> {
 pub struct ActorBuilder<S> {
     actor_id: Result<ActorId, lam_core::InvalidIdentifier>,
     initial_model_id: Result<ModelId, lam_core::InvalidIdentifier>,
+    initial_effort: Option<String>,
     initial_model: RegisteredModel,
     additional_models: Vec<PendingModel>,
     store: S,
@@ -554,6 +570,7 @@ where
 struct PreparedActor<S> {
     actor_id: ActorId,
     initial_model_id: ModelId,
+    initial_effort: Option<String>,
     models: BTreeMap<ModelId, RegisteredModel>,
     store: S,
     namespaces: Vec<Namespace>,
@@ -599,6 +616,7 @@ where
         Ok(Self {
             actor_id,
             initial_model_id,
+            initial_effort: builder.initial_effort,
             models,
             store: builder.store,
             namespaces: builder.namespaces,
@@ -671,7 +689,12 @@ where
             .expect("the initial model was inserted")
             .descriptor()
             .clone();
-        let initial_selection = ModelSelection::new(self.initial_model_id, initial_descriptor);
+        let initial_selection = match self.initial_effort {
+            Some(effort) => {
+                ModelSelection::with_effort(self.initial_model_id, initial_descriptor, effort)
+            }
+            None => ModelSelection::new(self.initial_model_id, initial_descriptor),
+        };
         let state_load_started = Instant::now();
         let (state, created) =
             ensure_model_selection(store.as_ref(), &self.actor_id, initial_selection)
