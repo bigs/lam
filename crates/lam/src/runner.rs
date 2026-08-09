@@ -172,6 +172,7 @@ where
         let aborted = matches!(result, Err(ActorError::Aborted));
         match result {
             Ok(value) => {
+                call.release_lease();
                 let _ = call.completion.send(Ok(value));
             }
             Err(error) => call.fail(error),
@@ -198,11 +199,40 @@ where
             self.drive_one(OutputContract::Text, None).await?;
         }
 
+        let message_id = call.message.message_id().clone();
+        if call.admission_cancel.try_recv().is_ok() {
+            return Err(ActorError::Aborted);
+        }
         let mut abort = self.abort.clone();
-        let receipt = tokio::select! {
-            biased;
-            _ = wait_for_abort(&mut abort) => return Err(ActorError::Aborted),
-            receipt = self.admit_call(call.message.clone()) => receipt?,
+        let admission = {
+            let admit = self.admit_call(call.message.clone());
+            tokio::pin!(admit);
+            tokio::select! {
+                biased;
+                Ok(()) = &mut call.admission_cancel => Ok(None),
+                receipt = &mut admit => receipt.map(Some),
+                _ = wait_for_abort(&mut abort) => Err(ActorError::Aborted),
+            }
+        }?;
+        let receipt = match admission {
+            Some(receipt) => receipt,
+            None => {
+                // The admission future is dropped before this read. Journal
+                // state therefore decides the race: a committed message owns
+                // the spawned child, while an absent one was cancelled first.
+                let state =
+                    refresh_state(self.store.as_ref(), &self.actor_id, ActorState::new()).await?;
+                let revision = state.message(&message_id).map(|message| message.revision);
+                self.state = Some(state);
+                let Some(revision) = revision else {
+                    return Err(ActorError::Aborted);
+                };
+                MessageReceipt {
+                    actor_id: self.actor_id.clone(),
+                    message_id,
+                    revision,
+                }
+            }
         };
         call.admitted(receipt);
         self.drive_one(call.output.clone(), Some(&call.events))

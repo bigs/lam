@@ -1066,8 +1066,10 @@ fn render_shelf(frame: &mut Frame<'_>, area: Rect, app: &mut App, suggestions: &
     // parenthetical stays in the same column across both states.
     let mut title = if app.busy {
         " working ".to_owned()
-    } else {
+    } else if app.current_agent == "/root" {
         " message ".to_owned()
+    } else {
+        format!(" message {} ", app.current_agent)
     };
     if let Some(consumed) = app.context_tokens
         && let Some(window) = app.context_window_tokens()

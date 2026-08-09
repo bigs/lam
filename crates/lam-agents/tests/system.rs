@@ -59,6 +59,7 @@ struct AdmissionGateStore {
 
 struct AdmissionGate {
     actor_id: ActorId,
+    after_commit: bool,
     armed: AtomicBool,
     entered: AtomicBool,
     entered_notify: Notify,
@@ -67,10 +68,19 @@ struct AdmissionGate {
 
 impl AdmissionGateStore {
     fn new(actor_id: &str) -> Self {
+        Self::at(actor_id, false)
+    }
+
+    fn after_commit(actor_id: &str) -> Self {
+        Self::at(actor_id, true)
+    }
+
+    fn at(actor_id: &str, after_commit: bool) -> Self {
         Self {
             inner: Arc::new(MemStore::new()),
             gate: Arc::new(AdmissionGate {
                 actor_id: ActorId::new(actor_id).unwrap(),
+                after_commit,
                 armed: AtomicBool::new(true),
                 entered: AtomicBool::new(false),
                 entered_notify: Notify::new(),
@@ -115,15 +125,21 @@ impl JournalStore for AdmissionGateStore {
         let is_admission = events
             .iter()
             .any(|event| matches!(event.data(), ActorEventData::MessageAdmitted { .. }));
-        if actor == &self.gate.actor_id
+        let gated = actor == &self.gate.actor_id
             && is_admission
-            && self.gate.armed.swap(false, Ordering::AcqRel)
-        {
+            && self.gate.armed.swap(false, Ordering::AcqRel);
+        if gated && !self.gate.after_commit {
             self.gate.entered.store(true, Ordering::Release);
             self.gate.entered_notify.notify_waiters();
             self.gate.release.notified().await;
         }
-        self.inner.append(actor, expected, events).await
+        let outcome = self.inner.append(actor, expected, events).await;
+        if gated && self.gate.after_commit {
+            self.gate.entered.store(true, Ordering::Release);
+            self.gate.entered_notify.notify_waiters();
+            self.gate.release.notified().await;
+        }
+        outcome
     }
 }
 
@@ -569,6 +585,24 @@ lam.result("unexpected root completion")"#
 }
 
 fn background_interruption_response(request: &Value) -> Value {
+    if has_message(request, "wait for cancelled child", Some("user")) {
+        if transition_payload_contains(request, "eval", "cancelled") {
+            return json!({ "kind": "output", "value": "WAIT_CANCELLED" });
+        }
+        return json!({
+            "kind": "eval",
+            "source": r#"let result;
+try {
+  await lam.agents.wait({ addresses: ["/background-interrupt-root/background"] });
+} catch (error) {
+  result = error;
+}
+lam.result(result)"#
+        });
+    }
+    if transition_payload_contains(request, "messages", "cancelled") {
+        return json!({ "kind": "output", "value": "cancellation recorded" });
+    }
     if has_message(request, "background interrupt child", Some("actor")) {
         return json!({ "kind": "eval", "source": "await new Promise(() => {})" });
     }
@@ -1101,6 +1135,75 @@ async fn cancelling_child_call_retires_the_owned_subtree() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn subtree_interruption_cancels_a_call_child_blocked_before_admission() {
+    let provider = RoutingProvider::for_scenario(RoutingScenario::CancelCall);
+    let model = Model::new(provider, TestCodec)
+        .with_descriptor(ModelDescriptor::new("test", "model-a", "test/messages").unwrap());
+    let store = AdmissionGateStore::new("/overlap-root/cancelled-call");
+    let system = AgentSystem::builder(store.clone())
+        .max_agents(2)
+        .build()
+        .unwrap();
+    let subagents: SubagentConfig<AdmissionGateStore> =
+        SubagentConfig::builder(model.clone(), "high")
+            .agent_namespace(false)
+            .build()
+            .unwrap();
+    let root = system
+        .host_with_subagents(
+            Lam::builder(model.clone())
+                .state_store(system.state_store())
+                .build()
+                .actor("/overlap-root"),
+            subagents,
+        )
+        .await
+        .unwrap();
+    let caller = root.clone();
+    let call = tokio::spawn(async move { caller.call("cancel child call root").await });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        store.wait_until_blocked(),
+    )
+    .await
+    .expect("child should block before initial task admission");
+
+    let interruption = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        system.interrupt(
+            &ActorAddress::new("/overlap-root").unwrap(),
+            InterruptionScope::Subtree,
+        ),
+    )
+    .await;
+    if interruption.is_err() {
+        store.release();
+        system.abort().await.unwrap();
+        panic!("subtree interruption hung behind the call child's admission");
+    }
+    interruption.unwrap().unwrap().unwrap();
+    let _ = call.await.unwrap();
+    assert!(
+        system
+            .agent(&ActorAddress::new("/overlap-root/cancelled-call").unwrap())
+            .is_none(),
+        "the call-owned child must retire even after being marked interrupted"
+    );
+
+    let replacement = system
+        .host(
+            Lam::builder(model)
+                .state_store(system.state_store())
+                .build()
+                .actor("/replacement-after-overlap"),
+        )
+        .await
+        .expect("overlapping cancellation must release child capacity");
+    assert_eq!(replacement.address().as_str(), "/replacement-after-overlap");
+    system.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn tree_interruption_is_durable_and_keeps_only_the_root_resident() {
     let provider = RoutingProvider::for_scenario(RoutingScenario::TreeInterruption);
     let model = Model::new(provider.clone(), TestCodec)
@@ -1315,48 +1418,40 @@ async fn actor_interruption_leaves_descendants_running_and_outcomes_deliverable(
         )),
         "the child journal must not contain an interruption boundary"
     );
-    assert!(
-        !child_state.context().iter().any(|entry| matches!(
-            entry.entry.transition,
-            ContextTransition::Interrupted { .. }
-        )),
-        "the child journal must not contain an interruption boundary"
-    );
 
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
-            let page = system
-                .state_store()
-                .read(
-                    root.actor_id(),
-                    Revision::ZERO,
-                    NonZeroUsize::new(128).unwrap(),
-                )
-                .await
-                .unwrap();
-            if page.events.iter().any(|stored| {
-                matches!(
-                    stored.event.data(),
-                    ActorEventData::MessageAdmitted { message }
-                        if matches!(
-                            message.source(),
-                            MessageSource::Actor { actor_id }
-                                if actor_id.as_str() == "/actor-interrupt-root/child"
-                        ) && message.payload().value.to_string().contains("actor child complete")
-                )
-            }) {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("the child's outcome should still be delivered to the root's mailbox");
+    // Wait for quiescence rather than polling with an arbitrary timeout:
+    // `system.wait()` returns once every resident is idle (no active run, no
+    // eligible messages) and no operation is in flight, which means the
+    // child's outcome delivery has durably committed to the root mailbox.
+    system.wait().await.unwrap();
+    let page = system
+        .state_store()
+        .read(
+            root.actor_id(),
+            Revision::ZERO,
+            NonZeroUsize::new(128).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        page.events.iter().any(|stored| {
+            matches!(
+                stored.event.data(),
+                ActorEventData::MessageAdmitted { message }
+                    if matches!(
+                        message.source(),
+                        MessageSource::Actor { actor_id }
+                            if actor_id.as_str() == "/actor-interrupt-root/child"
+                    ) && message.payload().value.to_string().contains("actor child complete")
+            )
+        }),
+        "the completed child outcome must be durable in the direct parent's mailbox"
+    );
     system.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn interrupted_background_outcome_is_not_delivered_to_the_root() {
+async fn interrupted_background_outcome_is_durable_for_its_direct_parent() {
     let provider = RoutingProvider::for_scenario(RoutingScenario::BackgroundInterruption);
     let model = Model::new(provider.clone(), TestCodec)
         .with_descriptor(ModelDescriptor::new("test", "model-a", "test/messages").unwrap());
@@ -1429,17 +1524,26 @@ async fn interrupted_background_outcome_is_not_delivered_to_the_root() {
         )
         .await
         .unwrap();
-    assert!(!page.events.iter().any(|stored| {
-        matches!(
-            stored.event.data(),
-            ActorEventData::MessageAdmitted { message }
-                if matches!(
-                    message.source(),
-                    MessageSource::Actor { actor_id }
-                        if actor_id.as_str() == "/background-interrupt-root/background"
-                )
-        )
-    }));
+    let delivered = page
+        .events
+        .iter()
+        .filter(|stored| {
+            matches!(
+                stored.event.data(),
+                ActorEventData::MessageAdmitted { message }
+                    if matches!(
+                        message.source(),
+                        MessageSource::Actor { actor_id }
+                            if actor_id.as_str() == "/background-interrupt-root/background"
+                    ) && message.payload().value.to_string().contains("cancelled")
+            )
+        })
+        .count();
+    assert_eq!(delivered, 1, "cancellation must be journaled exactly once");
+    assert_eq!(
+        root.call("wait for cancelled child").await.unwrap(),
+        "WAIT_CANCELLED"
+    );
     system.shutdown().await.unwrap();
 }
 
@@ -1735,6 +1839,91 @@ async fn cancelled_spawn_retires_the_child_before_releasing_capacity() {
     .await
     .expect("cancelled child must release capacity after its runner exits");
     assert_eq!(replacement.address().as_str(), "/replacement");
+    system.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn spawn_committed_before_receipt_survives_caller_cancellation() {
+    let provider = RoutingProvider::new();
+    let model = Model::new(provider, TestCodec)
+        .with_descriptor(ModelDescriptor::new("test", "model-a", "test/messages").unwrap());
+    let store = AdmissionGateStore::after_commit("/root/cancelled");
+    let system = AgentSystem::builder(store.clone())
+        .max_agents(2)
+        .build()
+        .unwrap();
+    let subagents: SubagentConfig<AdmissionGateStore> =
+        SubagentConfig::builder(model.clone(), "high")
+            .agent_namespace(false)
+            .build()
+            .unwrap();
+    let root = system
+        .host_with_subagents(
+            Lam::builder(model)
+                .state_store(system.state_store())
+                .default_eval_timeout(std::time::Duration::from_millis(50))
+                .build()
+                .actor("/root"),
+            subagents,
+        )
+        .await
+        .unwrap();
+    let caller = root.clone();
+    let call = tokio::spawn(async move { caller.call("cancel spawn task").await });
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        store.wait_until_blocked(),
+    )
+    .await
+    .expect("child admission should commit before its receipt returns");
+    let committed = system
+        .state_store()
+        .read(
+            &ActorId::new("/root/cancelled").unwrap(),
+            Revision::ZERO,
+            NonZeroUsize::new(32).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        committed
+            .events
+            .iter()
+            .any(|stored| matches!(stored.event.data(), ActorEventData::MessageAdmitted { .. }))
+    );
+
+    let output = tokio::time::timeout(std::time::Duration::from_secs(2), call)
+        .await
+        .expect("the parent eval should time out")
+        .unwrap()
+        .unwrap();
+    assert_eq!(output, "spawn cancelled");
+    assert!(
+        system
+            .agent(&ActorAddress::new("/root/cancelled").unwrap())
+            .is_some(),
+        "durably admitted spawn work must stay resident"
+    );
+
+    store.release();
+    system.wait().await.unwrap();
+    let parent = system
+        .state_store()
+        .read(
+            root.actor_id(),
+            Revision::ZERO,
+            NonZeroUsize::new(128).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(parent.events.iter().any(|stored| matches!(
+        stored.event.data(),
+        ActorEventData::MessageAdmitted { message }
+            if matches!(message.source(), MessageSource::Actor { actor_id }
+                if actor_id.as_str() == "/root/cancelled")
+                && message.payload().value.to_string().contains("plain complete")
+    )));
     system.shutdown().await.unwrap();
 }
 

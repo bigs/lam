@@ -136,13 +136,16 @@ actors. `shutdown()` stops admission, gracefully retires actors, and joins all
 workers; `abort()` interrupts active work first. Administrative `stop(address)`
 retires an addressed subtree.
 
-`Agent::interrupt()` (or `AgentSystem::interrupt(address)`) fans recoverable
-interruption out across the complete resident subtree before awaiting any one
-actor. Each active run commits its own durable interruption boundary. A model
-or eval completion already committed at that boundary wins normally. Once the
-fan-in completes, descendants retire and release capacity while the addressed
-root remains available for a later call. Interrupted detached outcomes are not
-delivered into the root mailbox; already completed outcomes remain eligible.
+`Agent::interrupt(scope)` (or `AgentSystem::interrupt(address, scope)`) can
+interrupt only the addressed actor or its complete resident subtree. Actor
+scope keeps descendants running and their detached outcomes deliverable.
+Subtree scope gives each active run its own durable interruption boundary,
+then retires descendants and releases their capacity while the addressed root
+remains available. A model or eval completion already committed at the
+boundary wins normally. Cancelled detached tasks publish one structured
+`AgentOutcome::Cancelled` to their direct parent's durable mailbox; `wait`
+surfaces that outcome as a structured cancellation error rather than normal
+completion. Outcomes never bubble beyond the direct parent.
 
 `take_events()` yields one single-consumer, addressed, ephemeral stream:
 

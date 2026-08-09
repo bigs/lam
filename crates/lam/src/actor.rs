@@ -1233,7 +1233,32 @@ where
     where
         T: Serialize,
     {
-        self.send_with_source(
+        let receipt = self.admit_from_actor(sender, input).await?;
+        self.wake();
+        Ok(receipt)
+    }
+
+    /// Requests processing of eligible durable mailbox work.
+    ///
+    /// This is a best-effort process-local notification; the journal remains
+    /// authoritative if the runner has already stopped.
+    pub fn wake(&self) {
+        let _ = self.commands.send(RunnerCommand::Wake);
+    }
+
+    /// Durably admits a value sent by another actor without waking this
+    /// runner. Multi-actor teardown uses this to preserve direct-child
+    /// terminal outcomes in a retiring parent's journal without resurrecting
+    /// model work while interruption is in progress.
+    pub async fn admit_from_actor<T>(
+        &self,
+        sender: &ActorRef<S>,
+        input: T,
+    ) -> Result<MessageReceipt, ActorError>
+    where
+        T: Serialize,
+    {
+        self.admit_with_source(
             input,
             MessageSource::Actor {
                 actor_id: sender.actor_id.clone(),
@@ -1241,6 +1266,20 @@ where
             DeliveryMode::Steer,
         )
         .await
+    }
+
+    async fn admit_with_source<T>(
+        &self,
+        input: T,
+        source: MessageSource,
+        delivery: DeliveryMode,
+    ) -> Result<MessageReceipt, ActorError>
+    where
+        T: Serialize,
+    {
+        let message_id = self.ids.message_id();
+        let message = self.message(message_id, source, input, delivery)?;
+        self.admission.admit(message).await
     }
 
     async fn send_with_source<T>(
@@ -1252,9 +1291,7 @@ where
     where
         T: Serialize,
     {
-        let message_id = self.ids.message_id();
-        let message = self.message(message_id, source, input, delivery)?;
-        let receipt = self.admission.admit(message).await?;
+        let receipt = self.admit_with_source(input, source, delivery).await?;
         let _ = self.commands.send(RunnerCommand::Wake);
         Ok(receipt)
     }

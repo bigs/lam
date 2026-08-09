@@ -1597,6 +1597,39 @@ async fn dropping_a_run_detaches_without_permitting_an_overlapping_call() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn pre_signalled_admission_cancellation_prevents_the_append() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let store = Arc::new(MemStore::new());
+            let (mut actor, runner) = Lam::builder(Model::new(
+                ScriptedProvider::new([output(json!("must not run"))]),
+                ScriptedCodec,
+            ))
+            .state_store(Arc::clone(&store))
+            .build()
+            .actor("pre-cancelled")
+            .build_task()
+            .await
+            .unwrap();
+            let mut run = actor.call("cancel before runner poll");
+            let admission = tokio::task::spawn_local(async move {
+                run.wait_admitted_or_cancel(std::future::ready(())).await
+            });
+
+            // The call and its cancellation signal are queued while the actor
+            // task is deliberately not being polled.
+            tokio::task::yield_now().await;
+            let runner = tokio::task::spawn_local(runner);
+            assert_eq!(admission.await.unwrap().unwrap_err(), ActorError::Aborted);
+            assert!(actor.handle().state().await.unwrap().messages().is_empty());
+
+            actor.shutdown().await.unwrap();
+            runner.await.unwrap();
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn cloned_actor_handles_share_exclusive_operation_admission() {
     let gate = Arc::new(Barrier::new(2));
     let provider = ScriptedProvider::new([

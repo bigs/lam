@@ -24,8 +24,9 @@ pub(crate) struct CallRequest {
     pub(crate) output: OutputContract,
     pub(crate) events: mpsc::Sender<RunEvent>,
     admission: Option<oneshot::Sender<Result<MessageReceipt, ActorError>>>,
+    pub(crate) admission_cancel: oneshot::Receiver<()>,
     pub(crate) completion: oneshot::Sender<Result<serde_json::Value, ActorError>>,
-    _lease: OperationLease,
+    lease: Option<OperationLease>,
 }
 
 impl CallRequest {
@@ -34,6 +35,7 @@ impl CallRequest {
         output: OutputContract,
         events: mpsc::Sender<RunEvent>,
         admission: oneshot::Sender<Result<MessageReceipt, ActorError>>,
+        admission_cancel: oneshot::Receiver<()>,
         completion: oneshot::Sender<Result<serde_json::Value, ActorError>>,
         lease: OperationLease,
     ) -> Self {
@@ -42,8 +44,9 @@ impl CallRequest {
             output,
             events,
             admission: Some(admission),
+            admission_cancel,
             completion,
-            _lease: lease,
+            lease: Some(lease),
         }
     }
 
@@ -64,7 +67,16 @@ impl CallRequest {
         self.emit(RunEvent::Failed {
             message: error.to_string(),
         });
+        self.release_lease();
         let _ = self.completion.send(Err(error));
+    }
+
+    /// Releases the exclusivity lease before the completion result is sent,
+    /// so a caller which observes completion never sees a stale `Busy` from a
+    /// still-held lease. The completion send and the lease release otherwise
+    /// race across threads under load.
+    pub(crate) fn release_lease(&mut self) {
+        drop(self.lease.take());
     }
 }
 

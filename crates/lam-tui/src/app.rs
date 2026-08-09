@@ -7,14 +7,14 @@ use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use lam::{ModelDelta, RunEvent, RunId, RuntimeEvent, ToolCallDelta};
-use lam_agents::{AgentOutcome, AgentSystemEvent, StopReason};
+use lam_agents::{ActorAddress, AgentOutcome, AgentSystemEvent, StopReason};
 use ratatui::layout::Rect;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::config::ModelChoice;
 use crate::runtime::{
-    AgentHistory, Command, CommandResult, CommittedRow, FoldOutcome, HistoryKind,
+    AgentHistory, Command, CommandResult, CommittedRow, FailedMessage, FoldOutcome, HistoryKind,
     RuntimePreferences, SentMessage,
 };
 
@@ -349,9 +349,10 @@ pub(crate) struct App {
     pub(crate) conversation_area: Option<Rect>,
     pub(crate) toast: Option<Toast>,
     pub(crate) current_agent: String,
-    /// Durably admitted user messages not yet consumed into model-visible
-    /// context, shown above the input bar until the runner delivers them at
-    /// a model boundary.
+    /// Pending steers for the agent currently in the pane. This field always
+    /// holds the viewed agent's queue: `switch_agent` swaps it in and out of
+    /// each `AgentConversation`, so a steer is cleared by its own agent's
+    /// projector fold and rendered only while that agent is in view.
     pub(crate) pending_steers: Vec<PendingSteer>,
     input_history: Option<InputHistory>,
     current_parent: Option<String>,
@@ -405,6 +406,10 @@ struct AgentConversation {
     effort: Option<String>,
     /// Whether this agent currently has a live harness run.
     run_active: bool,
+    /// Durably admitted user messages not yet consumed into this agent's
+    /// model-visible context. Per-agent because each message targets the
+    /// viewed agent and is cleared by that agent's own projector fold.
+    pending_steers: Vec<PendingSteer>,
     /// Monotonic create order for this session view (higher = newer).
     /// Assigned when the agent is first observed (Hosted / ensure / restore).
     created_ord: u64,
@@ -1123,6 +1128,7 @@ impl App {
                 self.status = "Wait for the interruption to finish".to_owned();
                 return None;
             }
+            let target = self.current_agent.clone();
             self.input = InputBuffer::default();
             self.input_history = None;
             self.suggestion_index = 0;
@@ -1133,7 +1139,7 @@ impl App {
             {
                 session.preview = Some(input.clone());
             }
-            self.with_agent("/root", |app| {
+            self.with_agent(&target, |app| {
                 app.status = "Sending…".to_owned();
             });
             // Optimistically show the steer the moment it is submitted; the
@@ -1147,7 +1153,8 @@ impl App {
             // message and its run output stay visible even from a scrolled-up
             // position.
             self.follow_conversation_tail = true;
-            return Some(Command::Message(input));
+            let target = ActorAddress::new(target).expect("the viewed agent address is valid");
+            return Some(Command::Message { target, input });
         }
         if self.busy {
             self.status = "Wait for the current operation to finish".to_owned();
@@ -1635,19 +1642,24 @@ impl App {
     /// fold's rows are the only path by which transcript content enters the
     /// view; events and command results carry state transitions only.
     pub(crate) fn apply_fold(&mut self, address: &str, outcome: FoldOutcome) -> bool {
+        self.ensure_agent(address, parent_address(address), "Working…");
         let before_other_running = self.other_running_agents();
         let affected = !outcome.rows.is_empty() && address == self.current_agent;
-        if address == "/root" && !outcome.consumed_message_ids.is_empty() {
-            self.pending_steers.retain(|steer| {
-                !outcome.consumed_message_ids.iter().any(|consumed| {
-                    steer
-                        .message_id
-                        .as_ref()
-                        .is_some_and(|message_id| message_id == consumed)
-                })
+        if !outcome.consumed_message_ids.is_empty() {
+            // Clear the folded agent's own queue: a steer is consumed into the
+            // context of the agent it targeted, so only that agent's fold can
+            // retire it.
+            self.with_agent(address, |app| {
+                app.pending_steers.retain(|steer| {
+                    !outcome.consumed_message_ids.iter().any(|consumed| {
+                        steer
+                            .message_id
+                            .as_ref()
+                            .is_some_and(|message_id| message_id == consumed)
+                    })
+                });
             });
         }
-        self.ensure_agent(address, parent_address(address), "Working…");
         let owner = address.to_owned();
         let context_tokens = outcome.context_tokens;
         let should_update_run_active = address == "/root"
@@ -1723,55 +1735,75 @@ impl App {
     /// Reports a failed transcript fold. The view keeps rendering; the next
     /// successful fold catches up from the projector's revision.
     pub(crate) fn fold_failed(&mut self, address: &str, error: String) {
-        self.push_error(format!("Transcript sync failed for {address}"), error);
+        self.ensure_agent(address, parent_address(address), "Working…");
+        self.with_agent(address, |app| {
+            app.push_error(format!("Transcript sync failed for {address}"), error);
+        });
     }
 
     /// Registers the durable receipt for a sent message. `consumed` reports
     /// whether the projector has already folded the message into context —
     /// in that case its row is already rendered and nothing is pending.
     pub(crate) fn apply_message_receipt(&mut self, sent: SentMessage, consumed: bool) {
+        let target = sent.target.to_string();
         // Attach the durable identity to the optimistic row submitted above,
         // or drop the row when the delivery already committed into context.
-        if let Some(index) = self
-            .pending_steers
-            .iter()
-            .position(|steer| steer.message_id.is_none() && steer.text == sent.text)
-        {
-            if consumed {
-                self.pending_steers.remove(index);
-            } else {
-                self.pending_steers[index].message_id = Some(sent.message_id);
+        // The steer lives in the targeted agent's queue, so scope to it.
+        self.with_agent(&target, |app| {
+            if let Some(index) = app
+                .pending_steers
+                .iter()
+                .position(|steer| steer.message_id.is_none() && steer.text == sent.text)
+            {
+                if consumed {
+                    app.pending_steers.remove(index);
+                } else {
+                    app.pending_steers[index].message_id = Some(sent.message_id.clone());
+                }
+            } else if !consumed {
+                // No optimistic row (e.g. a receipt without a prior submit);
+                // register the pending steer directly.
+                app.pending_steers.push(PendingSteer {
+                    message_id: Some(sent.message_id.clone()),
+                    text: sent.text.clone(),
+                });
             }
-        } else if !consumed {
-            // No optimistic row (e.g. a receipt without a prior submit);
-            // register the pending steer directly.
-            self.pending_steers.push(PendingSteer {
-                message_id: Some(sent.message_id),
-                text: sent.text,
-            });
-        }
-        self.with_agent("/root", |app| {
-            if !app.root_run_active {
+        });
+        self.with_agent(&target, |app| {
+            if consumed || !app.current_run_active {
                 return;
             }
             app.status = "Message queued — delivered at the next boundary".to_owned();
         });
     }
 
-    pub(crate) fn apply_message_error(&mut self, error: String) {
+    pub(crate) fn apply_message_error(&mut self, failed: FailedMessage) {
         // A rejected send removes the optimistic row and restores the draft
-        // so the user's text is never lost.
-        if let Some(index) = self
-            .pending_steers
-            .iter()
-            .position(|steer| steer.message_id.is_none())
-        {
-            let steer = self.pending_steers.remove(index);
-            self.input = InputBuffer::at_end(steer.text);
+        // when the user is still on that agent with an empty editor. If the
+        // pane or draft changed while admission was in flight, retain the
+        // exact text in the targeted agent's error row instead of overwriting
+        // unrelated input.
+        let target = failed.target.to_string();
+        self.with_agent(&target, |app| {
+            if let Some(index) = app
+                .pending_steers
+                .iter()
+                .position(|steer| steer.message_id.is_none() && steer.text == failed.text)
+            {
+                app.pending_steers.remove(index);
+            }
+            app.push_error(
+                "Could not send message",
+                format!("{}\n\nUnsent message:\n{}", failed.error, failed.text),
+            );
+        });
+        if self.current_agent == target && self.input.text.is_empty() {
+            self.input = InputBuffer::at_end(failed.text);
             self.input_history = None;
             self.suggestion_index = 0;
+        } else if self.current_agent != target {
+            self.show_toast(format!("Message to {target} was not sent"));
         }
-        self.push_error("Could not send message", error);
     }
 
     pub(crate) fn apply_interrupt_result(&mut self, result: Result<bool, String>) {
@@ -1788,71 +1820,73 @@ impl App {
                     };
                 });
             }
-            Err(error) => self.push_error("Could not stop run", error),
+            Err(error) => self.with_agent("/root", |app| {
+                app.push_error("Could not stop run", error);
+            }),
         }
     }
 
     pub(crate) fn apply_command_result(&mut self, result: CommandResult) {
-        let current = self.current_agent.clone();
-        self.switch_agent("/root");
         match result {
             CommandResult::Message(Ok(sent)) => {
-                // Main folds the root projector before routing here, so a
+                // Main folds the target projector before routing here, so a
                 // missing consumed check can only under-report; the pending
                 // row is then cleared by the delivery fold.
                 self.apply_message_receipt(sent, false);
             }
             CommandResult::Message(Err(error)) => self.apply_message_error(error),
             CommandResult::Interrupt(result) => self.apply_interrupt_result(result),
-            CommandResult::Compact(Ok(message)) => {
-                self.finish_command();
-                self.push_entry(EntryKind::System, "Compact", message);
-                self.status = "Ready".to_owned();
-            }
-            CommandResult::Compact(Err(error)) => {
-                self.finish_command();
-                self.push_error("Compaction failed", error);
-            }
-            CommandResult::SwitchModel {
-                index,
-                result: Ok(message),
-            } => {
-                self.finish_command();
-                self.selected_model = index;
-                self.current_model = Some(self.models[index].registry_id.clone());
-                self.push_entry(EntryKind::System, "Model", message);
-                self.status = "Ready".to_owned();
-            }
-            CommandResult::SwitchModel {
-                result: Err(error), ..
-            } => {
-                self.finish_command();
-                self.push_error("Model switch failed", error);
-            }
-            CommandResult::SetEffort {
-                index,
-                effort,
-                result: Ok(message),
-            } => {
-                self.finish_command();
-                let effort_index = self.models[index]
-                    .efforts
-                    .iter()
-                    .position(|configured| configured == &effort)
-                    .expect("runtime returns the requested configured effort");
-                self.selected_efforts[index] = effort_index;
-                self.push_entry(EntryKind::System, "Effort", message);
-                self.status = "Ready".to_owned();
-            }
-            CommandResult::SetEffort {
-                result: Err(error), ..
-            } => {
-                self.finish_command();
-                self.push_error("Effort switch failed", error);
-            }
-        }
-        if current != "/root" {
-            self.switch_agent(&current);
+            root_result => self.with_agent("/root", |app| match root_result {
+                CommandResult::Compact(Ok(message)) => {
+                    app.finish_command();
+                    app.push_entry(EntryKind::System, "Compact", message);
+                    app.status = "Ready".to_owned();
+                }
+                CommandResult::Compact(Err(error)) => {
+                    app.finish_command();
+                    app.push_error("Compaction failed", error);
+                }
+                CommandResult::SwitchModel {
+                    index,
+                    result: Ok(message),
+                } => {
+                    app.finish_command();
+                    app.selected_model = index;
+                    app.current_model = Some(app.models[index].registry_id.clone());
+                    app.push_entry(EntryKind::System, "Model", message);
+                    app.status = "Ready".to_owned();
+                }
+                CommandResult::SwitchModel {
+                    result: Err(error), ..
+                } => {
+                    app.finish_command();
+                    app.push_error("Model switch failed", error);
+                }
+                CommandResult::SetEffort {
+                    index,
+                    effort,
+                    result: Ok(message),
+                } => {
+                    app.finish_command();
+                    let effort_index = app.models[index]
+                        .efforts
+                        .iter()
+                        .position(|configured| configured == &effort)
+                        .expect("runtime returns the requested configured effort");
+                    app.selected_efforts[index] = effort_index;
+                    app.push_entry(EntryKind::System, "Effort", message);
+                    app.status = "Ready".to_owned();
+                }
+                CommandResult::SetEffort {
+                    result: Err(error), ..
+                } => {
+                    app.finish_command();
+                    app.push_error("Effort switch failed", error);
+                }
+                CommandResult::Message(_) | CommandResult::Interrupt(_) => {
+                    unreachable!("addressed results were handled before root routing")
+                }
+            }),
         }
     }
 
@@ -2447,6 +2481,7 @@ impl App {
             model: self.current_model.take(),
             effort: self.current_effort.take(),
             run_active: previous_run_active,
+            pending_steers: std::mem::take(&mut self.pending_steers),
             created_ord: self.current_created_ord,
             committed_len: self.committed_len,
             overlay_turn: self.overlay_turn,
@@ -2466,6 +2501,7 @@ impl App {
         self.current_model = next.model;
         self.current_effort = next.effort;
         self.current_run_active = next.run_active;
+        self.pending_steers = next.pending_steers;
         self.current_created_ord = next.created_ord;
         if address == "/root" {
             self.root_run_active = next.run_active;
@@ -2528,6 +2564,7 @@ impl AgentConversation {
             model: None,
             effort: None,
             run_active: false,
+            pending_steers: Vec::new(),
             created_ord,
             committed_len: 0,
             overlay_turn: 0,
@@ -2551,6 +2588,7 @@ impl AgentConversation {
             model: history.model,
             effort: history.effort,
             run_active: !history.run_completed,
+            pending_steers: Vec::new(),
             created_ord,
             overlay_turn: 0,
             dead_runs: BTreeSet::new(),
@@ -3242,8 +3280,8 @@ mod tests {
     };
     use crate::config::ModelChoice;
     use crate::runtime::{
-        AgentHistory, Command, CommandResult, CommittedRow, FoldOutcome, HistoryEntry, HistoryKind,
-        SentMessage,
+        AgentHistory, Command, CommandResult, CommittedRow, FailedMessage, FoldOutcome,
+        HistoryEntry, HistoryKind, SentMessage,
     };
 
     fn committed(kind: HistoryKind, title: &str, body: &str, run_id: Option<&str>) -> CommittedRow {
@@ -3316,7 +3354,7 @@ mod tests {
         let mut app = app();
         app.input = InputBuffer::at_end("hello".to_owned());
         let command = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(matches!(command, Some(Command::Message(_))));
+        assert!(matches!(command, Some(Command::Message { .. })));
         assert_eq!(app.pending_steers.len(), 1);
         assert!(app.pending_steers[0].message_id.is_none());
         assert_eq!(app.pending_steers[0].text, "hello");
@@ -3332,6 +3370,7 @@ mod tests {
         });
         app.apply_message_receipt(
             SentMessage {
+                target: ActorAddress::new("/root").unwrap(),
                 message_id: "m1".to_owned(),
                 text: "hello".to_owned(),
             },
@@ -3350,11 +3389,31 @@ mod tests {
         });
         app.apply_message_receipt(
             SentMessage {
+                target: ActorAddress::new("/root").unwrap(),
                 message_id: "m1".to_owned(),
                 text: "hello".to_owned(),
             },
             true,
         );
+        assert!(app.pending_steers.is_empty());
+    }
+
+    #[test]
+    fn consumed_receipt_does_not_report_queued_during_an_active_run() {
+        let mut app = app();
+        app.current_run_active = true;
+        app.status = "Working…".to_owned();
+
+        app.apply_message_receipt(
+            SentMessage {
+                target: ActorAddress::new("/root").unwrap(),
+                message_id: "m1".to_owned(),
+                text: "hello".to_owned(),
+            },
+            true,
+        );
+
+        assert_eq!(app.status, "Working…");
         assert!(app.pending_steers.is_empty());
     }
 
@@ -3365,7 +3424,11 @@ mod tests {
         let _ = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(app.pending_steers.len(), 1);
         assert!(app.input.text.is_empty());
-        app.apply_message_error("the journal rejected the message".to_owned());
+        app.apply_message_error(FailedMessage {
+            target: ActorAddress::new("/root").unwrap(),
+            text: "hello".to_owned(),
+            error: "the journal rejected the message".to_owned(),
+        });
         assert!(app.pending_steers.is_empty());
         assert_eq!(app.input.text, "hello");
     }
@@ -3504,7 +3567,7 @@ mod tests {
         // The draft stays editable across the newline, and Enter still submits.
         app.input.insert('s');
         let command = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(matches!(command, Some(Command::Message(_))));
+        assert!(matches!(command, Some(Command::Message { .. })));
         assert_eq!(app.pending_steers[0].text, "first\ns");
     }
 
@@ -4064,7 +4127,7 @@ mod tests {
 
         assert!(matches!(
             command,
-            Some(Command::Message(input)) if input == "one more thing"
+            Some(Command::Message { input, .. }) if input == "one more thing"
         ));
         assert!(app.input.text.is_empty());
         assert!(app.busy);
@@ -4077,6 +4140,7 @@ mod tests {
         // The receipt registers a pending steer, not a conversation row.
         app.apply_message_receipt(
             SentMessage {
+                target: ActorAddress::new("/root").unwrap(),
                 message_id: "steer-1".to_owned(),
                 text: "one more thing".to_owned(),
             },
@@ -4103,7 +4167,7 @@ mod tests {
 
         assert!(matches!(
             command,
-            Some(Command::Message(input)) if input == "keep going"
+            Some(Command::Message { input, .. }) if input == "keep going"
         ));
     }
 
@@ -4143,6 +4207,7 @@ mod tests {
         app.busy = true;
         app.apply_message_receipt(
             SentMessage {
+                target: ActorAddress::new("/root").unwrap(),
                 message_id: "steer-a".to_owned(),
                 text: "first steer".to_owned(),
             },
@@ -4150,6 +4215,7 @@ mod tests {
         );
         app.apply_message_receipt(
             SentMessage {
+                target: ActorAddress::new("/root").unwrap(),
                 message_id: "steer-b".to_owned(),
                 text: "second steer".to_owned(),
             },
@@ -4201,6 +4267,7 @@ mod tests {
 
         app.apply_message_receipt(
             SentMessage {
+                target: ActorAddress::new("/root").unwrap(),
                 message_id: "steer-race".to_owned(),
                 text: "raced message".to_owned(),
             },
@@ -4226,6 +4293,7 @@ mod tests {
         app.busy = true;
         app.apply_message_receipt(
             SentMessage {
+                target: ActorAddress::new("/root").unwrap(),
                 message_id: "steer-kept".to_owned(),
                 text: "still queued".to_owned(),
             },
@@ -4233,6 +4301,7 @@ mod tests {
         );
         app.apply_message_receipt(
             SentMessage {
+                target: ActorAddress::new("/root").unwrap(),
                 message_id: "steer-consumed".to_owned(),
                 text: "consumed by boundary".to_owned(),
             },
@@ -4328,6 +4397,7 @@ mod tests {
         // The send receipt arrives last; the projector reports it consumed.
         app.apply_message_receipt(
             SentMessage {
+                target: ActorAddress::new("/root").unwrap(),
                 message_id: "steer-1".to_owned(),
                 text: "also check the tests".to_owned(),
             },
@@ -5030,7 +5100,7 @@ mod tests {
 
         let command = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
-        assert!(matches!(command, Some(Command::Message(input)) if input == "one more"));
+        assert!(matches!(command, Some(Command::Message { input, .. }) if input == "one more"));
         assert!(
             app.follow_conversation_tail,
             "sending re-attaches the viewport to the tail"
@@ -5071,7 +5141,7 @@ mod tests {
         app.input.cursor = app.input.char_count();
         let command = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(
-            matches!(command, Some(Command::Message(input)) if input == "inspect the workspace")
+            matches!(command, Some(Command::Message { input, .. }) if input == "inspect the workspace")
         );
         // The message is not blocking and its row renders from the journal
         // fold once the runner delivers it.
@@ -5082,6 +5152,217 @@ mod tests {
                 .find(|session| session.id == app.session_id)
                 .and_then(|session| session.preview.as_deref()),
             Some("inspect the workspace")
+        );
+    }
+
+    #[test]
+    fn submitting_while_viewing_a_subagent_targets_that_subagent() {
+        let mut app = app();
+        app.apply_agent_event(AgentSystemEvent::Hosted {
+            address: ActorAddress::new("/root/researcher").unwrap(),
+            parent: Some(ActorAddress::new("/root").unwrap()),
+        });
+        assert!(app.switch_agent("/root/researcher"));
+        app.input.text = "keep digging".to_owned();
+        app.input.cursor = app.input.char_count();
+
+        let command = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(matches!(command, Some(Command::Message { target, input })
+                if target.as_str() == "/root/researcher" && input == "keep digging"));
+        // The view stays on the subagent; the message does not snap to root.
+        assert_eq!(app.current_agent, "/root/researcher");
+    }
+
+    #[test]
+    fn submitting_to_a_stopped_agent_defers_rejection_to_the_runtime() {
+        let mut app = app();
+        app.ensure_agent("/root/worker", Some("/root".to_owned()), "Stopped");
+        assert!(app.switch_agent("/root/worker"));
+        app.input.text = "are you there".to_owned();
+        app.input.cursor = app.input.char_count();
+
+        let command = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(matches!(command, Some(Command::Message { target, input })
+                if target.as_str() == "/root/worker" && input == "are you there"));
+        assert_eq!(app.pending_steers.len(), 1);
+
+        app.apply_message_error(FailedMessage {
+            target: ActorAddress::new("/root/worker").unwrap(),
+            text: "are you there".to_owned(),
+            error: "actor is no longer resident".to_owned(),
+        });
+        assert!(app.pending_steers.is_empty());
+        assert_eq!(app.input.text, "are you there");
+        assert!(
+            app.entries
+                .last()
+                .unwrap()
+                .body
+                .contains("no longer resident")
+        );
+    }
+
+    #[test]
+    fn a_subagent_steer_clears_via_its_own_fold_not_roots() {
+        let mut app = app();
+        app.apply_agent_event(AgentSystemEvent::Hosted {
+            address: ActorAddress::new("/root/researcher").unwrap(),
+            parent: Some(ActorAddress::new("/root").unwrap()),
+        });
+        assert!(app.switch_agent("/root/researcher"));
+        app.input.text = "keep digging".to_owned();
+        app.input.cursor = app.input.char_count();
+        let command = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(command, Some(Command::Message { .. })));
+        // The optimistic steer sits in the viewed (subagent) queue.
+        assert_eq!(app.pending_steers.len(), 1);
+
+        // The durable receipt attaches the message id, scoped to the subagent.
+        app.apply_message_receipt(
+            SentMessage {
+                target: ActorAddress::new("/root/researcher").unwrap(),
+                message_id: "steer-9".to_owned(),
+                text: "keep digging".to_owned(),
+            },
+            false,
+        );
+        assert_eq!(app.pending_steers.len(), 1);
+        assert_eq!(app.pending_steers[0].message_id.as_deref(), Some("steer-9"));
+
+        // A root fold must NOT clear the subagent's steer (the original bug).
+        let mut root_fold = fold_with_rows(Vec::new(), None);
+        root_fold.consumed_message_ids = vec!["steer-9".to_owned()];
+        app.apply_fold("/root", root_fold);
+        assert_eq!(
+            app.pending_steers.len(),
+            1,
+            "a root fold must not clear a steer owned by the subagent"
+        );
+
+        // The subagent's own fold consumes the message id and clears it.
+        let mut child_fold = fold_with_rows(Vec::new(), None);
+        child_fold.consumed_message_ids = vec!["steer-9".to_owned()];
+        app.apply_fold("/root/researcher", child_fold);
+        assert!(
+            app.pending_steers.is_empty(),
+            "the subagent's fold clears its own pending steer"
+        );
+    }
+
+    #[test]
+    fn subagent_receipt_is_routed_after_switching_back_to_root() {
+        let mut app = app();
+        app.apply_agent_event(AgentSystemEvent::Hosted {
+            address: ActorAddress::new("/root/researcher").unwrap(),
+            parent: Some(ActorAddress::new("/root").unwrap()),
+        });
+        assert!(app.switch_agent("/root/researcher"));
+        app.input = InputBuffer::at_end("keep digging".to_owned());
+        let command = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(command, Some(Command::Message { .. })));
+        assert!(app.switch_agent("/root"));
+
+        app.apply_message_receipt(
+            SentMessage {
+                target: ActorAddress::new("/root/researcher").unwrap(),
+                message_id: "steer-10".to_owned(),
+                text: "keep digging".to_owned(),
+            },
+            false,
+        );
+
+        assert_eq!(app.current_agent, "/root");
+        assert!(app.pending_steers.is_empty());
+        assert!(app.switch_agent("/root/researcher"));
+        assert_eq!(
+            app.pending_steers[0].message_id.as_deref(),
+            Some("steer-10")
+        );
+    }
+
+    #[test]
+    fn subagent_send_failure_does_not_overwrite_another_panes_draft() {
+        let mut app = app();
+        app.apply_agent_event(AgentSystemEvent::Hosted {
+            address: ActorAddress::new("/root/researcher").unwrap(),
+            parent: Some(ActorAddress::new("/root").unwrap()),
+        });
+        assert!(app.switch_agent("/root/researcher"));
+        app.input = InputBuffer::at_end("keep digging".to_owned());
+        let command = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(command, Some(Command::Message { .. })));
+        assert!(app.switch_agent("/root"));
+        app.input = InputBuffer::at_end("unrelated root draft".to_owned());
+
+        app.apply_message_error(FailedMessage {
+            target: ActorAddress::new("/root/researcher").unwrap(),
+            text: "keep digging".to_owned(),
+            error: "actor retired".to_owned(),
+        });
+
+        assert_eq!(app.current_agent, "/root");
+        assert_eq!(app.input.text, "unrelated root draft");
+        assert!(app.switch_agent("/root/researcher"));
+        assert!(app.pending_steers.is_empty());
+        assert!(app.entries.last().unwrap().body.contains("keep digging"));
+    }
+
+    #[test]
+    fn late_root_command_result_does_not_enter_the_selected_subagent_pane() {
+        let mut app = app();
+        app.apply_agent_event(AgentSystemEvent::Hosted {
+            address: ActorAddress::new("/root/researcher").unwrap(),
+            parent: Some(ActorAddress::new("/root").unwrap()),
+        });
+        assert!(app.switch_agent("/root/researcher"));
+        let child_entries = app.entries.len();
+        let child_status = app.status.clone();
+
+        app.apply_command_result(CommandResult::Compact(Ok("root compacted".to_owned())));
+
+        assert_eq!(app.current_agent, "/root/researcher");
+        assert_eq!(app.entries.len(), child_entries);
+        assert_eq!(app.status, child_status);
+        assert!(app.switch_agent("/root"));
+        let entry = app.entries.last().unwrap();
+        assert_eq!(entry.title, "Compact");
+        assert_eq!(entry.body, "root compacted");
+    }
+
+    #[test]
+    fn transcript_fold_failures_stay_with_their_owning_agent() {
+        let mut app = app();
+        app.apply_agent_event(AgentSystemEvent::Hosted {
+            address: ActorAddress::new("/root/researcher").unwrap(),
+            parent: Some(ActorAddress::new("/root").unwrap()),
+        });
+        let root_entries = app.entries.len();
+
+        app.fold_failed("/root/researcher", "child journal failed".to_owned());
+        assert_eq!(app.current_agent, "/root");
+        assert_eq!(app.entries.len(), root_entries);
+        assert!(app.switch_agent("/root/researcher"));
+        assert!(
+            app.entries
+                .last()
+                .unwrap()
+                .body
+                .contains("child journal failed")
+        );
+        let child_entries = app.entries.len();
+
+        app.fold_failed("/root", "root journal failed".to_owned());
+        assert_eq!(app.current_agent, "/root/researcher");
+        assert_eq!(app.entries.len(), child_entries);
+        assert!(app.switch_agent("/root"));
+        assert!(
+            app.entries
+                .last()
+                .unwrap()
+                .body
+                .contains("root journal failed")
         );
     }
 

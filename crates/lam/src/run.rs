@@ -115,6 +115,7 @@ struct RunStart {
     output: OutputContract,
     events: mpsc::Sender<RunEvent>,
     admission: oneshot::Sender<Result<MessageReceipt, ActorError>>,
+    admission_cancel: oneshot::Receiver<()>,
     completion: oneshot::Sender<Result<serde_json::Value, ActorError>>,
 }
 
@@ -124,6 +125,7 @@ pub struct Run<T> {
     start: Option<RunStart>,
     events: mpsc::Receiver<RunEvent>,
     admission: Option<oneshot::Receiver<Result<MessageReceipt, ActorError>>>,
+    admission_cancel: Option<oneshot::Sender<()>>,
     completion: oneshot::Receiver<Result<serde_json::Value, ActorError>>,
     marker: PhantomData<T>,
 }
@@ -154,6 +156,7 @@ impl Run<String> {
             start,
             events: self.events,
             admission: self.admission,
+            admission_cancel: self.admission_cancel,
             completion: self.completion,
             marker: PhantomData,
         }
@@ -169,6 +172,7 @@ impl<T> Run<T> {
     ) -> Self {
         let (event_sender, events) = mpsc::channel(RUN_EVENT_BUFFER);
         let (admission_sender, admission) = oneshot::channel();
+        let (admission_cancel, admission_cancellation) = oneshot::channel();
         let (completion_sender, completion) = oneshot::channel();
         Self {
             message_id,
@@ -179,10 +183,12 @@ impl<T> Run<T> {
                 output: OutputContract::Text,
                 events: event_sender,
                 admission: admission_sender,
+                admission_cancel: admission_cancellation,
                 completion: completion_sender,
             }),
             events,
             admission: Some(admission),
+            admission_cancel: Some(admission_cancel),
             completion,
             marker: PhantomData,
         }
@@ -212,6 +218,38 @@ impl<T> Run<T> {
         admission.await.map_err(|_| ActorError::Unavailable)?
     }
 
+    /// Waits for durable admission, requesting cancellation if `cancelled`
+    /// resolves first. The actor runner settles the in-flight append before
+    /// answering: a message already committed still returns its receipt, while
+    /// cancellation before the append returns [`ActorError::Aborted`].
+    pub async fn wait_admitted_or_cancel<F>(
+        &mut self,
+        cancelled: F,
+    ) -> Result<MessageReceipt, ActorError>
+    where
+        F: Future<Output = ()>,
+    {
+        self.ensure_started();
+        let mut admission = self.admission.take().ok_or_else(|| ActorError::State {
+            message: "call admission was already observed".to_owned(),
+        })?;
+        let cancel = self
+            .admission_cancel
+            .take()
+            .ok_or_else(|| ActorError::State {
+                message: "call admission cancellation was already observed".to_owned(),
+            })?;
+        tokio::pin!(cancelled);
+        tokio::select! {
+            biased;
+            result = &mut admission => result.map_err(|_| ActorError::Unavailable)?,
+            () = &mut cancelled => {
+                let _ = cancel.send(());
+                admission.await.map_err(|_| ActorError::Unavailable)?
+            }
+        }
+    }
+
     fn ensure_started(&mut self) {
         let Some(start) = self.start.take() else {
             return;
@@ -223,6 +261,7 @@ impl<T> Run<T> {
             output,
             events,
             admission,
+            admission_cancel,
             completion,
         } = start;
 
@@ -248,7 +287,15 @@ impl<T> Run<T> {
                 return;
             }
         };
-        let call = CallRequest::new(message, output, events, admission, completion, lease);
+        let call = CallRequest::new(
+            message,
+            output,
+            events,
+            admission,
+            admission_cancel,
+            completion,
+            lease,
+        );
         if let Err(error) = commands.send(RunnerCommand::Call(Box::new(call))) {
             let RunnerCommand::Call(call) = error.0 else {
                 unreachable!("only a call command was sent")

@@ -13,7 +13,8 @@ use lam::{
     ProjectedContextEntry, Revision, RunProgress, SYSTEM_NOTICE_CODEC_ID, SystemNotice,
 };
 use lam_agents::{
-    Agent, AgentSystem, AgentSystemEvents, InterruptionScope, SubagentConfig, SubagentConfigBuilder,
+    ActorAddress, Agent, AgentSystem, AgentSystemEvents, InterruptionScope, SubagentConfig,
+    SubagentConfigBuilder,
 };
 use lam_batteries::BatteriesPack;
 use lam_code::{CodingPack, FilesystemAccess, LocalCommandRunner};
@@ -131,7 +132,11 @@ pub(crate) enum Command {
     /// A user message. Always admitted as a durable steer: if a run is
     /// active it is delivered at the next model boundary, otherwise the
     /// runner wakes and starts a new run with it.
-    Message(String),
+    Message {
+        /// Agent the user is addressing (the one in the conversation pane).
+        target: ActorAddress,
+        input: String,
+    },
     Interrupt,
     Compact,
     SwitchModel {
@@ -160,7 +165,7 @@ pub(crate) enum Command {
 /// comes from the journal projectors, never from a command result.
 #[derive(Debug)]
 pub(crate) enum CommandResult {
-    Message(Result<SentMessage, String>),
+    Message(Result<SentMessage, FailedMessage>),
     /// Whether the interruption found a run to stop.
     Interrupt(Result<bool, String>),
     Compact(Result<String, String>),
@@ -178,10 +183,23 @@ pub(crate) enum CommandResult {
 /// Receipt for a durably admitted user message.
 #[derive(Debug)]
 pub(crate) struct SentMessage {
+    /// Agent the message was admitted to.
+    pub(crate) target: ActorAddress,
     /// Durable identity of the admitted mailbox message.
     pub(crate) message_id: String,
     /// The user's message text.
     pub(crate) text: String,
+}
+
+/// A user message which could not be admitted to its intended actor.
+#[derive(Debug)]
+pub(crate) struct FailedMessage {
+    /// Agent the user addressed.
+    pub(crate) target: ActorAddress,
+    /// Submitted text, retained so asynchronous failure never loses it.
+    pub(crate) text: String,
+    /// Durable-admission diagnostic.
+    pub(crate) error: String,
 }
 
 /// One committed transcript row rendered from a journal context entry.
@@ -614,28 +632,41 @@ impl Runtime {
             command => command,
         };
         let root = self.root.clone();
+        let system = self.system.clone();
         let runtime = self
             .command_runtime
             .as_ref()
             .expect("the command runtime is present while the TUI is running");
         let handle = runtime.spawn(async move {
             let result = match command {
-                Command::Message(input) => {
-                    let result = match root.send(input.clone(), DeliveryMode::Steer).await {
+                Command::Message { target, input } => {
+                    let result = match system.agent(&target) {
+                        Some(agent) => agent
+                            .send(input.clone(), DeliveryMode::Steer)
+                            .await
+                            .map_err(|e| e.to_string()),
+                        None => Err(format!("{target} is not running")),
+                    };
+                    let result = match result {
                         Ok(receipt) => {
                             tracing::debug!(
                                 target: "lam_tui::runtime",
                                 event = "tui.message_admitted",
-                                actor_id = "/root",
+                                actor_id = %target,
                                 message_id = %receipt.message_id,
                                 "user message durably admitted"
                             );
                             Ok(SentMessage {
+                                target,
                                 message_id: receipt.message_id.to_string(),
                                 text: input,
                             })
                         }
-                        Err(error) => Err(error.to_string()),
+                        Err(error) => Err(FailedMessage {
+                            target,
+                            text: input,
+                            error,
+                        }),
                     };
                     CommandResult::Message(result)
                 }

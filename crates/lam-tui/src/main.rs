@@ -225,6 +225,10 @@ async fn tokio_main() -> Result<(), AppError> {
                                             .map_err(AppError::Terminal)?;
                                         let shutdown = runtime.system.shutdown().await;
                                         runtime.quiesce().await;
+                                        // Quiesce has joined every producer, so
+                                        // remaining results belong exclusively
+                                        // to the session being replaced.
+                                        while command_receiver.try_recv().is_ok() {}
                                         shutdown.map_err(|error| {
                                             AppError::Shutdown(error.to_string())
                                         })?;
@@ -325,6 +329,9 @@ async fn tokio_main() -> Result<(), AppError> {
                                             .map_err(AppError::Terminal)?;
                                         let shutdown = runtime.system.shutdown().await;
                                         runtime.quiesce().await;
+                                        // Never route queued results from the
+                                        // deleted session into its successor.
+                                        while command_receiver.try_recv().is_ok() {}
                                         shutdown.map_err(|error| {
                                             AppError::Shutdown(error.to_string())
                                         })?;
@@ -409,8 +416,9 @@ async fn tokio_main() -> Result<(), AppError> {
                         CommandResult::Message(Ok(sent)) => {
                             // Fold first: if the delivery already committed, the
                             // row is rendered and the receipt registers nothing.
-                            fold_and_apply(&mut runtime, &mut app, "/root").await;
-                            let consumed = runtime.is_consumed("/root", &sent.message_id);
+                            let target = sent.target.to_string();
+                            fold_and_apply(&mut runtime, &mut app, &target).await;
+                            let consumed = runtime.is_consumed(&target, &sent.message_id);
                             app.apply_message_receipt(sent, consumed);
                         }
                         CommandResult::Message(Err(error)) => app.apply_message_error(error),

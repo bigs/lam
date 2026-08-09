@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use crate::config::{AGENTS_NAMESPACE, ModelTarget};
 use crate::system::SystemInner;
-use crate::{ActorAddress, SubagentConfig};
+use crate::{ActorAddress, AgentOutcome, SubagentConfig};
 
 /// Input accepted by both `lam.agents.spawn` and `lam.agents.call`.
 #[derive(Clone, Debug, JsonSchema, Deserialize)]
@@ -295,6 +295,20 @@ pub enum WaitError {
         /// Durable-delivery diagnostic.
         message: String,
     },
+    /// The child was cancelled and its terminal outcome is durable in this
+    /// actor's inbox. Cancellation remains a failed wait rather than a normal
+    /// completion, while preserving the structured outcome for inspection.
+    #[error("spawned task `{address}` was cancelled")]
+    Cancelled {
+        /// Cancelled direct child.
+        address: ActorAddress,
+        /// Durable terminal child outcome.
+        outcome: AgentOutcome,
+        /// Stable identity of the inbox message carrying the outcome.
+        inbox_message_id: String,
+        /// Caller-local journal revision containing the outcome.
+        inbox_revision: u64,
+    },
     /// The owning agent system is no longer available.
     #[error("the agent system is unavailable")]
     Unavailable,
@@ -365,7 +379,7 @@ where
         "Create a persistent direct child at {address}/<name>, wait asynchronously for its initial task, and return AgentOutcome. It uses the same child-request shape as `lam.agents.spawn`. Cancellation stops the child subtree. `model: {{ provider, model }}` and `effort` are required. Unless the user or project instructions request otherwise, pass the current selection from `lam.dir({{ path: 'lam' }})` when it includes an effort and is allowed by `lam.agents.models()`; otherwise choose an allowed combination explicitly. Omit namespaces for the complete configured set; allowed namespaces: [{}].",
         namespace_docs,
     );
-    let wait_docs = "Wait without steering for the initial tasks of direct children returned by `lam.agents.spawn`. Resolves only after every terminal `AgentOutcome` is durably admitted to this actor's inbox; the next model continuation receives the wait tool result and those inbox messages together. Waiting does not message, interrupt, stop, or otherwise steer the children. If the surrounding eval is cancelled or times out, the children continue running and their outcomes are still delivered.";
+    let wait_docs = "Wait without steering for the initial tasks of direct children returned by `lam.agents.spawn`. Resolves only after every terminal `AgentOutcome` is durably admitted to this actor's inbox; the next model continuation receives the wait tool result and those inbox messages together. A cancelled child produces a structured failed wait carrying its durable `AgentOutcome::Cancelled`. Waiting does not message, interrupt, stop, or otherwise steer the children. If the surrounding eval is cancelled or times out, admitted children continue running and their outcomes are still delivered.";
 
     let mut namespace = Namespace::new(AGENTS_NAMESPACE, docs);
     namespace = namespace.function(
@@ -616,6 +630,30 @@ mod tests {
             ["gpt-default", "gpt-other"]
         );
         assert_eq!(catalog.providers[1].models[0].efforts, ["low", "high"]);
+    }
+
+    #[test]
+    fn cancelled_wait_error_has_stable_structured_serialization() {
+        let address = ActorAddress::new("/root/worker").unwrap();
+        let error = WaitError::Cancelled {
+            address: address.clone(),
+            outcome: AgentOutcome::Cancelled {
+                address,
+                message_id: "child-message".to_owned(),
+                reason: Some("interrupted".to_owned()),
+            },
+            inbox_message_id: "inbox-message".to_owned(),
+            inbox_revision: 17,
+        };
+
+        let value = serde_json::to_value(error).unwrap();
+        assert_eq!(value["code"], "cancelled");
+        assert_eq!(value["address"], "/root/worker");
+        assert_eq!(value["outcome"]["status"], "cancelled");
+        assert_eq!(value["outcome"]["address"], "/root/worker");
+        assert_eq!(value["outcome"]["message_id"], "child-message");
+        assert_eq!(value["inbox_message_id"], "inbox-message");
+        assert_eq!(value["inbox_revision"], 17);
     }
 
     fn target(provider: &str, model: &str) -> ModelTarget {

@@ -76,8 +76,22 @@ where
         self.status.stopped.load(Ordering::Acquire)
     }
 
+    fn is_retiring(&self) -> bool {
+        lock(&self.status.reason).is_some()
+    }
+
+    /// Wakes this actor only when retirement has not started. Holding the
+    /// stop-reason lock across the notification orders this decision with
+    /// every stop path, which acquires the same lock before aborting.
+    fn wake_unless_retiring(&self) {
+        let reason = lock(&self.status.reason);
+        if reason.is_none() {
+            self.handle.actor_ref().wake();
+        }
+    }
+
     fn ensure_running(&self) -> Result<(), AgentSystemError> {
-        if !self.is_stopped() {
+        if !self.is_retiring() && !self.is_stopped() {
             return Ok(());
         }
         let address = self.address.clone();
@@ -97,6 +111,11 @@ where
         if matches!(*current, Some(StopReason::Interrupted))
             && matches!(reason, StopReason::Stopped | StopReason::Cancelled)
         {
+            // Preserve the interruption diagnostic, but do not discard the
+            // stronger ownership action: a cancelled call or pre-admission
+            // spawn must still force the child runner to retire.
+            drop(current);
+            self.abort.abort();
             return;
         }
         *current = Some(reason);
@@ -248,6 +267,19 @@ where
     /// Takes the single-consumer stream covering every managed actor.
     pub fn take_events(&self) -> Option<AgentSystemEvents> {
         lock(&self.inner.event_receiver).take()
+    }
+
+    /// Returns a handle to a resident actor, if it is still running.
+    ///
+    /// `None` means the address is not resident: either it was never hosted,
+    /// or it already retired and released its residency slot. The returned
+    /// [`Agent`] is a cheap cloneable handle; use it to send to or interrupt
+    /// that specific actor.
+    pub fn agent(&self, address: &ActorAddress) -> Option<Agent<S>> {
+        self.inner.resident(address).ok().map(|resident| Agent {
+            resident,
+            _system: Arc::clone(&self.inner),
+        })
     }
 
     /// Hosts an actor builder on the next local executor in the pool.
@@ -513,8 +545,13 @@ struct SpawnedTask {
 
 enum OutcomeDelivery {
     Pending,
-    Delivered(MessageReceipt),
-    Failed { message: String },
+    Delivered {
+        receipt: MessageReceipt,
+        cancellation: Option<AgentOutcome>,
+    },
+    Failed {
+        message: String,
+    },
 }
 
 struct ChildLaunch<S>
@@ -772,15 +809,13 @@ where
         } = self
             .prepare_child(parent_address, parent_depth, config, request)
             .await?;
-        let admission_guard = ChildAdmissionGuard::new(self, &child);
         let activity = self.begin_activity().map_err(spawn_system_error)?;
         let (ready, admitted) = oneshot::channel();
-        let (accept, accepted) = oneshot::channel();
         let system = Arc::clone(self);
         let background_child = child.clone();
         tokio::spawn(async move {
             system
-                .run_background_child(parent, background_child, task, ready, accepted, activity)
+                .run_background_child(parent, background_child, task, ready, activity)
                 .await;
         });
 
@@ -790,8 +825,6 @@ where
             .map_err(|error| SpawnError::StartFailed {
                 message: error.to_string(),
             })?;
-        accept.send(()).map_err(|_| SpawnError::Unavailable)?;
-        admission_guard.disarm();
         Ok(SpawnReceipt {
             address,
             model,
@@ -843,63 +876,72 @@ where
         parent: Arc<ResidentActor<S>>,
         child: Agent<S>,
         task: String,
-        ready: oneshot::Sender<Result<MessageReceipt, lam::ActorError>>,
-        accepted: oneshot::Receiver<()>,
+        mut ready: oneshot::Sender<Result<MessageReceipt, lam::ActorError>>,
         _activity: ActivityGuard<S>,
     ) {
+        if ready.is_closed() {
+            self.cancel_subtree(&child.resident.address, StopReason::Cancelled);
+            return;
+        }
         let parent_ref = parent.handle.actor_ref();
         let mut run = child.resident.handle.call_from_actor(&parent_ref, task);
         let message_id = run.message_id().clone();
-        let receipt = match run.wait_admitted().await {
+        // The durable initial-task admission is the spawn ownership boundary.
+        // Before it, dropping the caller cancels the child. Once admission
+        // wins, a caller which no longer receives its SpawnReceipt merely
+        // loses the observation: the child and eventual outcome survive.
+        let receipt = match run.wait_admitted_or_cancel(ready.closed()).await {
             Ok(receipt) => receipt,
             Err(error) => {
                 let _ = ready.send(Err(error));
+                self.cancel_subtree(&child.resident.address, StopReason::Cancelled);
                 return;
             }
         };
         self.track_spawned_task(child.resident.address.clone(), message_id.clone());
-        if ready.send(Ok(receipt)).is_err() || accepted.await.is_err() {
-            self.set_spawned_delivery(
-                &child.resident.address,
-                OutcomeDelivery::Failed {
-                    message: "spawn was cancelled before its admission receipt was accepted"
-                        .to_owned(),
-                },
-            );
-            self.cancel_subtree(&child.resident.address, StopReason::Cancelled);
-            return;
-        }
+        let _ = ready.send(Ok(receipt));
         let result = run.await;
-        let was_interrupted = matches!(&result, Err(lam::ActorError::Interrupted));
         let outcome =
             AgentOutcome::from_result(child.resident.address.clone(), &message_id, result);
         self.emit(AgentSystemEvent::Outcome {
             outcome: outcome.clone(),
         });
-        if was_interrupted {
-            self.set_spawned_delivery(
-                &child.resident.address,
-                OutcomeDelivery::Failed {
-                    message: "agent tree was interrupted before outcome delivery".to_owned(),
-                },
-            );
-            return;
-        }
-        let delivery = match parent.ensure_running() {
-            Ok(()) => {
-                let child_ref = child.resident.handle.actor_ref();
-                parent
+        let child_ref = child.resident.handle.actor_ref();
+        let cancellation =
+            matches!(outcome, AgentOutcome::Cancelled { .. }).then(|| outcome.clone());
+        let delivery = if cancellation.is_some() {
+            // Journal cancellation without a wake, then order any wake for a
+            // surviving direct parent against retirement. Retiring
+            // intermediate parents retain the record without new model work.
+            let delivery = parent
+                .handle
+                .actor_ref()
+                .admit_from_actor(&child_ref, outcome.clone())
+                .await
+                .map_err(AgentSystemError::from);
+            if delivery.is_ok() {
+                parent.wake_unless_retiring();
+            }
+            delivery
+        } else {
+            match parent.ensure_running() {
+                Ok(()) => parent
                     .handle
                     .actor_ref()
-                    .send_from_actor(&child_ref, outcome)
+                    .send_from_actor(&child_ref, outcome.clone())
                     .await
-                    .map_err(AgentSystemError::from)
+                    .map_err(AgentSystemError::from),
+                Err(error) => Err(error),
             }
-            Err(error) => Err(error),
         };
         match delivery {
-            Ok(receipt) => self
-                .set_spawned_delivery(&child.resident.address, OutcomeDelivery::Delivered(receipt)),
+            Ok(receipt) => self.set_spawned_delivery(
+                &child.resident.address,
+                OutcomeDelivery::Delivered {
+                    receipt,
+                    cancellation,
+                },
+            ),
             Err(error) => self.set_spawned_delivery(
                 &child.resident.address,
                 OutcomeDelivery::Failed {
@@ -1076,6 +1118,7 @@ where
     ) -> Result<MessageReceipt, AgentSystemError> {
         let sender = self.resident(sender_address)?;
         let target = self.resident(target_address)?;
+        target.ensure_running()?;
         let sender_ref = sender.handle.actor_ref();
         let receipt = target
             .handle
@@ -1128,12 +1171,27 @@ where
                     };
                     match &task.delivery {
                         OutcomeDelivery::Pending => pending = true,
-                        OutcomeDelivery::Delivered(receipt) => completed.push(WaitedTask {
-                            address: address.clone(),
-                            message_id: task.message_id.to_string(),
-                            inbox_message_id: receipt.message_id.to_string(),
-                            inbox_revision: receipt.revision.get(),
-                        }),
+                        OutcomeDelivery::Delivered {
+                            receipt,
+                            cancellation,
+                        } => match cancellation {
+                            Some(outcome) => {
+                                return Err(WaitError::Cancelled {
+                                    address: address.clone(),
+                                    outcome: outcome.clone(),
+                                    inbox_message_id: receipt.message_id.to_string(),
+                                    inbox_revision: receipt.revision.get(),
+                                });
+                            }
+                            None => {
+                                completed.push(WaitedTask {
+                                    address: address.clone(),
+                                    message_id: task.message_id.to_string(),
+                                    inbox_message_id: receipt.message_id.to_string(),
+                                    inbox_revision: receipt.revision.get(),
+                                });
+                            }
+                        },
                         OutcomeDelivery::Failed { message } => {
                             return Err(WaitError::DeliveryFailed {
                                 address: address.clone(),
@@ -1386,13 +1444,7 @@ where
     }
 
     fn cancel_subtree(&self, address: &ActorAddress, reason: StopReason) {
-        let residents = {
-            let state = lock(&self.state);
-            if state.overlapping_interruption(address).is_some() {
-                return;
-            }
-            state.residents_in_subtree(address)
-        };
+        let residents = lock(&self.state).residents_in_subtree(address);
         for resident in residents {
             resident.request_stop(reason.clone());
         }
