@@ -1293,8 +1293,7 @@ fn render_agents_drawer(frame: &mut Frame<'_>, area: Rect, app: &App, suggestion
     // top + side frame (no bottom) and keep one full content line visible.
     let block = Block::default()
         .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
-        .border_style(Style::default().fg(ACCENT))
-        .style(Style::default().bg(PANEL));
+        .border_style(Style::default().fg(ACCENT));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {
