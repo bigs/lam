@@ -12,7 +12,9 @@ use lam::{
     ModelRequestConfig, ModelResponseMetadata, ModelResponseProjection, ModelSelection, Namespace,
     ProjectedContextEntry, Revision, RunProgress, SYSTEM_NOTICE_CODEC_ID, SystemNotice,
 };
-use lam_agents::{Agent, AgentSystem, AgentSystemEvents, SubagentConfig, SubagentConfigBuilder};
+use lam_agents::{
+    Agent, AgentSystem, AgentSystemEvents, InterruptionScope, SubagentConfig, SubagentConfigBuilder,
+};
 use lam_batteries::BatteriesPack;
 use lam_code::{CodingPack, FilesystemAccess, LocalCommandRunner};
 use lam_openai::chat_completions::{
@@ -638,7 +640,7 @@ impl Runtime {
                     CommandResult::Message(result)
                 }
                 Command::Interrupt => {
-                    let result = match root.interrupt().await {
+                    let result = match root.interrupt(InterruptionScope::Actor).await {
                         Ok(receipt) => Ok(receipt.is_some()),
                         Err(error) => Err(error.to_string()),
                     };

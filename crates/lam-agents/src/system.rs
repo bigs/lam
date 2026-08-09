@@ -24,7 +24,7 @@ use crate::namespace::{
 use crate::{
     ActorAddress, AgentIdentity, AgentInterruptionReceipt, AgentOutcome, AgentSystemBuildError,
     AgentSystemError, AgentSystemEvent, AgentSystemEvents, AgentTreeInterruptionReceipt,
-    StopReason, SubagentConfig,
+    InterruptionScope, StopReason, SubagentConfig,
 };
 
 const DEFAULT_MAX_AGENTS: usize = 64;
@@ -308,15 +308,20 @@ where
         self.inner.stop_subtree(address, StopReason::Stopped).await
     }
 
-    /// Recoverably interrupts one active tree and retires its descendants.
+    /// Recoverably interrupts the addressed actor's active run.
     ///
+    /// With [`InterruptionScope::Actor`] only that actor is interrupted and
+    /// its resident descendants keep running; with
+    /// [`InterruptionScope::Subtree`] every resident descendant is also
+    /// interrupted and retires after committing its interruption boundary.
     /// The addressed root remains resident and can accept a later prompt.
     /// Returns `None` when its durable projection has no active run.
     pub async fn interrupt(
         &self,
         address: &ActorAddress,
+        scope: InterruptionScope,
     ) -> Result<Option<AgentTreeInterruptionReceipt>, AgentSystemError> {
-        self.inner.interrupt_tree(address).await
+        self.inner.interrupt_tree(address, scope).await
     }
 }
 
@@ -456,14 +461,20 @@ where
         self.resident.handle.state().await.map_err(Into::into)
     }
 
-    /// Recoverably interrupts this actor and every resident descendant.
+    /// Recoverably interrupts this actor's active run.
     ///
-    /// This actor remains resident; descendants retire after committing their
-    /// own interruption boundaries.
+    /// With [`InterruptionScope::Actor`] only this actor is interrupted and
+    /// its resident descendants keep running; with
+    /// [`InterruptionScope::Subtree`] every resident descendant is also
+    /// interrupted and retires after committing its own interruption
+    /// boundary. This actor remains resident either way.
     pub async fn interrupt(
         &self,
+        scope: InterruptionScope,
     ) -> Result<Option<AgentTreeInterruptionReceipt>, AgentSystemError> {
-        self._system.interrupt_tree(&self.resident.address).await
+        self._system
+            .interrupt_tree(&self.resident.address, scope)
+            .await
     }
 }
 
@@ -1220,6 +1231,7 @@ where
     async fn interrupt_tree(
         self: &Arc<Self>,
         address: &ActorAddress,
+        scope: InterruptionScope,
     ) -> Result<Option<AgentTreeInterruptionReceipt>, AgentSystemError> {
         let _activity = self.begin_activity()?;
         let (_interruption, root) = InterruptionGuard::acquire(Arc::clone(self), address.clone())?;
@@ -1227,10 +1239,13 @@ where
             return Ok(None);
         }
 
-        let mut residents = {
-            let mut state = lock(&self.state);
-            state.prune_stopped();
-            state.residents_in_subtree(address)
+        let mut residents = match scope {
+            InterruptionScope::Actor => vec![Arc::clone(&root)],
+            InterruptionScope::Subtree => {
+                let mut state = lock(&self.state);
+                state.prune_stopped();
+                state.residents_in_subtree(address)
+            }
         };
         for resident in &residents {
             if resident.address != *address {

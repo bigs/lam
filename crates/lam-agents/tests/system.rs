@@ -9,14 +9,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use lam::{
-    ActorEventData, ActorId, ActorState, AppendOutcome, CodecId, CodecRef, EncodedPayload,
-    EvalRequest, EventBatch, JournalError, JournalPage, JournalStore, Lam, MemStore, MessageSource,
-    Model, ModelCodec, ModelDescriptor, ModelDirective, ModelEventSink, ModelProvider,
-    ModelRequestConfig, ModelResponseProjection, OutputContract, Revision,
+    ActorEventData, ActorId, ActorState, AppendOutcome, CodecId, CodecRef, ContextTransition,
+    EncodedPayload, EvalRequest, EventBatch, JournalError, JournalPage, JournalStore, Lam,
+    MemStore, MessageSource, Model, ModelCodec, ModelDescriptor, ModelDirective, ModelEventSink,
+    ModelProvider, ModelRequestConfig, ModelResponseProjection, OutputContract, Revision,
 };
 use lam_agents::{
-    ActorAddress, AgentOutcome, AgentSystem, AgentSystemError, AgentSystemEvent, StopReason,
-    SubagentConfig, SubagentConfigError,
+    ActorAddress, AgentOutcome, AgentSystem, AgentSystemError, AgentSystemEvent, InterruptionScope,
+    StopReason, SubagentConfig, SubagentConfigError,
 };
 use serde_json::{Value, json};
 use tokio::sync::Notify;
@@ -40,6 +40,7 @@ enum RoutingScenario {
     UnauthorizedStop,
     TreeInterruption,
     BackgroundInterruption,
+    ActorInterruption,
 }
 
 struct ProviderState {
@@ -370,6 +371,7 @@ fn scenario_response(scenario: RoutingScenario, request: &Value) -> Option<Value
         RoutingScenario::UnauthorizedStop => Some(unauthorized_stop_response(request)),
         RoutingScenario::TreeInterruption => Some(tree_interruption_response(request)),
         RoutingScenario::BackgroundInterruption => Some(background_interruption_response(request)),
+        RoutingScenario::ActorInterruption => Some(actor_interruption_response(request)),
     }
 }
 
@@ -584,6 +586,27 @@ fn background_interruption_response(request: &Value) -> Value {
   namespaces: []
 });
 lam.result("spawned background child")"#
+        });
+    }
+    json!({ "kind": "output", "value": "plain complete" })
+}
+
+fn actor_interruption_response(request: &Value) -> Value {
+    if has_message(request, "actor child task", Some("actor")) {
+        return json!({ "kind": "output", "value": "actor child complete" });
+    }
+    if has_message(request, "actor root task", Some("user")) {
+        return json!({
+            "kind": "eval",
+            "source": r#"const child = await lam.agents.spawn({
+  name: "child",
+  task: "actor child task",
+  model: { provider: "test", model: "model-a" },
+  effort: "high",
+  namespaces: []
+});
+await lam.agents.wait({ addresses: [child.address] });
+lam.result("unexpected root completion")"#
         });
     }
     json!({ "kind": "output", "value": "plain complete" })
@@ -1110,11 +1133,14 @@ async fn tree_interruption_is_durable_and_keeps_only_the_root_resident() {
     .await
     .unwrap_or_else(|_| panic!("leaf did not start; requests: {:?}", provider.requests()));
 
-    let receipt = tokio::time::timeout(std::time::Duration::from_secs(2), root.interrupt())
-        .await
-        .expect("tree interruption should not wait for blocked evals")
-        .unwrap()
-        .expect("the root has an active run");
+    let receipt = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        root.interrupt(InterruptionScope::Subtree),
+    )
+    .await
+    .expect("tree interruption should not wait for blocked evals")
+    .unwrap()
+    .expect("the root has an active run");
     assert_eq!(receipt.root.as_str(), "/interrupt-root");
     assert_eq!(
         receipt
@@ -1204,8 +1230,128 @@ async fn tree_interruption_is_a_noop_without_an_active_root_run() {
         .await
         .unwrap();
 
-    assert!(root.interrupt().await.unwrap().is_none());
+    assert!(
+        root.interrupt(InterruptionScope::Subtree)
+            .await
+            .unwrap()
+            .is_none()
+    );
     assert_eq!(root.call("plain task").await.unwrap(), "plain complete");
+    system.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn actor_interruption_leaves_descendants_running_and_outcomes_deliverable() {
+    let provider = RoutingProvider::for_scenario(RoutingScenario::ActorInterruption);
+    let model = Model::new(provider.clone(), TestCodec)
+        .with_descriptor(ModelDescriptor::new("test", "model-a", "test/messages").unwrap());
+    let system = AgentSystem::builder(MemStore::new())
+        .max_agents(2)
+        .build()
+        .unwrap();
+    let subagents: SubagentConfig<MemStore> = SubagentConfig::builder(model.clone(), "high")
+        .build()
+        .unwrap();
+    let root = system
+        .host_with_subagents(
+            Lam::builder(model.clone())
+                .state_store(system.state_store())
+                .build()
+                .actor("/actor-interrupt-root"),
+            subagents,
+        )
+        .await
+        .unwrap();
+    let caller = root.clone();
+    let call = tokio::spawn(async move { caller.call("actor root task").await });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        provider.wait_for_request("actor child task"),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("child did not start; requests: {:?}", provider.requests()));
+
+    let receipt = system
+        .interrupt(
+            &ActorAddress::new("/actor-interrupt-root").unwrap(),
+            InterruptionScope::Actor,
+        )
+        .await
+        .unwrap()
+        .expect("the root has an active run");
+    assert_eq!(receipt.root.as_str(), "/actor-interrupt-root");
+    assert_eq!(
+        receipt
+            .actors
+            .iter()
+            .map(|actor| actor.address.as_str())
+            .collect::<Vec<_>>(),
+        ["/actor-interrupt-root"]
+    );
+    assert!(receipt.actors[0].interruption.is_some());
+    assert!(matches!(
+        call.await.unwrap(),
+        Err(AgentSystemError::Actor(lam::ActorError::Interrupted))
+    ));
+
+    // The child stayed resident and kept running: its journal has no
+    // interruption boundary, and its completed outcome is still durably
+    // admitted to the root's mailbox.
+    let child_page = system
+        .state_store()
+        .read(
+            &ActorId::new("/actor-interrupt-root/child").unwrap(),
+            Revision::ZERO,
+            NonZeroUsize::new(128).unwrap(),
+        )
+        .await
+        .unwrap();
+    let child_state = ActorState::new().fold_page(child_page).unwrap();
+    assert!(child_state.active_run().is_none());
+    assert!(
+        !child_state.context().iter().any(|entry| matches!(
+            entry.entry.transition,
+            ContextTransition::Interrupted { .. }
+        )),
+        "the child journal must not contain an interruption boundary"
+    );
+    assert!(
+        !child_state.context().iter().any(|entry| matches!(
+            entry.entry.transition,
+            ContextTransition::Interrupted { .. }
+        )),
+        "the child journal must not contain an interruption boundary"
+    );
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let page = system
+                .state_store()
+                .read(
+                    root.actor_id(),
+                    Revision::ZERO,
+                    NonZeroUsize::new(128).unwrap(),
+                )
+                .await
+                .unwrap();
+            if page.events.iter().any(|stored| {
+                matches!(
+                    stored.event.data(),
+                    ActorEventData::MessageAdmitted { message }
+                        if matches!(
+                            message.source(),
+                            MessageSource::Actor { actor_id }
+                                if actor_id.as_str() == "/actor-interrupt-root/child"
+                        ) && message.payload().value.to_string().contains("actor child complete")
+                )
+            }) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the child's outcome should still be delivered to the root's mailbox");
     system.shutdown().await.unwrap();
 }
 
@@ -1244,7 +1390,11 @@ async fn interrupted_background_outcome_is_not_delivered_to_the_root() {
     .await
     .expect("the background child should start");
 
-    let receipt = root.interrupt().await.unwrap().unwrap();
+    let receipt = root
+        .interrupt(InterruptionScope::Subtree)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(receipt.actors.len(), 2);
     assert!(matches!(
         call.await.unwrap(),

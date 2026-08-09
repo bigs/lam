@@ -14,6 +14,18 @@ pub struct AgentInterruptionReceipt {
     pub interruption: Option<InterruptionReceipt>,
 }
 
+/// How far a recoverable interruption reaches from its addressed actor.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum InterruptionScope {
+    /// Interrupt only the addressed actor's active run. Resident descendants
+    /// keep running and their outcomes remain deliverable.
+    Actor,
+    /// Interrupt the addressed actor and every resident descendant, retiring
+    /// the descendants after they commit their interruption boundaries.
+    #[default]
+    Subtree,
+}
+
 /// Result of recoverably interrupting a root and retiring its descendants.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
